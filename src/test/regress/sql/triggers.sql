@@ -1186,9 +1186,13 @@ insert into child values (10, 1, 'b');
 select * from parent; select * from child;
 
 update parent set val1 = 'b' where aid = 1; -- should fail
+merge into parent p using (values (1)) as v(id) on p.aid = v.id
+  when matched then update set val1 = 'b'; -- should fail
 select * from parent; select * from child;
 
 delete from parent where aid = 1; -- should fail
+merge into parent p using (values (1)) as v(id) on p.aid = v.id
+  when matched then delete; -- should fail
 select * from parent; select * from child;
 
 -- replace the trigger function with one that restarts the deletion after
@@ -1583,6 +1587,42 @@ create trigger qqq after insert on parted_trig_1_1 for each row execute procedur
 insert into parted_trig values (50), (1500);
 drop table parted_trig;
 
+-- Verify that the correct triggers fire for cross-partition updates
+create table parted_trig (a int) partition by list (a);
+create table parted_trig1 partition of parted_trig for values in (1);
+create table parted_trig2 partition of parted_trig for values in (2);
+insert into parted_trig values (1);
+
+create or replace function trigger_notice() returns trigger as $$
+  begin
+    raise notice 'trigger % on % % % for %', TG_NAME, TG_TABLE_NAME, TG_WHEN, TG_OP, TG_LEVEL;
+    if TG_LEVEL = 'ROW' then
+      if TG_OP = 'DELETE' then
+        return OLD;
+      else
+        return NEW;
+      end if;
+    end if;
+    return null;
+  end;
+  $$ language plpgsql;
+create trigger parted_trig_before_stmt before insert or update or delete on parted_trig
+   for each statement execute procedure trigger_notice();
+create trigger parted_trig_before_row before insert or update or delete on parted_trig
+   for each row execute procedure trigger_notice();
+create trigger parted_trig_after_row after insert or update or delete on parted_trig
+   for each row execute procedure trigger_notice();
+create trigger parted_trig_after_stmt after insert or update or delete on parted_trig
+   for each statement execute procedure trigger_notice();
+
+update parted_trig set a = 2 where a = 1;
+
+-- update action in merge should behave the same
+merge into parted_trig using (select 1) as ss on true
+  when matched and a = 2 then update set a = 1;
+
+drop table parted_trig;
+
 -- Verify propagation of trigger arguments to partitions
 create table parted_trig (a int) partition by list (a);
 create table parted_trig1 partition of parted_trig for values in (1);
@@ -1865,13 +1905,42 @@ create table parent (a int) partition by list (a);
 create table child1 partition of parent for values in (1);
 create trigger tg after insert on parent
   for each row execute procedure trig_nothing();
+create trigger tg_stmt after insert on parent
+  for statement execute procedure trig_nothing();
 select tgrelid::regclass, tgname, tgenabled from pg_trigger
   where tgrelid in ('parent'::regclass, 'child1'::regclass)
-  order by tgrelid::regclass::text;
-alter table only parent enable always trigger tg;
+  order by tgrelid::regclass::text, tgname;
+alter table only parent enable always trigger tg;	-- no recursion because ONLY
+alter table parent enable always trigger tg_stmt;	-- no recursion because statement trigger
 select tgrelid::regclass, tgname, tgenabled from pg_trigger
   where tgrelid in ('parent'::regclass, 'child1'::regclass)
-  order by tgrelid::regclass::text;
+  order by tgrelid::regclass::text, tgname;
+-- The following is a no-op for the parent trigger but not so
+-- for the child trigger, so recursion should be applied.
+alter table parent enable always trigger tg;
+select tgrelid::regclass, tgname, tgenabled from pg_trigger
+  where tgrelid in ('parent'::regclass, 'child1'::regclass)
+  order by tgrelid::regclass::text, tgname;
+-- This variant malfunctioned in some releases.
+alter table parent disable trigger user;
+select tgrelid::regclass, tgname, tgenabled from pg_trigger
+  where tgrelid in ('parent'::regclass, 'child1'::regclass)
+  order by tgrelid::regclass::text, tgname;
+drop table parent, child1;
+
+-- Check processing of foreign key triggers
+create table parent (a int primary key, f int references parent)
+  partition by list (a);
+create table child1 partition of parent for values in (1);
+select tgrelid::regclass, rtrim(tgname, '0123456789') as tgname,
+  tgfoid::regproc, tgenabled
+  from pg_trigger where tgrelid in ('parent'::regclass, 'child1'::regclass)
+  order by tgrelid::regclass::text, tgfoid;
+alter table parent disable trigger all;
+select tgrelid::regclass, rtrim(tgname, '0123456789') as tgname,
+  tgfoid::regproc, tgenabled
+  from pg_trigger where tgrelid in ('parent'::regclass, 'child1'::regclass)
+  order by tgrelid::regclass::text, tgfoid;
 drop table parent, child1;
 
 -- Verify that firing state propagates correctly on creation, too
@@ -2606,7 +2675,7 @@ insert into convslot_test_child(col1) values ('1');
 insert into convslot_test_parent(col1) values ('3');
 insert into convslot_test_child(col1) values ('3');
 
-create or replace function trigger_function1()
+create function convslot_trig1()
 returns trigger
 language plpgsql
 AS $$
@@ -2617,7 +2686,7 @@ raise notice 'trigger = %, old_table = %',
 return null;
 end; $$;
 
-create or replace function trigger_function2()
+create function convslot_trig2()
 returns trigger
 language plpgsql
 AS $$
@@ -2630,11 +2699,11 @@ end; $$;
 
 create trigger but_trigger after update on convslot_test_child
 referencing new table as new_table
-for each statement execute function trigger_function2();
+for each statement execute function convslot_trig2();
 
 update convslot_test_parent set col1 = col1 || '1';
 
-create or replace function trigger_function3()
+create function convslot_trig3()
 returns trigger
 language plpgsql
 AS $$
@@ -2648,15 +2717,48 @@ end; $$;
 
 create trigger but_trigger2 after update on convslot_test_child
 referencing old table as old_table new table as new_table
-for each statement execute function trigger_function3();
+for each statement execute function convslot_trig3();
 update convslot_test_parent set col1 = col1 || '1';
 
 create trigger bdt_trigger after delete on convslot_test_child
 referencing old table as old_table
-for each statement execute function trigger_function1();
+for each statement execute function convslot_trig1();
 delete from convslot_test_parent;
 
 drop table convslot_test_child, convslot_test_parent;
+drop function convslot_trig1();
+drop function convslot_trig2();
+drop function convslot_trig3();
+
+-- Bug #17607: variant of above in which trigger function raises an error;
+-- we don't see any ill effects unless trigger tuple requires mapping
+
+create table convslot_test_parent (id int primary key, val int)
+partition by range (id);
+
+create table convslot_test_part (val int, id int not null);
+
+alter table convslot_test_parent
+  attach partition convslot_test_part for values from (1) to (1000);
+
+create function convslot_trig4() returns trigger as
+$$begin raise exception 'BOOM!'; end$$ language plpgsql;
+
+create trigger convslot_test_parent_update
+    after update on convslot_test_parent
+    referencing old table as old_rows new table as new_rows
+    for each statement execute procedure convslot_trig4();
+
+insert into convslot_test_parent (id, val) values (1, 2);
+
+begin;
+savepoint svp;
+update convslot_test_parent set val = 3;  -- error expected
+rollback to savepoint svp;
+rollback;
+
+drop table convslot_test_parent;
+drop function convslot_trig4();
 
 -- Test trigger renaming on partitioned tables
 create table grandparent (id int, primary key (id)) partition by range (id);

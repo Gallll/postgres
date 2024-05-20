@@ -60,7 +60,7 @@
  * values.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -91,7 +91,6 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
-#include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -151,6 +150,7 @@ bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
 bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
+bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
 typedef struct
@@ -188,6 +188,7 @@ static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 static Cost append_nonpartial_cost(List *subpaths, int numpaths,
 								   int parallel_workers);
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
+static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
 static double get_parallel_divisor(Path *path);
@@ -214,6 +215,35 @@ clamp_row_est(double nrows)
 		nrows = rint(nrows);
 
 	return nrows;
+}
+
+/*
+ * clamp_width_est
+ *		Force a tuple-width estimate to a sane value.
+ *
+ * The planner represents datatype width and tuple width estimates as int32.
+ * When summing column width estimates to create a tuple width estimate,
+ * it's possible to reach integer overflow in edge cases.  To ensure sane
+ * behavior, we form such sums in int64 arithmetic and then apply this routine
+ * to clamp to int32 range.
+ */
+int32
+clamp_width_est(int64 tuple_width)
+{
+	/*
+	 * Anything more than MaxAllocSize is clearly bogus, since we could not
+	 * create a tuple that large.
+	 */
+	if (tuple_width > MaxAllocSize)
+		return (int32) MaxAllocSize;
+
+	/*
+	 * Unlike clamp_row_est, we just Assert that the value isn't negative,
+	 * rather than masking such errors.
+	 */
+	Assert(tuple_width >= 0);
+
+	return (int32) tuple_width;
 }
 
 /*
@@ -1225,7 +1255,7 @@ cost_tidscan(Path *path, PlannerInfo *root,
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 	QualCost	tid_qual_cost;
-	int			ntuples;
+	double		ntuples;
 	ListCell   *l;
 	double		spc_random_page_cost;
 
@@ -1252,7 +1282,7 @@ cost_tidscan(Path *path, PlannerInfo *root,
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) qual;
 			Node	   *arraynode = (Node *) lsecond(saop->args);
 
-			ntuples += estimate_array_length(arraynode);
+			ntuples += estimate_array_length(root, arraynode);
 		}
 		else if (IsA(qual, CurrentOfExpr))
 		{
@@ -1815,327 +1845,6 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 }
 
 /*
- * is_fake_var
- *		Workaround for generate_append_tlist() which generates fake Vars with
- *		varno == 0, that will cause a fail of estimate_num_group() call
- *
- * XXX Ummm, why would estimate_num_group fail with this?
- */
-static bool
-is_fake_var(Expr *expr)
-{
-	if (IsA(expr, RelabelType))
-		expr = (Expr *) ((RelabelType *) expr)->arg;
-
-	return (IsA(expr, Var) && ((Var *) expr)->varno == 0);
-}
-
-/*
- * get_width_cost_multiplier
- *		Returns relative complexity of comparing two values based on its width.
- * The idea behind is that the comparison becomes more expensive the longer the
- * value is. Return value is in cpu_operator_cost units.
- */
-static double
-get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
-{
-	double		width = -1.0;	/* fake value */
-
-	if (IsA(expr, RelabelType))
-		expr = (Expr *) ((RelabelType *) expr)->arg;
-
-	/* Try to find actual stat in corresponding relation */
-	if (IsA(expr, Var))
-	{
-		Var		   *var = (Var *) expr;
-
-		if (var->varno > 0 && var->varno < root->simple_rel_array_size)
-		{
-			RelOptInfo *rel = root->simple_rel_array[var->varno];
-
-			if (rel != NULL &&
-				var->varattno >= rel->min_attr &&
-				var->varattno <= rel->max_attr)
-			{
-				int			ndx = var->varattno - rel->min_attr;
-
-				if (rel->attr_widths[ndx] > 0)
-					width = rel->attr_widths[ndx];
-			}
-		}
-	}
-
-	/* Didn't find any actual stats, try using type width instead. */
-	if (width < 0.0)
-	{
-		Node	   *node = (Node *) expr;
-
-		width = get_typavgwidth(exprType(node), exprTypmod(node));
-	}
-
-	/*
-	 * Values are passed as Datum type, so comparisons can't be cheaper than
-	 * comparing a Datum value.
-	 *
-	 * FIXME I find this reasoning questionable. We may pass int2, and
-	 * comparing it is probably a bit cheaper than comparing a bigint.
-	 */
-	if (width <= sizeof(Datum))
-		return 1.0;
-
-	/*
-	 * We consider the cost of a comparison not to be directly proportional to
-	 * width of the argument, because widths of the arguments could be
-	 * slightly different (we only know the average width for the whole
-	 * column). So we use log16(width) as an estimate.
-	 */
-	return 1.0 + 0.125 * LOG2(width / sizeof(Datum));
-}
-
-/*
- * compute_cpu_sort_cost
- *		compute CPU cost of sort (i.e. in-memory)
- *
- * The main thing we need to calculate to estimate sort CPU costs is the number
- * of calls to the comparator functions. The difficulty is that for multi-column
- * sorts there may be different data types involved (for some of which the calls
- * may be much more expensive). Furthermore, columns may have a very different
- * number of distinct values - the higher the number, the fewer comparisons will
- * be needed for the following columns.
- *
- * The algorithm is incremental - we add pathkeys one by one, and at each step we
- * estimate the number of necessary comparisons (based on the number of distinct
- * groups in the current pathkey prefix and the new pathkey), and the comparison
- * costs (which is data type specific).
- *
- * Estimation of the number of comparisons is based on ideas from:
- *
- * "Quicksort Is Optimal", Robert Sedgewick, Jon Bentley, 2002
- * [https://www.cs.princeton.edu/~rs/talks/QuicksortIsOptimal.pdf]
- *
- * In term of that paper, let N - number of tuples, Xi - number of identical
- * tuples with value Ki, then the estimate of number of comparisons is:
- *
- *	log(N! / (X1! * X2! * ..))  ~  sum(Xi * log(N/Xi))
- *
- * We assume all Xi the same because now we don't have any estimation of
- * group sizes, we have only know the estimate of number of groups (distinct
- * values). In that case, formula becomes:
- *
- *	N * log(NumberOfGroups)
- *
- * For multi-column sorts we need to estimate the number of comparisons for
- * each individual column - for example with columns (c1, c2, ..., ck) we
- * can estimate that number of comparisons on ck is roughly
- *
- *	ncomparisons(c1, c2, ..., ck) / ncomparisons(c1, c2, ..., c(k-1))
- *
- * Let k be a column number, Gk - number of groups defined by k columns, and Fk
- * the cost of the comparison is
- *
- *	N * sum( Fk * log(Gk) )
- *
- * Note: We also consider column width, not just the comparator cost.
- *
- * NOTE: some callers currently pass NIL for pathkeys because they
- * can't conveniently supply the sort keys. In this case, it will fallback to
- * simple comparison cost estimate.
- */
-static Cost
-compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
-					  Cost comparison_cost, double tuples, double output_tuples,
-					  bool heapSort)
-{
-	Cost		per_tuple_cost = 0.0;
-	ListCell   *lc;
-	List	   *pathkeyExprs = NIL;
-	double		tuplesPerPrevGroup = tuples;
-	double		totalFuncCost = 1.0;
-	bool		has_fake_var = false;
-	int			i = 0;
-	Oid			prev_datatype = InvalidOid;
-	List	   *cache_varinfos = NIL;
-
-	/* fallback if pathkeys is unknown */
-	if (list_length(pathkeys) == 0)
-	{
-		/*
-		 * If we'll use a bounded heap-sort keeping just K tuples in memory,
-		 * for a total number of tuple comparisons of N log2 K; but the
-		 * constant factor is a bit higher than for quicksort. Tweak it so
-		 * that the cost curve is continuous at the crossover point.
-		 */
-		output_tuples = (heapSort) ? 2.0 * output_tuples : tuples;
-		per_tuple_cost += 2.0 * cpu_operator_cost * LOG2(output_tuples);
-
-		/* add cost provided by caller */
-		per_tuple_cost += comparison_cost;
-
-		return per_tuple_cost * tuples;
-	}
-
-	/*
-	 * Computing total cost of sorting takes into account the per-column
-	 * comparison function cost.  We try to compute the needed number of
-	 * comparisons per column.
-	 */
-	foreach(lc, pathkeys)
-	{
-		PathKey    *pathkey = (PathKey *) lfirst(lc);
-		EquivalenceMember *em;
-		double		nGroups,
-					correctedNGroups;
-		Cost		funcCost = 1.0;
-
-		/*
-		 * We believe that equivalence members aren't very different, so, to
-		 * estimate cost we consider just the first member.
-		 */
-		em = (EquivalenceMember *) linitial(pathkey->pk_eclass->ec_members);
-
-		if (em->em_datatype != InvalidOid)
-		{
-			/* do not lookup funcCost if the data type is the same */
-			if (prev_datatype != em->em_datatype)
-			{
-				Oid			sortop;
-				QualCost	cost;
-
-				sortop = get_opfamily_member(pathkey->pk_opfamily,
-											 em->em_datatype, em->em_datatype,
-											 pathkey->pk_strategy);
-
-				cost.startup = 0;
-				cost.per_tuple = 0;
-				add_function_cost(root, get_opcode(sortop), NULL, &cost);
-
-				/*
-				 * add_function_cost returns the product of cpu_operator_cost
-				 * and procost, but we need just procost, co undo that.
-				 */
-				funcCost = cost.per_tuple / cpu_operator_cost;
-
-				prev_datatype = em->em_datatype;
-			}
-		}
-
-		/* factor in the width of the values in this column */
-		funcCost *= get_width_cost_multiplier(root, em->em_expr);
-
-		/* now we have per-key cost, so add to the running total */
-		totalFuncCost += funcCost;
-
-		/* remember if we have found a fake Var in pathkeys */
-		has_fake_var |= is_fake_var(em->em_expr);
-		pathkeyExprs = lappend(pathkeyExprs, em->em_expr);
-
-		/*
-		 * We need to calculate the number of comparisons for this column,
-		 * which requires knowing the group size. So we estimate the number of
-		 * groups by calling estimate_num_groups_incremental(), which
-		 * estimates the group size for "new" pathkeys.
-		 *
-		 * Note: estimate_num_groups_incremental does not handle fake Vars, so
-		 * use a default estimate otherwise.
-		 */
-		if (!has_fake_var)
-			nGroups = estimate_num_groups_incremental(root, pathkeyExprs,
-													  tuplesPerPrevGroup, NULL, NULL,
-													  &cache_varinfos,
-													  list_length(pathkeyExprs) - 1);
-		else if (tuples > 4.0)
-
-			/*
-			 * Use geometric mean as estimation if there are no stats.
-			 *
-			 * We don't use DEFAULT_NUM_DISTINCT here, because that's used for
-			 * a single column, but here we're dealing with multiple columns.
-			 */
-			nGroups = ceil(2.0 + sqrt(tuples) * (i + 1) / list_length(pathkeys));
-		else
-			nGroups = tuples;
-
-		/*
-		 * Presorted keys are not considered in the cost above, but we still
-		 * do have to compare them in the qsort comparator. So make sure to
-		 * factor in the cost in that case.
-		 */
-		if (i >= nPresortedKeys)
-		{
-			if (heapSort)
-			{
-				/*
-				 * have to keep at least one group, and a multiple of group
-				 * size
-				 */
-				correctedNGroups = ceil(output_tuples / tuplesPerPrevGroup);
-			}
-			else
-				/* all groups in the input */
-				correctedNGroups = nGroups;
-
-			correctedNGroups = Max(1.0, ceil(correctedNGroups));
-
-			per_tuple_cost += totalFuncCost * LOG2(correctedNGroups);
-		}
-
-		i++;
-
-		/*
-		 * Uniform distributions with all groups being of the same size are
-		 * the best case, with nice smooth behavior. Real-world distributions
-		 * tend not to be uniform, though, and we don't have any reliable
-		 * easy-to-use information. As a basic defense against skewed
-		 * distributions, we use a 1.5 factor to make the expected group a bit
-		 * larger, but we need to be careful not to make the group larger than
-		 * in the preceding step.
-		 */
-		tuplesPerPrevGroup = Min(tuplesPerPrevGroup,
-								 ceil(1.5 * tuplesPerPrevGroup / nGroups));
-
-		/*
-		 * Once we get single-row group, it means tuples in the group are
-		 * unique and we can skip all remaining columns.
-		 */
-		if (tuplesPerPrevGroup <= 1.0)
-			break;
-	}
-
-	list_free(pathkeyExprs);
-
-	/* per_tuple_cost is in cpu_operator_cost units */
-	per_tuple_cost *= cpu_operator_cost;
-
-	/*
-	 * Accordingly to "Introduction to algorithms", Thomas H. Cormen, Charles
-	 * E. Leiserson, Ronald L. Rivest, ISBN 0-07-013143-0, quicksort
-	 * estimation formula has additional term proportional to number of tuples
-	 * (see Chapter 8.2 and Theorem 4.1). That affects cases with a low number
-	 * of tuples, approximately less than 1e4. We could implement it as an
-	 * additional multiplier under the logarithm, but we use a bit more
-	 * complex formula which takes into account the number of unique tuples
-	 * and it's not clear how to combine the multiplier with the number of
-	 * groups. Estimate it as 10 cpu_operator_cost units.
-	 */
-	per_tuple_cost += 10 * cpu_operator_cost;
-
-	per_tuple_cost += comparison_cost;
-
-	return tuples * per_tuple_cost;
-}
-
-/*
- * simple wrapper just to estimate best sort path
- */
-Cost
-cost_sort_estimate(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
-				   double tuples)
-{
-	return compute_cpu_sort_cost(root, pathkeys, nPresortedKeys,
-								 0, tuples, tuples, false);
-}
-
-/*
  * cost_tuplesort
  *	  Determines and returns the cost of sorting a relation using tuplesort,
  *    not including the cost of reading the input data.
@@ -2151,7 +1860,7 @@ cost_sort_estimate(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
  * number of initial runs formed and M is the merge order used by tuplesort.c.
  * Since the average initial run should be about sort_mem, we have
  *		disk traffic = 2 * relsize * ceil(logM(p / sort_mem))
- * 		and cpu cost (computed by compute_cpu_sort_cost()).
+ *		cpu = comparison_cost * t * log2(t)
  *
  * If the sort is bounded (i.e., only the first k result tuples are needed)
  * and k tuples can fit into sort_mem, we use a heap method that keeps only
@@ -2170,11 +1879,9 @@ cost_sort_estimate(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
  * 'comparison_cost' is the extra cost per comparison, if any
  * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
- * 'startup_cost' is expected to be 0 at input. If there is "input cost" it should
- * be added by caller later
  */
 static void
-cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_cost,
+cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 			   double tuples, int width,
 			   Cost comparison_cost, int sort_mem,
 			   double limit_tuples)
@@ -2190,6 +1897,9 @@ cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_
 	 */
 	if (tuples < 2.0)
 		tuples = 2.0;
+
+	/* Include the default cost-per-comparison */
+	comparison_cost += 2.0 * cpu_operator_cost;
 
 	/* Do we have a useful LIMIT? */
 	if (limit_tuples > 0 && limit_tuples < tuples)
@@ -2214,10 +1924,12 @@ cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_
 		double		log_runs;
 		double		npageaccesses;
 
-		/* CPU costs */
-		*startup_cost = compute_cpu_sort_cost(root, pathkeys, 0,
-											  comparison_cost, tuples,
-											  tuples, false);
+		/*
+		 * CPU costs
+		 *
+		 * Assume about N log2 N comparisons
+		 */
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 
 		/* Disk costs */
 
@@ -2233,17 +1945,18 @@ cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_
 	}
 	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
 	{
-		/* We'll use a bounded heap-sort keeping just K tuples in memory. */
-		*startup_cost = compute_cpu_sort_cost(root, pathkeys, 0,
-											  comparison_cost, tuples,
-											  output_tuples, true);
+		/*
+		 * We'll use a bounded heap-sort keeping just K tuples in memory, for
+		 * a total number of tuple comparisons of N log2 K; but the constant
+		 * factor is a bit higher than for quicksort.  Tweak it so that the
+		 * cost curve is continuous at the crossover point.
+		 */
+		*startup_cost = comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
 		/* We'll use plain quicksort on all the input tuples */
-		*startup_cost = compute_cpu_sort_cost(root, pathkeys, 0,
-											  comparison_cost, tuples,
-											  tuples, false);
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 	}
 
 	/*
@@ -2286,10 +1999,9 @@ cost_incremental_sort(Path *path,
 				group_input_run_cost;
 	List	   *presortedExprs = NIL;
 	ListCell   *l;
-	int			i = 0;
 	bool		unknown_varno = false;
 
-	Assert(presorted_keys != 0);
+	Assert(presorted_keys > 0 && presorted_keys < list_length(pathkeys));
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -2327,7 +2039,7 @@ cost_incremental_sort(Path *path,
 	{
 		PathKey    *key = (PathKey *) lfirst(l);
 		EquivalenceMember *member = (EquivalenceMember *)
-		linitial(key->pk_eclass->ec_members);
+			linitial(key->pk_eclass->ec_members);
 
 		/*
 		 * Check if the expression contains Var with "varno 0" so that we
@@ -2342,12 +2054,11 @@ cost_incremental_sort(Path *path,
 		/* expression not containing any Vars with "varno 0" */
 		presortedExprs = lappend(presortedExprs, member->em_expr);
 
-		i++;
-		if (i >= presorted_keys)
+		if (foreach_current_index(l) + 1 >= presorted_keys)
 			break;
 	}
 
-	/* Estimate number of groups with equal presorted keys. */
+	/* Estimate the number of groups with equal presorted keys. */
 	if (!unknown_varno)
 		input_groups = estimate_num_groups(root, presortedExprs, input_tuples,
 										   NULL, NULL);
@@ -2356,22 +2067,19 @@ cost_incremental_sort(Path *path,
 	group_input_run_cost = input_run_cost / input_groups;
 
 	/*
-	 * Estimate average cost of sorting of one group where presorted keys are
-	 * equal.  Incremental sort is sensitive to distribution of tuples to the
-	 * groups, where we're relying on quite rough assumptions.  Thus, we're
-	 * pessimistic about incremental sort performance and increase its average
-	 * group size by half.
+	 * Estimate the average cost of sorting of one group where presorted keys
+	 * are equal.
 	 */
-	cost_tuplesort(root, pathkeys, &group_startup_cost, &group_run_cost,
-				   1.5 * group_tuples, width, comparison_cost, sort_mem,
+	cost_tuplesort(&group_startup_cost, &group_run_cost,
+				   group_tuples, width, comparison_cost, sort_mem,
 				   limit_tuples);
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
 	 * plus the cost of its input.
 	 */
-	startup_cost = group_startup_cost
-		+ input_startup_cost + group_input_run_cost;
+	startup_cost = group_startup_cost + input_startup_cost +
+		group_input_run_cost;
 
 	/*
 	 * After we started producing tuples from the first group, the cost of
@@ -2379,17 +2087,20 @@ cost_incremental_sort(Path *path,
 	 * group, plus the total cost to process the remaining groups, plus the
 	 * remaining cost of input.
 	 */
-	run_cost = group_run_cost
-		+ (group_run_cost + group_startup_cost) * (input_groups - 1)
-		+ group_input_run_cost * (input_groups - 1);
+	run_cost = group_run_cost + (group_run_cost + group_startup_cost) *
+		(input_groups - 1) + group_input_run_cost * (input_groups - 1);
 
 	/*
 	 * Incremental sort adds some overhead by itself. Firstly, it has to
 	 * detect the sort groups. This is roughly equal to one extra copy and
-	 * comparison per tuple. Secondly, it has to reset the tuplesort context
-	 * for every group.
+	 * comparison per tuple.
 	 */
 	run_cost += (cpu_tuple_cost + comparison_cost) * input_tuples;
+
+	/*
+	 * Additionally, we charge double cpu_tuple_cost for each input group to
+	 * account for the tuplesort_reset that's performed after each group.
+	 */
 	run_cost += 2.0 * cpu_tuple_cost * input_groups;
 
 	path->rows = input_tuples;
@@ -2419,7 +2130,7 @@ cost_sort(Path *path, PlannerInfo *root,
 	Cost		startup_cost;
 	Cost		run_cost;
 
-	cost_tuplesort(root, pathkeys, &startup_cost, &run_cost,
+	cost_tuplesort(&startup_cost, &run_cost,
 				   tuples, width,
 				   comparison_cost, sort_mem,
 				   limit_tuples);
@@ -2447,7 +2158,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	int			arrlen;
 	ListCell   *l;
 	ListCell   *cell;
-	int			i;
 	int			path_index;
 	int			min_index;
 	int			max_index;
@@ -2486,7 +2196,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	for_each_cell(l, subpaths, cell)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
-		int			i;
 
 		/* Consider only the non-partial paths */
 		if (path_index++ == numpaths)
@@ -2495,7 +2204,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 		costarr[min_index] += subpath->total_cost;
 
 		/* Update the new min cost array index */
-		for (min_index = i = 0; i < arrlen; i++)
+		min_index = 0;
+		for (int i = 0; i < arrlen; i++)
 		{
 			if (costarr[i] < costarr[min_index])
 				min_index = i;
@@ -2503,7 +2213,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	}
 
 	/* Return the highest cost from the array */
-	for (max_index = i = 0; i < arrlen; i++)
+	max_index = 0;
+	for (int i = 0; i < arrlen; i++)
 	{
 		if (costarr[i] > costarr[max_index])
 			max_index = i;
@@ -2517,7 +2228,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
  *	  Determines and returns the cost of an Append node.
  */
 void
-cost_append(AppendPath *apath, PlannerInfo *root)
+cost_append(AppendPath *apath)
 {
 	ListCell   *l;
 
@@ -2534,13 +2245,13 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 
 		if (pathkeys == NIL)
 		{
-			Path	   *subpath = (Path *) linitial(apath->subpaths);
+			Path	   *firstsubpath = (Path *) linitial(apath->subpaths);
 
 			/*
 			 * For an unordered, non-parallel-aware Append we take the startup
 			 * cost as the startup cost of the first subpath.
 			 */
-			apath->path.startup_cost = subpath->startup_cost;
+			apath->path.startup_cost = firstsubpath->startup_cost;
 
 			/* Compute rows and costs as sums of subplan rows and costs. */
 			foreach(l, apath->subpaths)
@@ -2585,7 +2296,7 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 					 * any child.
 					 */
 					cost_sort(&sort_path,
-							  root,
+							  NULL, /* doesn't currently need root */
 							  pathkeys,
 							  subpath->total_cost,
 							  subpath->rows,
@@ -2799,6 +2510,7 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 					Cost *rescan_startup_cost, Cost *rescan_total_cost)
 {
 	EstimationInfo estinfo;
+	ListCell   *lc;
 	Cost		input_startup_cost = mpath->subpath->startup_cost;
 	Cost		input_total_cost = mpath->subpath->total_cost;
 	double		tuples = mpath->subpath->rows;
@@ -2822,11 +2534,13 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * To provide us with better estimations on how many cache entries we can
 	 * store at once, we make a call to the executor here to ask it what
 	 * memory overheads there are for a single cache entry.
-	 *
-	 * XXX we also store the cache key, but that's not accounted for here.
 	 */
 	est_entry_bytes = relation_byte_size(tuples, width) +
 		ExecEstimateCacheEntryOverheadBytes(tuples);
+
+	/* include the estimated width for the cache keys */
+	foreach(lc, mpath->param_exprs)
+		est_entry_bytes += get_expr_width(root, (Node *) lfirst(lc));
 
 	/* estimate on the upper limit of cache entries we can hold at once */
 	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
@@ -2872,11 +2586,10 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	 * must look at how many scans are estimated in total for this node and
 	 * how many of those scans we expect to get a cache hit.
 	 */
-	hit_ratio = 1.0 / ndistinct * Min(est_cache_entries, ndistinct) -
-		(ndistinct / calls);
+	hit_ratio = ((calls - ndistinct) / calls) *
+		(est_cache_entries / Max(ndistinct, est_cache_entries));
 
-	/* Ensure we don't go negative */
-	hit_ratio = Max(hit_ratio, 0.0);
+	Assert(hit_ratio >= 0 && hit_ratio <= 1.0);
 
 	/*
 	 * Set the total_cost accounting for the expected cache hit ratio.  We
@@ -3125,6 +2838,226 @@ cost_agg(Path *path, PlannerInfo *root,
 }
 
 /*
+ * get_windowclause_startup_tuples
+ *		Estimate how many tuples we'll need to fetch from a WindowAgg's
+ *		subnode before we can output the first WindowAgg tuple.
+ *
+ * How many tuples need to be read depends on the WindowClause.  For example,
+ * a WindowClause with no PARTITION BY and no ORDER BY requires that all
+ * subnode tuples are read and aggregated before the WindowAgg can output
+ * anything.  If there's a PARTITION BY, then we only need to look at tuples
+ * in the first partition.  Here we attempt to estimate just how many
+ * 'input_tuples' the WindowAgg will need to read for the given WindowClause
+ * before the first tuple can be output.
+ */
+static double
+get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
+								double input_tuples)
+{
+	int			frameOptions = wc->frameOptions;
+	double		partition_tuples;
+	double		return_tuples;
+	double		peer_tuples;
+
+	/*
+	 * First, figure out how many partitions there are likely to be and set
+	 * partition_tuples according to that estimate.
+	 */
+	if (wc->partitionClause != NIL)
+	{
+		double		num_partitions;
+		List	   *partexprs = get_sortgrouplist_exprs(wc->partitionClause,
+														root->parse->targetList);
+
+		num_partitions = estimate_num_groups(root, partexprs, input_tuples,
+											 NULL, NULL);
+		list_free(partexprs);
+
+		partition_tuples = input_tuples / num_partitions;
+	}
+	else
+	{
+		/* all tuples belong to the same partition */
+		partition_tuples = input_tuples;
+	}
+
+	/* estimate the number of tuples in each peer group */
+	if (wc->orderClause != NIL)
+	{
+		double		num_groups;
+		List	   *orderexprs;
+
+		orderexprs = get_sortgrouplist_exprs(wc->orderClause,
+											 root->parse->targetList);
+
+		/* estimate out how many peer groups there are in the partition */
+		num_groups = estimate_num_groups(root, orderexprs,
+										 partition_tuples, NULL,
+										 NULL);
+		list_free(orderexprs);
+		peer_tuples = partition_tuples / num_groups;
+	}
+	else
+	{
+		/* no ORDER BY so only 1 tuple belongs in each peer group */
+		peer_tuples = 1.0;
+	}
+
+	if (frameOptions & FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
+	{
+		/* include all partition rows */
+		return_tuples = partition_tuples;
+	}
+	else if (frameOptions & FRAMEOPTION_END_CURRENT_ROW)
+	{
+		if (frameOptions & FRAMEOPTION_ROWS)
+		{
+			/* just count the current row */
+			return_tuples = 1.0;
+		}
+		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
+		{
+			/*
+			 * When in RANGE/GROUPS mode, it's more complex.  If there's no
+			 * ORDER BY, then all rows in the partition are peers, otherwise
+			 * we'll need to read the first group of peers.
+			 */
+			if (wc->orderClause == NIL)
+				return_tuples = partition_tuples;
+			else
+				return_tuples = peer_tuples;
+		}
+		else
+		{
+			/*
+			 * Something new we don't support yet?  This needs attention.
+			 * We'll just return 1.0 in the meantime.
+			 */
+			Assert(false);
+			return_tuples = 1.0;
+		}
+	}
+	else if (frameOptions & FRAMEOPTION_END_OFFSET_PRECEDING)
+	{
+		/*
+		 * BETWEEN ... AND N PRECEDING will only need to read the WindowAgg's
+		 * subnode after N ROWS/RANGES/GROUPS.  N can be 0, but not negative,
+		 * so we'll just assume only the current row needs to be read to fetch
+		 * the first WindowAgg row.
+		 */
+		return_tuples = 1.0;
+	}
+	else if (frameOptions & FRAMEOPTION_END_OFFSET_FOLLOWING)
+	{
+		Const	   *endOffset = (Const *) wc->endOffset;
+		double		end_offset_value;
+
+		/* try and figure out the value specified in the endOffset. */
+		if (IsA(endOffset, Const))
+		{
+			if (endOffset->constisnull)
+			{
+				/*
+				 * NULLs are not allowed, but currently, there's no code to
+				 * error out if there's a NULL Const.  We'll only discover
+				 * this during execution.  For now, just pretend everything is
+				 * fine and assume that just the first row/range/group will be
+				 * needed.
+				 */
+				end_offset_value = 1.0;
+			}
+			else
+			{
+				switch (endOffset->consttype)
+				{
+					case INT2OID:
+						end_offset_value =
+							(double) DatumGetInt16(endOffset->constvalue);
+						break;
+					case INT4OID:
+						end_offset_value =
+							(double) DatumGetInt32(endOffset->constvalue);
+						break;
+					case INT8OID:
+						end_offset_value =
+							(double) DatumGetInt64(endOffset->constvalue);
+						break;
+					default:
+						end_offset_value =
+							partition_tuples / peer_tuples *
+							DEFAULT_INEQ_SEL;
+						break;
+				}
+			}
+		}
+		else
+		{
+			/*
+			 * When the end bound is not a Const, we'll just need to guess. We
+			 * just make use of DEFAULT_INEQ_SEL.
+			 */
+			end_offset_value =
+				partition_tuples / peer_tuples * DEFAULT_INEQ_SEL;
+		}
+
+		if (frameOptions & FRAMEOPTION_ROWS)
+		{
+			/* include the N FOLLOWING and the current row */
+			return_tuples = end_offset_value + 1.0;
+		}
+		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
+		{
+			/* include N FOLLOWING ranges/group and the initial range/group */
+			return_tuples = peer_tuples * (end_offset_value + 1.0);
+		}
+		else
+		{
+			/*
+			 * Something new we don't support yet?  This needs attention.
+			 * We'll just return 1.0 in the meantime.
+			 */
+			Assert(false);
+			return_tuples = 1.0;
+		}
+	}
+	else
+	{
+		/*
+		 * Something new we don't support yet?  This needs attention.  We'll
+		 * just return 1.0 in the meantime.
+		 */
+		Assert(false);
+		return_tuples = 1.0;
+	}
+
+	if (wc->partitionClause != NIL || wc->orderClause != NIL)
+	{
+		/*
+		 * Cap the return value to the estimated partition tuples and account
+		 * for the extra tuple WindowAgg will need to read to confirm the next
+		 * tuple does not belong to the same partition or peer group.
+		 */
+		return_tuples = Min(return_tuples + 1.0, partition_tuples);
+	}
+	else
+	{
+		/*
+		 * Cap the return value so it's never higher than the expected tuples
+		 * in the partition.
+		 */
+		return_tuples = Min(return_tuples, partition_tuples);
+	}
+
+	/*
+	 * We needn't worry about any EXCLUDE options as those only exclude rows
+	 * from being aggregated, not from being read from the WindowAgg's
+	 * subnode.
+	 */
+
+	return clamp_row_est(return_tuples);
+}
+
+/*
  * cost_windowagg
  *		Determines and returns the cost of performing a WindowAgg plan node,
  *		including the cost of its input.
@@ -3133,13 +3066,19 @@ cost_agg(Path *path, PlannerInfo *root,
  */
 void
 cost_windowagg(Path *path, PlannerInfo *root,
-			   List *windowFuncs, int numPartCols, int numOrderCols,
+			   List *windowFuncs, WindowClause *winclause,
 			   Cost input_startup_cost, Cost input_total_cost,
 			   double input_tuples)
 {
 	Cost		startup_cost;
 	Cost		total_cost;
+	double		startup_tuples;
+	int			numPartCols;
+	int			numOrderCols;
 	ListCell   *lc;
+
+	numPartCols = list_length(winclause->partitionClause);
+	numOrderCols = list_length(winclause->orderClause);
 
 	startup_cost = input_startup_cost;
 	total_cost = input_total_cost;
@@ -3195,6 +3134,21 @@ cost_windowagg(Path *path, PlannerInfo *root,
 	path->rows = input_tuples;
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
+
+	/*
+	 * Also, take into account how many tuples we need to read from the
+	 * subnode in order to produce the first tuple from the WindowAgg.  To do
+	 * this we proportion the run cost (total cost not including startup cost)
+	 * over the estimated startup tuples.  We already included the startup
+	 * cost of the subnode, so we only need to do this when the estimated
+	 * startup tuples is above 1.0.
+	 */
+	startup_tuples = get_windowclause_startup_tuples(root, winclause,
+													 input_tuples);
+
+	if (startup_tuples > 1.0)
+		path->startup_cost += (total_cost - startup_cost) / input_tuples *
+			(startup_tuples - 1.0);
 }
 
 /*
@@ -3645,7 +3599,8 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 			outerstartsel = 0.0;
 			outerendsel = 1.0;
 		}
-		else if (jointype == JOIN_RIGHT)
+		else if (jointype == JOIN_RIGHT ||
+				 jointype == JOIN_RIGHT_ANTI)
 		{
 			innerstartsel = 0.0;
 			innerendsel = 1.0;
@@ -4814,7 +4769,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		Node	   *arraynode = (Node *) lsecond(saop->args);
 		QualCost	sacosts;
 		QualCost	hcosts;
-		int			estarraylen = estimate_array_length(arraynode);
+		double		estarraylen = estimate_array_length(context->root, arraynode);
 
 		set_sa_opfuncid(saop);
 		sacosts.startup = sacosts.per_tuple = 0;
@@ -4852,7 +4807,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 			 */
 			context->total.startup += sacosts.startup;
 			context->total.per_tuple += sacosts.per_tuple *
-				estimate_array_length(arraynode) * 0.5;
+				estimate_array_length(context->root, arraynode) * 0.5;
 		}
 	}
 	else if (IsA(node, Aggref) ||
@@ -4903,7 +4858,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		context->total.startup += perelemcost.startup;
 		if (perelemcost.per_tuple > 0)
 			context->total.per_tuple += perelemcost.per_tuple *
-				estimate_array_length((Node *) acoerce->arg);
+				estimate_array_length(context->root, (Node *) acoerce->arg);
 	}
 	else if (IsA(node, RowCompareExpr))
 	{
@@ -5095,19 +5050,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	/*
 	 * Also get the normal inner-join selectivity of the join clauses.
 	 */
-	norm_sjinfo.type = T_SpecialJoinInfo;
-	norm_sjinfo.min_lefthand = outerrel->relids;
-	norm_sjinfo.min_righthand = innerrel->relids;
-	norm_sjinfo.syn_lefthand = outerrel->relids;
-	norm_sjinfo.syn_righthand = innerrel->relids;
-	norm_sjinfo.jointype = JOIN_INNER;
-	/* we don't bother trying to make the remaining fields valid */
-	norm_sjinfo.lhs_strict = false;
-	norm_sjinfo.delay_upper_joins = false;
-	norm_sjinfo.semi_can_btree = false;
-	norm_sjinfo.semi_can_hash = false;
-	norm_sjinfo.semi_operators = NIL;
-	norm_sjinfo.semi_rhs_exprs = NIL;
+	init_dummy_sjinfo(&norm_sjinfo, outerrel->relids, innerrel->relids);
 
 	nselec = clauselist_selectivity(root,
 									joinquals,
@@ -5260,19 +5203,8 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	/*
 	 * Make up a SpecialJoinInfo for JOIN_INNER semantics.
 	 */
-	sjinfo.type = T_SpecialJoinInfo;
-	sjinfo.min_lefthand = path->outerjoinpath->parent->relids;
-	sjinfo.min_righthand = path->innerjoinpath->parent->relids;
-	sjinfo.syn_lefthand = path->outerjoinpath->parent->relids;
-	sjinfo.syn_righthand = path->innerjoinpath->parent->relids;
-	sjinfo.jointype = JOIN_INNER;
-	/* we don't bother trying to make the remaining fields valid */
-	sjinfo.lhs_strict = false;
-	sjinfo.delay_upper_joins = false;
-	sjinfo.semi_can_btree = false;
-	sjinfo.semi_can_hash = false;
-	sjinfo.semi_operators = NIL;
-	sjinfo.semi_rhs_exprs = NIL;
+	init_dummy_sjinfo(&sjinfo, path->outerjoinpath->parent->relids,
+					  path->innerjoinpath->parent->relids);
 
 	/* Get the approximate selectivity */
 	foreach(l, quals)
@@ -6167,7 +6099,7 @@ static void
 set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 {
 	Oid			reloid = planner_rt_fetch(rel->relid, root)->relid;
-	int32		tuple_width = 0;
+	int64		tuple_width = 0;
 	bool		have_wholerow_var = false;
 	ListCell   *lc;
 
@@ -6245,7 +6177,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			 * scanning this rel, so be sure to include it in reltarget->cost.
 			 */
 			PlaceHolderVar *phv = (PlaceHolderVar *) node;
-			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv, false);
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv);
 			QualCost	cost;
 
 			tuple_width += phinfo->ph_width;
@@ -6279,7 +6211,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 	 */
 	if (have_wholerow_var)
 	{
-		int32		wholerow_width = MAXALIGN(SizeofHeapTupleHeader);
+		int64		wholerow_width = MAXALIGN(SizeofHeapTupleHeader);
 
 		if (reloid != InvalidOid)
 		{
@@ -6296,7 +6228,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 				wholerow_width += rel->attr_widths[i - rel->min_attr];
 		}
 
-		rel->attr_widths[0 - rel->min_attr] = wholerow_width;
+		rel->attr_widths[0 - rel->min_attr] = clamp_width_est(wholerow_width);
 
 		/*
 		 * Include the whole-row Var as part of the output tuple.  Yes, that
@@ -6305,8 +6237,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 		tuple_width += wholerow_width;
 	}
 
-	Assert(tuple_width >= 0);
-	rel->reltarget->width = tuple_width;
+	rel->reltarget->width = clamp_width_est(tuple_width);
 }
 
 /*
@@ -6324,7 +6255,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 PathTarget *
 set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 {
-	int32		tuple_width = 0;
+	int64		tuple_width = 0;
 	ListCell   *lc;
 
 	/* Vars are assumed to have cost zero, but other exprs do not */
@@ -6335,64 +6266,71 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 	{
 		Node	   *node = (Node *) lfirst(lc);
 
-		if (IsA(node, Var))
+		tuple_width += get_expr_width(root, node);
+
+		/* For non-Vars, account for evaluation cost */
+		if (!IsA(node, Var))
 		{
-			Var		   *var = (Var *) node;
-			int32		item_width;
-
-			/* We should not see any upper-level Vars here */
-			Assert(var->varlevelsup == 0);
-
-			/* Try to get data from RelOptInfo cache */
-			if (!IS_SPECIAL_VARNO(var->varno) &&
-				var->varno < root->simple_rel_array_size)
-			{
-				RelOptInfo *rel = root->simple_rel_array[var->varno];
-
-				if (rel != NULL &&
-					var->varattno >= rel->min_attr &&
-					var->varattno <= rel->max_attr)
-				{
-					int			ndx = var->varattno - rel->min_attr;
-
-					if (rel->attr_widths[ndx] > 0)
-					{
-						tuple_width += rel->attr_widths[ndx];
-						continue;
-					}
-				}
-			}
-
-			/*
-			 * No cached data available, so estimate using just the type info.
-			 */
-			item_width = get_typavgwidth(var->vartype, var->vartypmod);
-			Assert(item_width > 0);
-			tuple_width += item_width;
-		}
-		else
-		{
-			/*
-			 * Handle general expressions using type info.
-			 */
-			int32		item_width;
 			QualCost	cost;
 
-			item_width = get_typavgwidth(exprType(node), exprTypmod(node));
-			Assert(item_width > 0);
-			tuple_width += item_width;
-
-			/* Account for cost, too */
 			cost_qual_eval_node(&cost, node, root);
 			target->cost.startup += cost.startup;
 			target->cost.per_tuple += cost.per_tuple;
 		}
 	}
 
-	Assert(tuple_width >= 0);
-	target->width = tuple_width;
+	target->width = clamp_width_est(tuple_width);
 
 	return target;
+}
+
+/*
+ * get_expr_width
+ *		Estimate the width of the given expr attempting to use the width
+ *		cached in a Var's owning RelOptInfo, else fallback on the type's
+ *		average width when unable to or when the given Node is not a Var.
+ */
+static int32
+get_expr_width(PlannerInfo *root, const Node *expr)
+{
+	int32		width;
+
+	if (IsA(expr, Var))
+	{
+		const Var  *var = (const Var *) expr;
+
+		/* We should not see any upper-level Vars here */
+		Assert(var->varlevelsup == 0);
+
+		/* Try to get data from RelOptInfo cache */
+		if (!IS_SPECIAL_VARNO(var->varno) &&
+			var->varno < root->simple_rel_array_size)
+		{
+			RelOptInfo *rel = root->simple_rel_array[var->varno];
+
+			if (rel != NULL &&
+				var->varattno >= rel->min_attr &&
+				var->varattno <= rel->max_attr)
+			{
+				int			ndx = var->varattno - rel->min_attr;
+
+				if (rel->attr_widths[ndx] > 0)
+					return rel->attr_widths[ndx];
+			}
+		}
+
+		/*
+		 * No cached data available, so estimate using just the type info.
+		 */
+		width = get_typavgwidth(var->vartype, var->vartypmod);
+		Assert(width > 0);
+
+		return width;
+	}
+
+	width = get_typavgwidth(exprType(expr), exprTypmod(expr));
+	Assert(width > 0);
+	return width;
 }
 
 /*
@@ -6451,12 +6389,20 @@ get_parallel_divisor(Path *path)
 
 /*
  * compute_bitmap_pages
+ *	  Estimate number of pages fetched from heap in a bitmap heap scan.
  *
- * compute number of pages fetched from heap in bitmap heap scan.
+ * 'baserel' is the relation to be scanned
+ * 'bitmapqual' is a tree of IndexPaths, BitmapAndPaths, and BitmapOrPaths
+ * 'loop_count' is the number of repetitions of the indexscan to factor into
+ *		estimates of caching behavior
+ *
+ * If cost_p isn't NULL, the indexTotalCost estimate is returned in *cost_p.
+ * If tuples_p isn't NULL, the tuples_fetched estimate is returned in *tuples_p.
  */
 double
-compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
-					 int loop_count, Cost *cost, double *tuple)
+compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
+					 Path *bitmapqual, double loop_count,
+					 Cost *cost_p, double *tuples_p)
 {
 	Cost		indexTotalCost;
 	Selectivity indexSelectivity;
@@ -6546,10 +6492,10 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
 							  (lossy_pages / heap_pages) * baserel->tuples);
 	}
 
-	if (cost)
-		*cost = indexTotalCost;
-	if (tuple)
-		*tuple = tuples_fetched;
+	if (cost_p)
+		*cost_p = indexTotalCost;
+	if (tuples_p)
+		*tuples_p = tuples_fetched;
 
 	return pages_fetched;
 }

@@ -19,7 +19,7 @@
  * routines.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -37,14 +37,12 @@
 #include "win32.h"
 #else
 #include <unistd.h>
+#include <sys/select.h>
 #include <sys/time.h>
 #endif
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
-#endif
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
 #endif
 
 #include "libpq-fe.h"
@@ -57,7 +55,6 @@ static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
 static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
 						  time_t end_time);
-static int	pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time);
 
 /*
  * PQlibVersion: return the libpq version number
@@ -572,8 +569,7 @@ pqReadData(PGconn *conn)
 
 	if (conn->sock == PGINVALID_SOCKET)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("connection not open\n"));
+		libpq_append_conn_error(conn, "connection not open");
 		return -1;
 	}
 
@@ -751,10 +747,9 @@ retry4:
 	 * means the connection has been closed.  Cope.
 	 */
 definitelyEOF:
-	appendPQExpBufferStr(&conn->errorMessage,
-						 libpq_gettext("server closed the connection unexpectedly\n"
-									   "\tThis probably means the server terminated abnormally\n"
-									   "\tbefore or while processing the request.\n"));
+	libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
+							"\tThis probably means the server terminated abnormally\n"
+							"\tbefore or while processing the request.");
 
 	/* Come here if lower-level code already set a suitable errorMessage */
 definitelyFailed:
@@ -1004,8 +999,7 @@ pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
 
 	if (result == 0)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("timeout expired\n"));
+		libpq_append_conn_error(conn, "timeout expired");
 		return 1;
 	}
 
@@ -1049,8 +1043,7 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
 		return -1;
 	if (conn->sock == PGINVALID_SOCKET)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("invalid socket\n"));
+		libpq_append_conn_error(conn, "invalid socket");
 		return -1;
 	}
 
@@ -1065,17 +1058,15 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
 
 	/* We will retry as long as we get EINTR */
 	do
-		result = pqSocketPoll(conn->sock, forRead, forWrite, end_time);
+		result = PQsocketPoll(conn->sock, forRead, forWrite, end_time);
 	while (result < 0 && SOCK_ERRNO == EINTR);
 
 	if (result < 0)
 	{
 		char		sebuf[PG_STRERROR_R_BUFLEN];
 
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("%s() failed: %s\n"),
-						  "select",
-						  SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+		libpq_append_conn_error(conn, "%s() failed: %s", "select",
+								SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
 	}
 
 	return result;
@@ -1091,8 +1082,8 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
  * Timeout is infinite if end_time is -1.  Timeout is immediate (no blocking)
  * if end_time is 0 (or indeed, any time before now).
  */
-static int
-pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
+int
+PQsocketPoll(int sock, int forRead, int forWrite, time_t end_time)
 {
 	/* We use poll(2) if available, otherwise select(2) */
 #ifdef HAVE_POLL
@@ -1233,13 +1224,14 @@ static void
 libpq_binddomain(void)
 {
 	/*
-	 * If multiple threads come through here at about the same time, it's okay
-	 * for more than one of them to call bindtextdomain().  But it's not okay
-	 * for any of them to return to caller before bindtextdomain() is
-	 * complete, so don't set the flag till that's done.  Use "volatile" just
-	 * to be sure the compiler doesn't try to get cute.
+	 * At least on Windows, there are gettext implementations that fail if
+	 * multiple threads call bindtextdomain() concurrently.  Use a mutex and
+	 * flag variable to ensure that we call it just once per process.  It is
+	 * not known that similar bugs exist on non-Windows platforms, but we
+	 * might as well do it the same way everywhere.
 	 */
 	static volatile bool already_bound = false;
+	static pthread_mutex_t binddomain_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	if (!already_bound)
 	{
@@ -1249,14 +1241,26 @@ libpq_binddomain(void)
 #else
 		int			save_errno = errno;
 #endif
-		const char *ldir;
 
-		/* No relocatable lookup here because the binary could be anywhere */
-		ldir = getenv("PGLOCALEDIR");
-		if (!ldir)
-			ldir = LOCALEDIR;
-		bindtextdomain(PG_TEXTDOMAIN("libpq"), ldir);
-		already_bound = true;
+		(void) pthread_mutex_lock(&binddomain_mutex);
+
+		if (!already_bound)
+		{
+			const char *ldir;
+
+			/*
+			 * No relocatable lookup here because the calling executable could
+			 * be anywhere
+			 */
+			ldir = getenv("PGLOCALEDIR");
+			if (!ldir)
+				ldir = LOCALEDIR;
+			bindtextdomain(PG_TEXTDOMAIN("libpq"), ldir);
+			already_bound = true;
+		}
+
+		(void) pthread_mutex_unlock(&binddomain_mutex);
+
 #ifdef WIN32
 		SetLastError(save_errno);
 #else
@@ -1280,3 +1284,62 @@ libpq_ngettext(const char *msgid, const char *msgid_plural, unsigned long n)
 }
 
 #endif							/* ENABLE_NLS */
+
+
+/*
+ * Append a formatted string to the given buffer, after translating it.  A
+ * newline is automatically appended; the format should not end with a
+ * newline.
+ */
+void
+libpq_append_error(PQExpBuffer errorMessage, const char *fmt,...)
+{
+	int			save_errno = errno;
+	bool		done;
+	va_list		args;
+
+	Assert(fmt[strlen(fmt) - 1] != '\n');
+
+	if (PQExpBufferBroken(errorMessage))
+		return;					/* already failed */
+
+	/* Loop in case we have to retry after enlarging the buffer. */
+	do
+	{
+		errno = save_errno;
+		va_start(args, fmt);
+		done = appendPQExpBufferVA(errorMessage, libpq_gettext(fmt), args);
+		va_end(args);
+	} while (!done);
+
+	appendPQExpBufferChar(errorMessage, '\n');
+}
+
+/*
+ * Append a formatted string to the error message buffer of the given
+ * connection, after translating it.  A newline is automatically appended; the
+ * format should not end with a newline.
+ */
+void
+libpq_append_conn_error(PGconn *conn, const char *fmt,...)
+{
+	int			save_errno = errno;
+	bool		done;
+	va_list		args;
+
+	Assert(fmt[strlen(fmt) - 1] != '\n');
+
+	if (PQExpBufferBroken(&conn->errorMessage))
+		return;					/* already failed */
+
+	/* Loop in case we have to retry after enlarging the buffer. */
+	do
+	{
+		errno = save_errno;
+		va_start(args, fmt);
+		done = appendPQExpBufferVA(&conn->errorMessage, libpq_gettext(fmt), args);
+		va_end(args);
+	} while (!done);
+
+	appendPQExpBufferChar(&conn->errorMessage, '\n');
+}

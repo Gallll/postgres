@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,7 +20,6 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -30,13 +29,11 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
-#include "utils/syscache.h"
 
 
 /* ----------------------------------------------------------------
@@ -175,7 +172,7 @@ IndexScanEnd(IndexScanDesc scan)
  */
 char *
 BuildIndexValueDescription(Relation indexRelation,
-						   Datum *values, bool *isnull)
+						   const Datum *values, const bool *isnull)
 {
 	StringInfoData buf;
 	Form_pg_index idxrec;
@@ -275,14 +272,15 @@ BuildIndexValueDescription(Relation indexRelation,
 }
 
 /*
- * Get the latestRemovedXid from the table entries pointed at by the index
- * tuples being deleted using an AM-generic approach.
+ * Get the snapshotConflictHorizon from the table entries pointed to by the
+ * index tuples being deleted using an AM-generic approach.
  *
- * This is a table_index_delete_tuples() shim used by index AMs that have
- * simple requirements.  These callers only need to consult the tableam to get
- * a latestRemovedXid value, and only expect to delete tuples that are already
- * known deletable.  When a latestRemovedXid value isn't needed in index AM's
- * deletion WAL record, it is safe for it to skip calling here entirely.
+ * This is a table_index_delete_tuples() shim used by index AMs that only need
+ * to consult the tableam to get a snapshotConflictHorizon value, and only
+ * expect to delete index tuples that are already known deletable (typically
+ * due to having LP_DEAD bits set).  When a snapshotConflictHorizon value
+ * isn't needed in index AM's deletion WAL record, it is safe for it to skip
+ * calling here entirely.
  *
  * We assume that caller index AM uses the standard IndexTuple representation,
  * with table TIDs stored in the t_tid field.  We also expect (and assert)
@@ -297,7 +295,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 									 int nitems)
 {
 	TM_IndexDeleteOp delstate;
-	TransactionId latestRemovedXid = InvalidTransactionId;
+	TransactionId snapshotConflictHorizon = InvalidTransactionId;
 	Page		ipage = BufferGetPage(ibuf);
 	IndexTuple	itup;
 
@@ -333,7 +331,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	}
 
 	/* determine the actual xid horizon */
-	latestRemovedXid = table_index_delete_tuples(hrel, &delstate);
+	snapshotConflictHorizon = table_index_delete_tuples(hrel, &delstate);
 
 	/* assert tableam agrees that all items are deletable */
 	Assert(delstate.ndeltids == nitems);
@@ -341,7 +339,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	pfree(delstate.deltids);
 	pfree(delstate.status);
 
-	return latestRemovedXid;
+	return snapshotConflictHorizon;
 }
 
 
@@ -652,8 +650,10 @@ systable_beginscan_ordered(Relation heapRelation,
 
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
-		elog(ERROR, "cannot do ordered scan on index \"%s\", because it is being reindexed",
-			 RelationGetRelationName(indexRelation));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access index \"%s\" while it is being reindexed",
+						RelationGetRelationName(indexRelation))));
 	/* ... but we only throw a warning about violating IgnoreSystemIndexes */
 	if (IgnoreSystemIndexes)
 		elog(WARNING, "using index \"%s\" despite IgnoreSystemIndexes",

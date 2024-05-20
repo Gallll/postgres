@@ -3,7 +3,7 @@
  * jsonb_gin.c
  *	 GIN support functions for jsonb
  *
- * Copyright (c) 2014-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  * We provide two opclasses for jsonb indexing: jsonb_ops and jsonb_path_ops.
  * For their description see json.sgml and comments in jsonb.h.
@@ -65,7 +65,7 @@
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/jsonb.h"
 #include "utils/jsonpath.h"
 #include "utils/varlena.h"
@@ -88,7 +88,7 @@ typedef enum JsonPathGinNodeType
 {
 	JSP_GIN_OR,
 	JSP_GIN_AND,
-	JSP_GIN_ENTRY
+	JSP_GIN_ENTRY,
 } JsonPathGinNodeType;
 
 typedef struct JsonPathGinNode JsonPathGinNode;
@@ -567,7 +567,7 @@ extract_jsp_path_expr(JsonPathGinContext *cxt, JsonPathGinPath path,
 	/* extract a list of nodes to be AND-ed */
 	List	   *nodes = extract_jsp_path_expr_nodes(cxt, path, jsp, scalar);
 
-	if (list_length(nodes) <= 0)
+	if (nodes == NIL)
 		/* no nodes were extracted => full scan is needed for this path */
 		return NULL;
 
@@ -894,9 +894,10 @@ gin_extract_jsonb_query(PG_FUNCTION_ARGS)
 			/* Nulls in the array are ignored */
 			if (key_nulls[i])
 				continue;
+			/* We rely on the array elements not being toasted */
 			entries[j++] = make_text_key(JGINFLAG_KEY,
-										 VARDATA(key_datums[i]),
-										 VARSIZE(key_datums[i]) - VARHDRSZ);
+										 VARDATA_ANY(key_datums[i]),
+										 VARSIZE_ANY_EXHDR(key_datums[i]));
 		}
 
 		*nentries = j;

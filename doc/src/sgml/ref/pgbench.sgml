@@ -161,8 +161,9 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
 
     <variablelist>
 
-     <varlistentry>
-      <term><replaceable class="parameter">dbname</replaceable></term>
+     <varlistentry id="pgbench-option-dbname">
+      <term><option><optional>-d</optional> <replaceable class="parameter">dbname</replaceable></option></term>
+      <term><option><optional>--dbname=</optional><replaceable class="parameter">dbname</replaceable></option></term>
       <listitem>
        <para>
         Specifies the name of the database to test in. If this is
@@ -173,7 +174,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-initialize">
       <term><option>-i</option></term>
       <term><option>--initialize</option></term>
       <listitem>
@@ -183,7 +184,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-init-steps">
       <term><option>-I <replaceable>init_steps</replaceable></option></term>
       <term><option>--init-steps=<replaceable>init_steps</replaceable></option></term>
       <listitem>
@@ -196,7 +197,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
         The available steps are:
 
         <variablelist>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-d">
           <term><literal>d</literal> (Drop)</term>
           <listitem>
            <para>
@@ -204,7 +205,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
            </para>
           </listitem>
          </varlistentry>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-t">
           <term><literal>t</literal> (create Tables)</term>
           <listitem>
            <para>
@@ -217,7 +218,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
            </para>
           </listitem>
          </varlistentry>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-g">
           <term><literal>g</literal> or <literal>G</literal> (Generate data, client-side or server-side)</term>
           <listitem>
            <para>
@@ -229,12 +230,14 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
             data is generated in <command>pgbench</command> client and then
             sent to the server. This uses the client/server bandwidth
             extensively through a <command>COPY</command>.
-            <command>pgbench</command> uses the FREEZE option with version 14 or later
+            <command>pgbench</command> uses the <option>FREEZE</option> option
+            with version 14 or later
             of <productname>PostgreSQL</productname> to speed up
-            subsequent <command>VACUUM</command>, unless partitions are enabled.
-            Using <literal>g</literal> causes logging to print one message
-            every 100,000 rows while generating data for the
-            <structname>pgbench_accounts</structname> table.
+            subsequent <command>VACUUM</command>, except on the
+            <literal>pgbench_accounts</literal> table if partitions are
+            enabled. Using <literal>g</literal> causes logging to
+            print one message every 100,000 rows while generating data for all
+            tables.
            </para>
            <para>
             With <literal>G</literal> (server-side data generation),
@@ -251,7 +254,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
            </para>
           </listitem>
          </varlistentry>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-v">
           <term><literal>v</literal> (Vacuum)</term>
           <listitem>
            <para>
@@ -259,7 +262,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
            </para>
           </listitem>
          </varlistentry>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-p">
           <term><literal>p</literal> (create Primary keys)</term>
           <listitem>
            <para>
@@ -267,7 +270,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
            </para>
           </listitem>
          </varlistentry>
-         <varlistentry>
+         <varlistentry id="pgbench-option-init-steps-f">
          <term><literal>f</literal> (create Foreign keys)</term>
           <listitem>
            <para>
@@ -280,7 +283,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-fillfactor">
       <term><option>-F</option> <replaceable>fillfactor</replaceable></term>
       <term><option>--fillfactor=</option><replaceable>fillfactor</replaceable></term>
       <listitem>
@@ -293,7 +296,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-no-vacuum-init">
       <term><option>-n</option></term>
       <term><option>--no-vacuum</option></term>
       <listitem>
@@ -305,7 +308,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-quiet">
       <term><option>-q</option></term>
       <term><option>--quiet</option></term>
       <listitem>
@@ -321,7 +324,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-scale-init">
       <term><option>-s</option> <replaceable>scale_factor</replaceable></term>
       <term><option>--scale=</option><replaceable>scale_factor</replaceable></term>
       <listitem>
@@ -338,7 +341,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-foreign-keys">
       <term><option>--foreign-keys</option></term>
       <listitem>
        <para>
@@ -349,7 +352,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-index-tablespace">
       <term><option>--index-tablespace=<replaceable>index_tablespace</replaceable></option></term>
       <listitem>
        <para>
@@ -359,7 +362,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-partition-method">
       <term><option>--partition-method=<replaceable>NAME</replaceable></option></term>
       <listitem>
        <para>
@@ -372,7 +375,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-partitions">
       <term><option>--partitions=<replaceable>NUM</replaceable></option></term>
       <listitem>
        <para>
@@ -384,7 +387,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-tablespace">
       <term><option>--tablespace=<replaceable>tablespace</replaceable></option></term>
       <listitem>
        <para>
@@ -394,7 +397,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-unlogged-tables">
       <term><option>--unlogged-tables</option></term>
       <listitem>
        <para>
@@ -416,7 +419,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
     benchmarking arguments:
 
     <variablelist>
-     <varlistentry>
+     <varlistentry id="pgbench-option-builtin">
       <term><option>-b</option> <replaceable>scriptname[@weight]</replaceable></term>
       <term><option>--builtin</option>=<replaceable>scriptname[@weight]</replaceable></term>
       <listitem>
@@ -437,7 +440,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-client">
       <term><option>-c</option> <replaceable>clients</replaceable></term>
       <term><option>--client=</option><replaceable>clients</replaceable></term>
       <listitem>
@@ -448,7 +451,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-connect">
       <term><option>-C</option></term>
       <term><option>--connect</option></term>
       <listitem>
@@ -460,17 +463,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
-      <term><option>-d</option></term>
-      <term><option>--debug</option></term>
-      <listitem>
-       <para>
-        Print debugging output.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
+     <varlistentry id="pgbench-option-define">
       <term><option>-D</option> <replaceable>varname</replaceable><literal>=</literal><replaceable>value</replaceable></term>
       <term><option>--define=</option><replaceable>varname</replaceable><literal>=</literal><replaceable>value</replaceable></term>
       <listitem>
@@ -481,7 +474,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-file">
       <term><option>-f</option> <replaceable>filename[@weight]</replaceable></term>
       <term><option>--file=</option><replaceable>filename[@weight]</replaceable></term>
       <listitem>
@@ -501,7 +494,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-jobs">
       <term><option>-j</option> <replaceable>threads</replaceable></term>
       <term><option>--jobs=</option><replaceable>threads</replaceable></term>
       <listitem>
@@ -514,7 +507,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-log">
       <term><option>-l</option></term>
       <term><option>--log</option></term>
       <listitem>
@@ -525,7 +518,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-latency-limit">
       <term><option>-L</option> <replaceable>limit</replaceable></term>
       <term><option>--latency-limit=</option><replaceable>limit</replaceable></term>
       <listitem>
@@ -554,7 +547,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
        </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-protocol">
       <term><option>-M</option> <replaceable>querymode</replaceable></term>
       <term><option>--protocol=</option><replaceable>querymode</replaceable></term>
       <listitem>
@@ -584,7 +577,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-no-vacuum-run">
       <term><option>-n</option></term>
       <term><option>--no-vacuum</option></term>
       <listitem>
@@ -599,7 +592,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-skip-some-updates">
       <term><option>-N</option></term>
       <term><option>--skip-some-updates</option></term>
       <listitem>
@@ -610,7 +603,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-progress">
       <term><option>-P</option> <replaceable>sec</replaceable></term>
       <term><option>--progress=</option><replaceable>sec</replaceable></term>
       <listitem>
@@ -629,14 +622,14 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-report-latencies">
       <term><option>-r</option></term>
       <term><option>--report-per-command</option></term>
       <listitem>
        <para>
         Report the following statistics for each command after the benchmark
         finishes: the average per-statement latency (execution time from the
-        perspective of the client), the number of failures and the number of
+        perspective of the client), the number of failures, and the number of
         retries after serialization or deadlock errors in this command.  The
         report displays retry statistics only if the
         <option>--max-tries</option> option is not equal to 1.
@@ -644,7 +637,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-rate">
       <term><option>-R</option> <replaceable>rate</replaceable></term>
       <term><option>--rate=</option><replaceable>rate</replaceable></term>
       <listitem>
@@ -695,7 +688,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-scale-run">
       <term><option>-s</option> <replaceable>scale_factor</replaceable></term>
       <term><option>--scale=</option><replaceable>scale_factor</replaceable></term>
       <listitem>
@@ -710,7 +703,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-select-only">
       <term><option>-S</option></term>
       <term><option>--select-only</option></term>
       <listitem>
@@ -721,7 +714,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-transactions">
       <term><option>-t</option> <replaceable>transactions</replaceable></term>
       <term><option>--transactions=</option><replaceable>transactions</replaceable></term>
       <listitem>
@@ -731,7 +724,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-time">
       <term><option>-T</option> <replaceable>seconds</replaceable></term>
       <term><option>--time=</option><replaceable>seconds</replaceable></term>
       <listitem>
@@ -743,7 +736,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-vacuum-all">
       <term><option>-v</option></term>
       <term><option>--vacuum-all</option></term>
       <listitem>
@@ -756,7 +749,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-aggregate-interval">
       <term><option>--aggregate-interval=<replaceable>seconds</replaceable></option></term>
       <listitem>
        <para>
@@ -767,7 +760,25 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-exit-on-abort">
+      <term><option>--exit-on-abort</option></term>
+      <listitem>
+       <para>
+        Exit immediately when any client is aborted due to some error. Without
+        this option, even when a client is aborted, other clients could
+        continue their run as specified by <option>-t</option>
+        or <option>-T</option> option, and <application>pgbench</application>
+        will print an incomplete results in this case.
+       </para>
+       <para>
+        Note that serialization failures or deadlock failures do not abort the
+        client, so they are not affected by this option.
+        See <xref linkend="failures-and-retries"/> for more information.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="pgbench-option-failures-detailed">
       <term><option>--failures-detailed</option></term>
       <listitem>
        <para>
@@ -786,7 +797,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-log-prefix">
       <term><option>--log-prefix=<replaceable>prefix</replaceable></option></term>
       <listitem>
        <para>
@@ -796,7 +807,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-max-tries">
       <term><option>--max-tries=<replaceable>number_of_tries</replaceable></option></term>
       <listitem>
        <para>
@@ -813,7 +824,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-progress-timestamp">
       <term><option>--progress-timestamp</option></term>
       <listitem>
        <para>
@@ -826,7 +837,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-random-seed">
       <term><option>--random-seed=</option><replaceable>seed</replaceable></term>
       <listitem>
        <para>
@@ -863,7 +874,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-sampling-rate">
       <term><option>--sampling-rate=<replaceable>rate</replaceable></option></term>
       <listitem>
        <para>
@@ -881,7 +892,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-show-script">
       <term><option>--show-script=</option><replaceable>scriptname</replaceable></term>
       <listitem>
        <para>
@@ -891,7 +902,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-verbose-errors">
       <term><option>--verbose-errors</option></term>
       <listitem>
        <para>
@@ -914,11 +925,19 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
 
    <para>
     <application>pgbench</application> also accepts the following common command-line
-    arguments for connection parameters:
+    arguments for connection parameters and other common settings:
 
     <variablelist>
+     <varlistentry id="pgbench-option-debug">
+      <term><option>--debug</option></term>
+      <listitem>
+       <para>
+        Print debugging output.
+       </para>
+      </listitem>
+     </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-host">
       <term><option>-h</option> <replaceable>hostname</replaceable></term>
       <term><option>--host=</option><replaceable>hostname</replaceable></term>
       <listitem>
@@ -928,7 +947,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-port">
       <term><option>-p</option> <replaceable>port</replaceable></term>
       <term><option>--port=</option><replaceable>port</replaceable></term>
       <listitem>
@@ -938,7 +957,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-username">
       <term><option>-U</option> <replaceable>login</replaceable></term>
       <term><option>--username=</option><replaceable>login</replaceable></term>
       <listitem>
@@ -948,7 +967,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-version">
       <term><option>-V</option></term>
       <term><option>--version</option></term>
       <listitem>
@@ -958,7 +977,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="pgbench-option-help">
       <term><option>-?</option></term>
       <term><option>--help</option></term>
       <listitem>
@@ -984,7 +1003,8 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
    benchmark such as initial connection failures also exit with status 1.
    Errors during the run such as database errors or problems in the script
    will result in exit status 2. In the latter case,
-   <application>pgbench</application> will print partial results.
+   <application>pgbench</application> will print partial results if
+   <option>--exit-on-abort</option> option is not specified.
   </para>
  </refsect1>
 
@@ -992,7 +1012,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
   <title>Environment</title>
 
   <variablelist>
-   <varlistentry>
+   <varlistentry id="pgbench-environment-pgdatabase">
     <term><envar>PGDATABASE</envar></term>
     <term><envar>PGHOST</envar></term>
     <term><envar>PGPORT</envar></term>
@@ -1098,7 +1118,8 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
     each SQL command on a single line ending with a semicolon.
    </para>
    <para>
-    It is assumed that pgbench scripts do not contain incomplete blocks of SQL
+    It is assumed that <application>pgbench</application> scripts do not contain
+    incomplete blocks of SQL
     transactions. If at runtime the client reaches the end of the script without
     completing the last transaction block, it will be aborted.
    </para>
@@ -1167,7 +1188,7 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
   </para>
 
   <variablelist>
-   <varlistentry id='pgbench-metacommand-gset'>
+   <varlistentry id="pgbench-metacommand-gset">
     <term>
      <literal>\gset [<replaceable>prefix</replaceable>]</literal>
      <literal>\aset [<replaceable>prefix</replaceable>]</literal>
@@ -1222,7 +1243,7 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="pgbench-metacommand-if-else">
     <term><literal>\if</literal> <replaceable class="parameter">expression</replaceable></term>
     <term><literal>\elif</literal> <replaceable class="parameter">expression</replaceable></term>
     <term><literal>\else</literal></term>
@@ -1237,7 +1258,7 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry id='pgbench-metacommand-set'>
+   <varlistentry id="pgbench-metacommand-set">
     <term>
      <literal>\set <replaceable>varname</replaceable> <replaceable>expression</replaceable></literal>
     </term>
@@ -1292,7 +1313,7 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="pgbench-metacommand-sleep">
     <term>
      <literal>\sleep <replaceable>number</replaceable> [ us | ms | s ]</literal>
     </term>
@@ -1315,7 +1336,7 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="pgbench-metacommand-setshell">
     <term>
      <literal>\setshell <replaceable>varname</replaceable> <replaceable>command</replaceable> [ <replaceable>argument</replaceable> ... ]</literal>
     </term>
@@ -1343,7 +1364,7 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="pgbench-metacommand-shell">
     <term>
      <literal>\shell <replaceable>command</replaceable> [ <replaceable>argument</replaceable> ... ]</literal>
     </term>
@@ -1362,15 +1383,21 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
-   <varlistentry id='pgbench-metacommand-pipeline'>
+   <varlistentry id="pgbench-metacommand-pipeline">
     <term><literal>\startpipeline</literal></term>
+    <term><literal>\syncpipeline</literal></term>
     <term><literal>\endpipeline</literal></term>
 
     <listitem>
       <para>
-        These commands delimit the start and end of a pipeline of SQL
-        statements.  In pipeline mode, statements are sent to the server
-        without waiting for the results of previous statements.  See
+        This group of commands implements pipelining of SQL statements.
+        A pipeline must begin with a <command>\startpipeline</command>
+        and end with an <command>\endpipeline</command>. In between there
+        may be any number of <command>\syncpipeline</command> commands,
+        which sends a <link linkend="protocol-flow-ext-query">sync message</link>
+        without ending the ongoing pipeline and flushing the send buffer.
+        In pipeline mode, statements are sent to the server without waiting
+        for the results of previous statements.  See
         <xref linkend="libpq-pipeline-mode"/> for more details.
         Pipeline mode requires the use of extended query protocol.
      </para>
@@ -2616,7 +2643,7 @@ END;
   </para>
 
   <para>
-   Here is some example output generated with these options:
+   Here is some example output generated with this option:
 <screen>
 <userinput>pgbench --aggregate-interval=10 --time=20 --client=10 --log --rate=1000 --latency-limit=10 --failures-detailed --max-tries=10 test</userinput>
 
@@ -2800,14 +2827,17 @@ statement latencies in milliseconds, failures and retries:
          start a connection to the database server / the socket for connecting
          the client to the database server has become invalid). In such cases
          all clients of this thread stop while other threads continue to work.
+         However, <option>--exit-on-abort</option> is specified, all of the
+         threads stop immediately in this case.
        </para>
      </listitem>
      <listitem>
        <para>
          Direct client errors. They lead to immediate exit from
          <application>pgbench</application> with the corresponding error message
-         only in the case of an internal <application>pgbench</application>
-         error (which are supposed to never occur...). Otherwise in the worst
+         in the case of an internal <application>pgbench</application>
+         error (which are supposed to never occur...) or when
+         <option>--exit-on-abort</option> is specified. Otherwise in the worst
          case they only lead to the abortion of the failed client while other
          clients continue their run (but some client errors are handled without
          an abortion of the client and reported separately, see below). Later in

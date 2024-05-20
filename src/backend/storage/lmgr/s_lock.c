@@ -36,7 +36,7 @@
  * the probability of unintended failure) than to fix the total time
  * spent.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -53,6 +53,7 @@
 #include "common/pg_prng.h"
 #include "port/atomics.h"
 #include "storage/s_lock.h"
+#include "utils/wait_event.h"
 
 #define MIN_SPINS_PER_DELAY 10
 #define MAX_SPINS_PER_DELAY 1000
@@ -60,8 +61,14 @@
 #define MIN_DELAY_USEC		1000L
 #define MAX_DELAY_USEC		1000000L
 
-
-slock_t		dummy_spinlock;
+#ifdef S_LOCK_TEST
+/*
+ * These are needed by pgstat_report_wait_start in the standalone compile of
+ * s_lock_test.
+ */
+static uint32 local_my_wait_event_info;
+uint32	   *my_wait_event_info = &local_my_wait_event_info;
+#endif
 
 static int	spins_per_delay = DEFAULT_SPINS_PER_DELAY;
 
@@ -136,7 +143,17 @@ perform_spin_delay(SpinDelayStatus *status)
 		if (status->cur_delay == 0) /* first time to delay? */
 			status->cur_delay = MIN_DELAY_USEC;
 
+		/*
+		 * Once we start sleeping, the overhead of reporting a wait event is
+		 * justified. Actively spinning easily stands out in profilers, but
+		 * sleeping with an exponential backoff is harder to spot...
+		 *
+		 * We might want to report something more granular at some point, but
+		 * this is better than nothing.
+		 */
+		pgstat_report_wait_start(WAIT_EVENT_SPIN_DELAY);
 		pg_usleep(status->cur_delay);
+		pgstat_report_wait_end();
 
 #if defined(S_LOCK_TEST)
 		fprintf(stdout, "*");
@@ -304,7 +321,7 @@ main()
 	printf("             if S_LOCK() and TAS() are working.\n");
 	fflush(stdout);
 
-	s_lock(&test_lock.lock, __FILE__, __LINE__, PG_FUNCNAME_MACRO);
+	s_lock(&test_lock.lock, __FILE__, __LINE__, __func__);
 
 	printf("S_LOCK_TEST: failed, lock not locked\n");
 	return 1;

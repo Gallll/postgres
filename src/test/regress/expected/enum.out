@@ -24,6 +24,34 @@ SELECT 'mauve'::rainbow;
 ERROR:  invalid input value for enum rainbow: "mauve"
 LINE 1: SELECT 'mauve'::rainbow;
                ^
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('red', 'rainbow');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('mauve', 'rainbow');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('mauve', 'rainbow');
+                    message                    | detail | hint | sql_error_code 
+-----------------------------------------------+--------+------+----------------
+ invalid input value for enum rainbow: "mauve" |        |      | 22P02
+(1 row)
+
+\x
+SELECT * FROM pg_input_error_info(repeat('too_long', 32), 'rainbow');
+-[ RECORD 1 ]--+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+message        | invalid input value for enum rainbow: "too_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_longtoo_long"
+detail         | 
+hint           | 
+sql_error_code | 22P02
+
+\x
 --
 -- adding new values
 --
@@ -656,16 +684,18 @@ select enum_range(null::bogon);
 (1 row)
 
 ROLLBACK;
--- ideally, we'd allow this usage; but it requires keeping track of whether
--- the enum type was created in the current transaction, which is expensive
+-- we must allow this usage to support pg_dump in binary upgrade mode
 BEGIN;
 CREATE TYPE bogus AS ENUM('good');
 ALTER TYPE bogus RENAME TO bogon;
 ALTER TYPE bogon ADD VALUE 'bad';
 ALTER TYPE bogon ADD VALUE 'ugly';
-select enum_range(null::bogon);  -- fails
-ERROR:  unsafe use of new value "bad" of enum type bogon
-HINT:  New enum values must be committed before they can be used.
+select enum_range(null::bogon);
+   enum_range    
+-----------------
+ {good,bad,ugly}
+(1 row)
+
 ROLLBACK;
 --
 -- Cleanup

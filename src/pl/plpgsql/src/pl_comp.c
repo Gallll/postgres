@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -271,7 +271,6 @@ do_compile(FunctionCallInfo fcinfo,
 	bool		is_dml_trigger = CALLED_AS_TRIGGER(fcinfo);
 	bool		is_event_trigger = CALLED_AS_EVENT_TRIGGER(fcinfo);
 	Datum		prosrcdatum;
-	bool		isnull;
 	char	   *proc_source;
 	HeapTuple	typeTup;
 	Form_pg_type typeStruct;
@@ -296,10 +295,7 @@ do_compile(FunctionCallInfo fcinfo,
 	 * cannot be invoked recursively, so there's no need to save and restore
 	 * the static variables used here.
 	 */
-	prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-								  Anum_pg_proc_prosrc, &isnull);
-	if (isnull)
-		elog(ERROR, "null prosrc");
+	prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup, Anum_pg_proc_prosrc);
 	proc_source = TextDatumGetCString(prosrcdatum);
 	plpgsql_scanner_init(proc_source);
 
@@ -1600,19 +1596,16 @@ plpgsql_parse_tripword(char *word1, char *word2, char *word3,
 
 
 /* ----------
- * plpgsql_parse_wordtype	The scanner found word%TYPE. word can be
- *				a variable name or a basetype.
+ * plpgsql_parse_wordtype	The scanner found word%TYPE. word should be
+ *				a pre-existing variable name.
  *
- * Returns datatype struct, or NULL if no match found for word.
+ * Returns datatype struct.  Throws error if no match found for word.
  * ----------
  */
 PLpgSQL_type *
 plpgsql_parse_wordtype(char *ident)
 {
-	PLpgSQL_type *dtype;
 	PLpgSQL_nsitem *nse;
-	TypeName   *typeName;
-	HeapTuple	typeTup;
 
 	/*
 	 * Do a lookup in the current namespace stack
@@ -1627,49 +1620,27 @@ plpgsql_parse_wordtype(char *ident)
 		{
 			case PLPGSQL_NSTYPE_VAR:
 				return ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
-
-				/* XXX perhaps allow REC/ROW here? */
-
+			case PLPGSQL_NSTYPE_REC:
+				return ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
 			default:
-				return NULL;
+				break;
 		}
 	}
 
-	/*
-	 * Word wasn't found in the namespace stack. Try to find a data type with
-	 * that name, but ignore shell types and complex types.
-	 */
-	typeName = makeTypeName(ident);
-	typeTup = LookupTypeName(NULL, typeName, NULL, false);
-	if (typeTup)
-	{
-		Form_pg_type typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
-
-		if (!typeStruct->typisdefined ||
-			typeStruct->typrelid != InvalidOid)
-		{
-			ReleaseSysCache(typeTup);
-			return NULL;
-		}
-
-		dtype = build_datatype(typeTup, -1,
-							   plpgsql_curr_compile->fn_input_collation,
-							   typeName);
-
-		ReleaseSysCache(typeTup);
-		return dtype;
-	}
-
-	/*
-	 * Nothing found - up to now it's a word without any special meaning for
-	 * us.
-	 */
-	return NULL;
+	/* No match, complain */
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("variable \"%s\" does not exist", ident)));
+	return NULL;				/* keep compiler quiet */
 }
 
 
 /* ----------
  * plpgsql_parse_cwordtype		Same lookup for compositeword%TYPE
+ *
+ * Here, we allow either a block-qualified variable name, or a reference
+ * to a column of some table.  (If we must throw error, we assume that the
+ * latter case was intended.)
  * ----------
  */
 PLpgSQL_type *
@@ -1677,12 +1648,12 @@ plpgsql_parse_cwordtype(List *idents)
 {
 	PLpgSQL_type *dtype = NULL;
 	PLpgSQL_nsitem *nse;
-	const char *fldname;
+	int			nnames;
+	RangeVar   *relvar = NULL;
+	const char *fldname = NULL;
 	Oid			classOid;
-	HeapTuple	classtup = NULL;
 	HeapTuple	attrtup = NULL;
 	HeapTuple	typetup = NULL;
-	Form_pg_class classStruct;
 	Form_pg_attribute attrStruct;
 	MemoryContext oldCxt;
 
@@ -1692,70 +1663,64 @@ plpgsql_parse_cwordtype(List *idents)
 	if (list_length(idents) == 2)
 	{
 		/*
-		 * Do a lookup in the current namespace stack. We don't need to check
-		 * number of names matched, because we will only consider scalar
-		 * variables.
+		 * Do a lookup in the current namespace stack
 		 */
 		nse = plpgsql_ns_lookup(plpgsql_ns_top(), false,
 								strVal(linitial(idents)),
 								strVal(lsecond(idents)),
 								NULL,
-								NULL);
+								&nnames);
 
 		if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_VAR)
 		{
+			/* Block-qualified reference to scalar variable. */
 			dtype = ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
+			goto done;
+		}
+		else if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_REC &&
+				 nnames == 2)
+		{
+			/* Block-qualified reference to record variable. */
+			dtype = ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
 			goto done;
 		}
 
 		/*
 		 * First word could also be a table name
 		 */
-		classOid = RelnameGetRelid(strVal(linitial(idents)));
-		if (!OidIsValid(classOid))
-			goto done;
+		relvar = makeRangeVar(NULL,
+							  strVal(linitial(idents)),
+							  -1);
 		fldname = strVal(lsecond(idents));
 	}
-	else if (list_length(idents) == 3)
-	{
-		RangeVar   *relvar;
-
-		relvar = makeRangeVar(strVal(linitial(idents)),
-							  strVal(lsecond(idents)),
-							  -1);
-		/* Can't lock relation - we might not have privileges. */
-		classOid = RangeVarGetRelid(relvar, NoLock, true);
-		if (!OidIsValid(classOid))
-			goto done;
-		fldname = strVal(lthird(idents));
-	}
 	else
-		goto done;
+	{
+		/*
+		 * We could check for a block-qualified reference to a field of a
+		 * record variable, but %TYPE is documented as applying to variables,
+		 * not fields of variables.  Things would get rather ambiguous if we
+		 * allowed either interpretation.
+		 */
+		List	   *rvnames;
 
-	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(classOid));
-	if (!HeapTupleIsValid(classtup))
-		goto done;
-	classStruct = (Form_pg_class) GETSTRUCT(classtup);
+		Assert(list_length(idents) > 2);
+		rvnames = list_delete_last(list_copy(idents));
+		relvar = makeRangeVarFromNameList(rvnames);
+		fldname = strVal(llast(idents));
+	}
 
-	/*
-	 * It must be a relation, sequence, view, materialized view, composite
-	 * type, or foreign table
-	 */
-	if (classStruct->relkind != RELKIND_RELATION &&
-		classStruct->relkind != RELKIND_SEQUENCE &&
-		classStruct->relkind != RELKIND_VIEW &&
-		classStruct->relkind != RELKIND_MATVIEW &&
-		classStruct->relkind != RELKIND_COMPOSITE_TYPE &&
-		classStruct->relkind != RELKIND_FOREIGN_TABLE &&
-		classStruct->relkind != RELKIND_PARTITIONED_TABLE)
-		goto done;
+	/* Look up relation name.  Can't lock it - we might not have privileges. */
+	classOid = RangeVarGetRelid(relvar, NoLock, false);
 
 	/*
 	 * Fetch the named table field and its type
 	 */
 	attrtup = SearchSysCacheAttName(classOid, fldname);
 	if (!HeapTupleIsValid(attrtup))
-		goto done;
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						fldname, relvar->relname)));
 	attrStruct = (Form_pg_attribute) GETSTRUCT(attrtup);
 
 	typetup = SearchSysCache1(TYPEOID,
@@ -1776,8 +1741,6 @@ plpgsql_parse_cwordtype(List *idents)
 	MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 
 done:
-	if (HeapTupleIsValid(classtup))
-		ReleaseSysCache(classtup);
 	if (HeapTupleIsValid(attrtup))
 		ReleaseSysCache(attrtup);
 	if (HeapTupleIsValid(typetup))
@@ -1841,16 +1804,12 @@ plpgsql_parse_cwordrowtype(List *idents)
 	 * As above, this is a relation lookup but could be a type lookup if we
 	 * weren't being backwards-compatible about error wording.
 	 */
-	if (list_length(idents) != 2)
-		return NULL;
 
 	/* Avoid memory leaks in long-term function context */
 	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 
 	/* Look up relation name.  Can't lock it - we might not have privileges. */
-	relvar = makeRangeVar(strVal(linitial(idents)),
-						  strVal(lsecond(idents)),
-						  -1);
+	relvar = makeRangeVarFromNameList(idents);
 	classOid = RangeVarGetRelid(relvar, NoLock, false);
 
 	/* Some relkinds lack type OIDs */
@@ -1859,7 +1818,7 @@ plpgsql_parse_cwordrowtype(List *idents)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" does not have a composite type",
-						strVal(lsecond(idents)))));
+						relvar->relname)));
 
 	MemoryContextSwitchTo(oldCxt);
 
@@ -2213,6 +2172,33 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 }
 
 /*
+ * Build an array type for the element type specified as argument.
+ */
+PLpgSQL_type *
+plpgsql_build_datatype_arrayof(PLpgSQL_type *dtype)
+{
+	Oid			array_typeid;
+
+	/*
+	 * If it's already an array type, use it as-is: Postgres doesn't do nested
+	 * arrays.
+	 */
+	if (dtype->typisarray)
+		return dtype;
+
+	array_typeid = get_array_type(dtype->typoid);
+	if (!OidIsValid(array_typeid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("could not find array type for data type %s",
+						format_type_be(dtype->typoid))));
+
+	/* Note we inherit typmod and collation, if any, from the element type */
+	return plpgsql_build_datatype(array_typeid, dtype->atttypmod,
+								  dtype->collation, NULL);
+}
+
+/*
  *	plpgsql_recognize_err_condition
  *		Check condition name and translate it to SQLSTATE.
  *
@@ -2498,9 +2484,15 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 
 /*
  * This is the same as the standard resolve_polymorphic_argtypes() function,
- * but with a special case for validation: assume that polymorphic arguments
- * are integer, integer-array or integer-range.  Also, we go ahead and report
- * the error if we can't resolve the types.
+ * except that:
+ * 1. We go ahead and report the error if we can't resolve the types.
+ * 2. We treat RECORD-type input arguments (not output arguments) as if
+ *    they were polymorphic, replacing their types with the actual input
+ *    types if we can determine those.  This allows us to create a separate
+ *    function cache entry for each named composite type passed to such an
+ *    argument.
+ * 3. In validation mode, we have no inputs to look at, so assume that
+ *    polymorphic arguments are integer, integer-array or integer-range.
  */
 static void
 plpgsql_resolve_polymorphic_argtypes(int numargs,
@@ -2512,6 +2504,8 @@ plpgsql_resolve_polymorphic_argtypes(int numargs,
 
 	if (!forValidator)
 	{
+		int			inargno;
+
 		/* normal case, pass to standard routine */
 		if (!resolve_polymorphic_argtypes(numargs, argtypes, argmodes,
 										  call_expr))
@@ -2520,10 +2514,28 @@ plpgsql_resolve_polymorphic_argtypes(int numargs,
 					 errmsg("could not determine actual argument "
 							"type for polymorphic function \"%s\"",
 							proname)));
+		/* also, treat RECORD inputs (but not outputs) as polymorphic */
+		inargno = 0;
+		for (i = 0; i < numargs; i++)
+		{
+			char		argmode = argmodes ? argmodes[i] : PROARGMODE_IN;
+
+			if (argmode == PROARGMODE_OUT || argmode == PROARGMODE_TABLE)
+				continue;
+			if (argtypes[i] == RECORDOID || argtypes[i] == RECORDARRAYOID)
+			{
+				Oid			resolvedtype = get_call_expr_argtype(call_expr,
+																 inargno);
+
+				if (OidIsValid(resolvedtype))
+					argtypes[i] = resolvedtype;
+			}
+			inargno++;
+		}
 	}
 	else
 	{
-		/* special validation case */
+		/* special validation case (no need to do anything for RECORD) */
 		for (i = 0; i < numargs; i++)
 		{
 			switch (argtypes[i])
@@ -2601,7 +2613,7 @@ plpgsql_HashTableLookup(PLpgSQL_func_hashkey *func_key)
 	plpgsql_HashEnt *hentry;
 
 	hentry = (plpgsql_HashEnt *) hash_search(plpgsql_HashTable,
-											 (void *) func_key,
+											 func_key,
 											 HASH_FIND,
 											 NULL);
 	if (hentry)
@@ -2618,7 +2630,7 @@ plpgsql_HashTableInsert(PLpgSQL_function *function,
 	bool		found;
 
 	hentry = (plpgsql_HashEnt *) hash_search(plpgsql_HashTable,
-											 (void *) func_key,
+											 func_key,
 											 HASH_ENTER,
 											 &found);
 	if (found)
@@ -2639,7 +2651,7 @@ plpgsql_HashTableDelete(PLpgSQL_function *function)
 		return;
 
 	hentry = (plpgsql_HashEnt *) hash_search(plpgsql_HashTable,
-											 (void *) function->fn_hashkey,
+											 function->fn_hashkey,
 											 HASH_REMOVE,
 											 NULL);
 	if (hentry == NULL)

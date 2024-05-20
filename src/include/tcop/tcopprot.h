@@ -4,7 +4,7 @@
  *	  prototypes for postgres.c.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/tcopprot.h
@@ -15,7 +15,6 @@
 #define TCOPPROT_H
 
 #include "nodes/params.h"
-#include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
 #include "storage/procsignal.h"
 #include "utils/guc.h"
@@ -38,7 +37,7 @@ typedef enum
 	LOGSTMT_NONE,				/* log no statements */
 	LOGSTMT_DDL,				/* log data definition statements */
 	LOGSTMT_MOD,				/* log modification statements, plus DDL */
-	LOGSTMT_ALL					/* log all statements */
+	LOGSTMT_ALL,				/* log all statements */
 } LogStmtLevel;
 
 extern PGDLLIMPORT int log_statement;
@@ -66,15 +65,11 @@ extern List *pg_plan_queries(List *querytrees, const char *query_string,
 							 int cursorOptions,
 							 ParamListInfo boundParams);
 
-extern bool check_max_stack_depth(int *newval, void **extra, GucSource source);
-extern void assign_max_stack_depth(int newval, void *extra);
-
 extern void die(SIGNAL_ARGS);
 extern void quickdie(SIGNAL_ARGS) pg_attribute_noreturn();
 extern void StatementCancelHandler(SIGNAL_ARGS);
 extern void FloatExceptionHandler(SIGNAL_ARGS) pg_attribute_noreturn();
-extern void RecoveryConflictInterrupt(ProcSignalReason reason); /* called from SIGUSR1
-																 * handler */
+extern void HandleRecoveryConflictInterrupt(ProcSignalReason reason);
 extern void ProcessClientReadInterrupt(bool blocked);
 extern void ProcessClientWriteInterrupt(bool blocked);
 

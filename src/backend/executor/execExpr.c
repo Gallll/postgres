@@ -19,7 +19,7 @@
  *	and "Expression Evaluation" sections.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,7 @@
 
 #include "access/nbtree.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
@@ -46,20 +47,21 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
-#include "utils/json.h"
-#include "utils/jsonb.h"
+#include "utils/jsonfuncs.h"
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
 
-typedef struct LastAttnumInfo
+typedef struct ExprSetupInfo
 {
+	/* Highest attribute numbers fetched from inner/outer/scan tuple slots: */
 	AttrNumber	last_inner;
 	AttrNumber	last_outer;
 	AttrNumber	last_scan;
-} LastAttnumInfo;
+	/* MULTIEXPR SubPlan nodes appearing in the expression: */
+	List	   *multiexpr_subplans;
+} ExprSetupInfo;
 
 static void ExecReadyExpr(ExprState *state);
 static void ExecInitExprRec(Expr *node, ExprState *state,
@@ -67,9 +69,9 @@ static void ExecInitExprRec(Expr *node, ExprState *state,
 static void ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args,
 						 Oid funcid, Oid inputcollid,
 						 ExprState *state);
-static void ExecInitExprSlots(ExprState *state, Node *node);
-static void ExecPushExprSlots(ExprState *state, LastAttnumInfo *info);
-static bool get_last_attnums_walker(Node *node, LastAttnumInfo *info);
+static void ExecCreateExprSetupSteps(ExprState *state, Node *node);
+static void ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info);
+static bool expr_setup_walker(Node *node, ExprSetupInfo *info);
 static bool ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op);
 static void ExecInitWholeRowVar(ExprEvalStep *scratch, Var *variable,
 								ExprState *state);
@@ -86,41 +88,13 @@ static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 								  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
 								  int transno, int setno, int setoff, bool ishash,
 								  bool nullcheck);
+static void ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
+							 Datum *resv, bool *resnull,
+							 ExprEvalStep *scratch);
+static void ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
+								 ErrorSaveContext *escontext,
+								 Datum *resv, bool *resnull);
 
-
-static ExprState *
-ExecInitExprInternal(Expr *node, PlanState *parent, ParamListInfo ext_params,
-					 Datum *caseval, bool *casenull)
-{
-	ExprState  *state;
-	ExprEvalStep scratch = {0};
-
-	/* Special case: NULL expression produces a NULL ExprState pointer */
-	if (node == NULL)
-		return NULL;
-
-	/* Initialize ExprState with empty step list */
-	state = makeNode(ExprState);
-	state->expr = node;
-	state->parent = parent;
-	state->ext_params = ext_params;
-	state->innermost_caseval = caseval;
-	state->innermost_casenull = casenull;
-
-	/* Insert EEOP_*_FETCHSOME steps as needed */
-	ExecInitExprSlots(state, (Node *) node);
-
-	/* Compile the expression proper */
-	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
-
-	/* Finally, append a DONE step */
-	scratch.opcode = EEOP_DONE;
-	ExprEvalPushStep(state, &scratch);
-
-	ExecReadyExpr(state);
-
-	return state;
-}
 
 /*
  * ExecInitExpr: prepare an expression tree for execution
@@ -159,7 +133,32 @@ ExecInitExprInternal(Expr *node, PlanState *parent, ParamListInfo ext_params,
 ExprState *
 ExecInitExpr(Expr *node, PlanState *parent)
 {
-	return ExecInitExprInternal(node, parent, NULL, NULL, NULL);
+	ExprState  *state;
+	ExprEvalStep scratch = {0};
+
+	/* Special case: NULL expression produces a NULL ExprState pointer */
+	if (node == NULL)
+		return NULL;
+
+	/* Initialize ExprState with empty step list */
+	state = makeNode(ExprState);
+	state->expr = node;
+	state->parent = parent;
+	state->ext_params = NULL;
+
+	/* Insert setup steps as needed */
+	ExecCreateExprSetupSteps(state, (Node *) node);
+
+	/* Compile the expression proper */
+	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
+
+	/* Finally, append a DONE step */
+	scratch.opcode = EEOP_DONE;
+	ExprEvalPushStep(state, &scratch);
+
+	ExecReadyExpr(state);
+
+	return state;
 }
 
 /*
@@ -171,20 +170,32 @@ ExecInitExpr(Expr *node, PlanState *parent)
 ExprState *
 ExecInitExprWithParams(Expr *node, ParamListInfo ext_params)
 {
-	return ExecInitExprInternal(node, NULL, ext_params, NULL, NULL);
-}
+	ExprState  *state;
+	ExprEvalStep scratch = {0};
 
-/*
- * ExecInitExprWithCaseValue: prepare an expression tree for execution
- *
- * This is the same as ExecInitExpr, except that a pointer to the value for
- * CasTestExpr is passed here.
- */
-ExprState *
-ExecInitExprWithCaseValue(Expr *node, PlanState *parent,
-						  Datum *caseval, bool *casenull)
-{
-	return ExecInitExprInternal(node, parent, NULL, caseval, casenull);
+	/* Special case: NULL expression produces a NULL ExprState pointer */
+	if (node == NULL)
+		return NULL;
+
+	/* Initialize ExprState with empty step list */
+	state = makeNode(ExprState);
+	state->expr = node;
+	state->parent = NULL;
+	state->ext_params = ext_params;
+
+	/* Insert setup steps as needed */
+	ExecCreateExprSetupSteps(state, (Node *) node);
+
+	/* Compile the expression proper */
+	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
+
+	/* Finally, append a DONE step */
+	scratch.opcode = EEOP_DONE;
+	ExprEvalPushStep(state, &scratch);
+
+	ExecReadyExpr(state);
+
+	return state;
 }
 
 /*
@@ -211,7 +222,6 @@ ExecInitQual(List *qual, PlanState *parent)
 	ExprState  *state;
 	ExprEvalStep scratch = {0};
 	List	   *adjust_jumps = NIL;
-	ListCell   *lc;
 
 	/* short-circuit (here and in ExecQual) for empty restriction list */
 	if (qual == NIL)
@@ -227,8 +237,8 @@ ExecInitQual(List *qual, PlanState *parent)
 	/* mark expression as to be used with ExecQual() */
 	state->flags = EEO_FLAG_IS_QUAL;
 
-	/* Insert EEOP_*_FETCHSOME steps as needed */
-	ExecInitExprSlots(state, (Node *) qual);
+	/* Insert setup steps as needed */
+	ExecCreateExprSetupSteps(state, (Node *) qual);
 
 	/*
 	 * ExecQual() needs to return false for an expression returning NULL. That
@@ -245,10 +255,8 @@ ExecInitQual(List *qual, PlanState *parent)
 	scratch.resvalue = &state->resvalue;
 	scratch.resnull = &state->resnull;
 
-	foreach(lc, qual)
+	foreach_ptr(Expr, node, qual)
 	{
-		Expr	   *node = (Expr *) lfirst(lc);
-
 		/* first evaluate expression */
 		ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
 
@@ -260,9 +268,9 @@ ExecInitQual(List *qual, PlanState *parent)
 	}
 
 	/* adjust jump targets */
-	foreach(lc, adjust_jumps)
+	foreach_int(jump, adjust_jumps)
 	{
-		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+		ExprEvalStep *as = &state->steps[jump];
 
 		Assert(as->opcode == EEOP_QUAL);
 		Assert(as->d.qualexpr.jumpdone == -1);
@@ -371,8 +379,8 @@ ExecBuildProjectionInfo(List *targetList,
 
 	state->resultslot = slot;
 
-	/* Insert EEOP_*_FETCHSOME steps as needed */
-	ExecInitExprSlots(state, (Node *) targetList);
+	/* Insert setup steps as needed */
+	ExecCreateExprSetupSteps(state, (Node *) targetList);
 
 	/* Now compile each tlist column */
 	foreach(lc, targetList)
@@ -523,7 +531,7 @@ ExecBuildUpdateProjection(List *targetList,
 	int			nAssignableCols;
 	bool		sawJunk;
 	Bitmapset  *assignedCols;
-	LastAttnumInfo deform = {0, 0, 0};
+	ExprSetupInfo deform = {0, 0, 0, NIL};
 	ExprEvalStep scratch = {0};
 	int			outerattnum;
 	ListCell   *lc,
@@ -602,17 +610,18 @@ ExecBuildUpdateProjection(List *targetList,
 	 * number of columns of the "outer" tuple.
 	 */
 	if (evalTargetList)
-		get_last_attnums_walker((Node *) targetList, &deform);
+		expr_setup_walker((Node *) targetList, &deform);
 	else
 		deform.last_outer = nAssignableCols;
 
-	ExecPushExprSlots(state, &deform);
+	ExecPushExprSetupSteps(state, &deform);
 
 	/*
 	 * Now generate code to evaluate the tlist's assignable expressions or
 	 * fetch them from the outer tuple, incidentally validating that they'll
 	 * be of the right data type.  The checks above ensure that the forboth()
-	 * will iterate over exactly the non-junk columns.
+	 * will iterate over exactly the non-junk columns.  Note that we don't
+	 * bother evaluating any remaining resjunk columns.
 	 */
 	outerattnum = 0;
 	forboth(lc, targetList, lc2, targetColnos)
@@ -673,22 +682,6 @@ ExecBuildUpdateProjection(List *targetList,
 			ExprEvalPushStep(state, &scratch);
 		}
 		outerattnum++;
-	}
-
-	/*
-	 * If we're evaluating the tlist, must evaluate any resjunk columns too.
-	 * (This matters for things like MULTIEXPR_SUBLINK SubPlans.)
-	 */
-	if (evalTargetList)
-	{
-		for_each_cell(lc, targetList, lc)
-		{
-			TargetEntry *tle = lfirst_node(TargetEntry, lc);
-
-			Assert(tle->resjunk);
-			ExecInitExprRec(tle->expr, state,
-							&state->resvalue, &state->resnull);
-		}
 	}
 
 	/*
@@ -1121,6 +1114,19 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
+		case T_MergeSupportFunc:
+			{
+				/* must be in a MERGE, else something messed up */
+				if (!state->parent ||
+					!IsA(state->parent, ModifyTableState) ||
+					((ModifyTableState *) state->parent)->operation != CMD_MERGE)
+					elog(ERROR, "MergeSupportFunc found in non-merge plan node");
+
+				scratch.opcode = EEOP_MERGE_SUPPORT_FUNC;
+				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
 		case T_SubscriptingRef:
 			{
 				SubscriptingRef *sbsref = (SubscriptingRef *) node;
@@ -1224,9 +1230,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				arrayarg = (Expr *) lsecond(opexpr->args);
 
 				/* Check permission to call function */
-				aclresult = pg_proc_aclcheck(cmpfuncid,
-											 GetUserId(),
-											 ACL_EXECUTE);
+				aclresult = object_aclcheck(ProcedureRelationId, cmpfuncid,
+											GetUserId(),
+											ACL_EXECUTE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_FUNCTION,
 								   get_func_name(cmpfuncid));
@@ -1234,9 +1240,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				if (OidIsValid(opexpr->hashfuncid))
 				{
-					aclresult = pg_proc_aclcheck(opexpr->hashfuncid,
-												 GetUserId(),
-												 ACL_EXECUTE);
+					aclresult = object_aclcheck(ProcedureRelationId, opexpr->hashfuncid,
+												GetUserId(),
+												ACL_EXECUTE);
 					if (aclresult != ACLCHECK_OK)
 						aclcheck_error(aclresult, OBJECT_FUNCTION,
 									   get_func_name(opexpr->hashfuncid));
@@ -1401,6 +1407,21 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				SubPlan    *subplan = (SubPlan *) node;
 				SubPlanState *sstate;
 
+				/*
+				 * Real execution of a MULTIEXPR SubPlan has already been
+				 * done. What we have to do here is return a dummy NULL record
+				 * value in case this targetlist element is assigned
+				 * someplace.
+				 */
+				if (subplan->subLinkType == MULTIEXPR_SUBLINK)
+				{
+					scratch.opcode = EEOP_CONST;
+					scratch.d.constval.value = (Datum) 0;
+					scratch.d.constval.isnull = true;
+					ExprEvalPushStep(state, &scratch);
+					break;
+				}
+
 				if (!state->parent)
 					elog(ERROR, "SubPlan found with no parent plan");
 
@@ -1558,7 +1579,10 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 * We don't check permissions here as a type's input/output
 				 * function are assumed to be executable by everyone.
 				 */
-				scratch.opcode = EEOP_IOCOERCE;
+				if (state->escontext == NULL)
+					scratch.opcode = EEOP_IOCOERCE;
+				else
+					scratch.opcode = EEOP_IOCOERCE_SAFE;
 
 				/* lookup the source type's output function */
 				scratch.d.iocoerce.finfo_out = palloc0(sizeof(FmgrInfo));
@@ -1593,6 +1617,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				fcinfo_in->args[1].isnull = false;
 				fcinfo_in->args[2].value = Int32GetDatum(-1);
 				fcinfo_in->args[2].isnull = false;
+
+				fcinfo_in->context = (Node *) state->escontext;
 
 				ExprEvalPushStep(state, &scratch);
 				break;
@@ -2286,6 +2312,143 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
+		case T_JsonValueExpr:
+			{
+				JsonValueExpr *jve = (JsonValueExpr *) node;
+
+				Assert(jve->formatted_expr != NULL);
+				ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
+				break;
+			}
+
+		case T_JsonConstructorExpr:
+			{
+				JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+				List	   *args = ctor->args;
+				ListCell   *lc;
+				int			nargs = list_length(args);
+				int			argno = 0;
+
+				if (ctor->func)
+				{
+					ExecInitExprRec(ctor->func, state, resv, resnull);
+				}
+				else if ((ctor->type == JSCTOR_JSON_PARSE && !ctor->unique) ||
+						 ctor->type == JSCTOR_JSON_SERIALIZE)
+				{
+					/* Use the value of the first argument as result */
+					ExecInitExprRec(linitial(args), state, resv, resnull);
+				}
+				else
+				{
+					JsonConstructorExprState *jcstate;
+
+					jcstate = palloc0(sizeof(JsonConstructorExprState));
+
+					scratch.opcode = EEOP_JSON_CONSTRUCTOR;
+					scratch.d.json_constructor.jcstate = jcstate;
+
+					jcstate->constructor = ctor;
+					jcstate->arg_values = (Datum *) palloc(sizeof(Datum) * nargs);
+					jcstate->arg_nulls = (bool *) palloc(sizeof(bool) * nargs);
+					jcstate->arg_types = (Oid *) palloc(sizeof(Oid) * nargs);
+					jcstate->nargs = nargs;
+
+					foreach(lc, args)
+					{
+						Expr	   *arg = (Expr *) lfirst(lc);
+
+						jcstate->arg_types[argno] = exprType((Node *) arg);
+
+						if (IsA(arg, Const))
+						{
+							/* Don't evaluate const arguments every round */
+							Const	   *con = (Const *) arg;
+
+							jcstate->arg_values[argno] = con->constvalue;
+							jcstate->arg_nulls[argno] = con->constisnull;
+						}
+						else
+						{
+							ExecInitExprRec(arg, state,
+											&jcstate->arg_values[argno],
+											&jcstate->arg_nulls[argno]);
+						}
+						argno++;
+					}
+
+					/* prepare type cache for datum_to_json[b]() */
+					if (ctor->type == JSCTOR_JSON_SCALAR)
+					{
+						bool		is_jsonb =
+							ctor->returning->format->format_type == JS_FORMAT_JSONB;
+
+						jcstate->arg_type_cache =
+							palloc(sizeof(*jcstate->arg_type_cache) * nargs);
+
+						for (int i = 0; i < nargs; i++)
+						{
+							JsonTypeCategory category;
+							Oid			outfuncid;
+							Oid			typid = jcstate->arg_types[i];
+
+							json_categorize_type(typid, is_jsonb,
+												 &category, &outfuncid);
+
+							jcstate->arg_type_cache[i].outfuncid = outfuncid;
+							jcstate->arg_type_cache[i].category = (int) category;
+						}
+					}
+
+					ExprEvalPushStep(state, &scratch);
+				}
+
+				if (ctor->coercion)
+				{
+					Datum	   *innermost_caseval = state->innermost_caseval;
+					bool	   *innermost_isnull = state->innermost_casenull;
+
+					state->innermost_caseval = resv;
+					state->innermost_casenull = resnull;
+
+					ExecInitExprRec(ctor->coercion, state, resv, resnull);
+
+					state->innermost_caseval = innermost_caseval;
+					state->innermost_casenull = innermost_isnull;
+				}
+			}
+			break;
+
+		case T_JsonIsPredicate:
+			{
+				JsonIsPredicate *pred = (JsonIsPredicate *) node;
+
+				ExecInitExprRec((Expr *) pred->expr, state, resv, resnull);
+
+				scratch.opcode = EEOP_IS_JSON;
+				scratch.d.is_json.pred = pred;
+
+				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
+		case T_JsonExpr:
+			{
+				JsonExpr   *jsexpr = castNode(JsonExpr, node);
+
+				/*
+				 * No need to initialize a full JsonExprState For
+				 * JSON_TABLE(), because the upstream caller tfuncFetchRows()
+				 * is only interested in the value of formatted_expr.
+				 */
+				if (jsexpr->op == JSON_TABLE_OP)
+					ExecInitExprRec((Expr *) jsexpr->formatted_expr, state,
+									resv, resnull);
+				else
+					ExecInitJsonExpr(jsexpr, state, resv, resnull, &scratch);
+				break;
+			}
+
 		case T_NullTest:
 			{
 				NullTest   *ntest = (NullTest *) node;
@@ -2411,263 +2574,6 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
-		case T_JsonValueExpr:
-			{
-				JsonValueExpr *jve = (JsonValueExpr *) node;
-
-				ExecInitExprRec(jve->raw_expr, state, resv, resnull);
-
-				if (jve->formatted_expr)
-				{
-					Datum	   *innermost_caseval = state->innermost_caseval;
-					bool	   *innermost_isnull = state->innermost_casenull;
-
-					state->innermost_caseval = resv;
-					state->innermost_casenull = resnull;
-
-					ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
-
-					state->innermost_caseval = innermost_caseval;
-					state->innermost_casenull = innermost_isnull;
-				}
-				break;
-			}
-
-		case T_JsonConstructorExpr:
-			{
-				JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
-				List	   *args = ctor->args;
-				ListCell   *lc;
-				int			nargs = list_length(args);
-				int			argno = 0;
-
-				if (ctor->func)
-				{
-					ExecInitExprRec(ctor->func, state, resv, resnull);
-				}
-				else if ((ctor->type == JSCTOR_JSON_PARSE && !ctor->unique) ||
-						 ctor->type == JSCTOR_JSON_SERIALIZE)
-				{
-					/* Use the value of the first argument as a result */
-					ExecInitExprRec(linitial(args), state, resv, resnull);
-				}
-				else
-				{
-					JsonConstructorExprState *jcstate;
-
-					jcstate = palloc0(sizeof(JsonConstructorExprState));
-
-					scratch.opcode = EEOP_JSON_CONSTRUCTOR;
-					scratch.d.json_constructor.jcstate = jcstate;
-
-					jcstate->constructor = ctor;
-					jcstate->arg_values = palloc(sizeof(Datum) * nargs);
-					jcstate->arg_nulls = palloc(sizeof(bool) * nargs);
-					jcstate->arg_types = palloc(sizeof(Oid) * nargs);
-					jcstate->nargs = nargs;
-
-					foreach(lc, args)
-					{
-						Expr	   *arg = (Expr *) lfirst(lc);
-
-						jcstate->arg_types[argno] = exprType((Node *) arg);
-
-						if (IsA(arg, Const))
-						{
-							/* Don't evaluate const arguments every round */
-							Const	   *con = (Const *) arg;
-
-							jcstate->arg_values[argno] = con->constvalue;
-							jcstate->arg_nulls[argno] = con->constisnull;
-						}
-						else
-						{
-							ExecInitExprRec(arg, state,
-											&jcstate->arg_values[argno],
-											&jcstate->arg_nulls[argno]);
-						}
-						argno++;
-					}
-
-					/* prepare type cache for datum_to_json[b]() */
-					if (ctor->type == JSCTOR_JSON_SCALAR)
-					{
-						bool		is_jsonb =
-						ctor->returning->format->format_type == JS_FORMAT_JSONB;
-
-						jcstate->arg_type_cache =
-							palloc(sizeof(*jcstate->arg_type_cache) * nargs);
-
-						for (int i = 0; i < nargs; i++)
-						{
-							int			category;
-							Oid			outfuncid;
-							Oid			typid = jcstate->arg_types[i];
-
-							if (is_jsonb)
-							{
-								JsonbTypeCategory jbcat;
-
-								jsonb_categorize_type(typid, &jbcat, &outfuncid);
-
-								category = (int) jbcat;
-							}
-							else
-							{
-								JsonTypeCategory jscat;
-
-								json_categorize_type(typid, &jscat, &outfuncid);
-
-								category = (int) jscat;
-							}
-
-							jcstate->arg_type_cache[i].outfuncid = outfuncid;
-							jcstate->arg_type_cache[i].category = category;
-						}
-					}
-
-					ExprEvalPushStep(state, &scratch);
-				}
-
-				if (ctor->coercion)
-				{
-					Datum	   *innermost_caseval = state->innermost_caseval;
-					bool	   *innermost_isnull = state->innermost_casenull;
-
-					state->innermost_caseval = resv;
-					state->innermost_casenull = resnull;
-
-					ExecInitExprRec(ctor->coercion, state, resv, resnull);
-
-					state->innermost_caseval = innermost_caseval;
-					state->innermost_casenull = innermost_isnull;
-				}
-			}
-			break;
-
-		case T_JsonIsPredicate:
-			{
-				JsonIsPredicate *pred = (JsonIsPredicate *) node;
-
-				ExecInitExprRec((Expr *) pred->expr, state, resv, resnull);
-
-				scratch.opcode = EEOP_IS_JSON;
-				scratch.d.is_json.pred = pred;
-
-				ExprEvalPushStep(state, &scratch);
-				break;
-			}
-
-		case T_JsonExpr:
-			{
-				JsonExpr   *jexpr = castNode(JsonExpr, node);
-				JsonExprState *jsestate = palloc0(sizeof(JsonExprState));
-				ListCell   *argexprlc;
-				ListCell   *argnamelc;
-
-				scratch.opcode = EEOP_JSONEXPR;
-				scratch.d.jsonexpr.jsestate = jsestate;
-
-				jsestate->jsexpr = jexpr;
-
-				jsestate->formatted_expr =
-					palloc(sizeof(*jsestate->formatted_expr));
-
-				ExecInitExprRec((Expr *) jexpr->formatted_expr, state,
-								&jsestate->formatted_expr->value,
-								&jsestate->formatted_expr->isnull);
-
-				jsestate->pathspec =
-					palloc(sizeof(*jsestate->pathspec));
-
-				ExecInitExprRec((Expr *) jexpr->path_spec, state,
-								&jsestate->pathspec->value,
-								&jsestate->pathspec->isnull);
-
-				jsestate->res_expr =
-					palloc(sizeof(*jsestate->res_expr));
-
-				jsestate->result_expr = jexpr->result_coercion
-					? ExecInitExprWithCaseValue((Expr *) jexpr->result_coercion->expr,
-												state->parent,
-												&jsestate->res_expr->value,
-												&jsestate->res_expr->isnull)
-					: NULL;
-
-				jsestate->default_on_empty = !jexpr->on_empty ? NULL :
-					ExecInitExpr((Expr *) jexpr->on_empty->default_expr,
-								 state->parent);
-
-				jsestate->default_on_error =
-					ExecInitExpr((Expr *) jexpr->on_error->default_expr,
-								 state->parent);
-
-				if (jexpr->omit_quotes ||
-					(jexpr->result_coercion && jexpr->result_coercion->via_io))
-				{
-					Oid			typinput;
-
-					/* lookup the result type's input function */
-					getTypeInputInfo(jexpr->returning->typid, &typinput,
-									 &jsestate->input.typioparam);
-					fmgr_info(typinput, &jsestate->input.func);
-				}
-
-				jsestate->args = NIL;
-
-				forboth(argexprlc, jexpr->passing_values,
-						argnamelc, jexpr->passing_names)
-				{
-					Expr	   *argexpr = (Expr *) lfirst(argexprlc);
-					String	   *argname = lfirst_node(String, argnamelc);
-					JsonPathVariableEvalContext *var = palloc(sizeof(*var));
-
-					var->name = pstrdup(argname->sval);
-					var->typid = exprType((Node *) argexpr);
-					var->typmod = exprTypmod((Node *) argexpr);
-					var->estate = ExecInitExpr(argexpr, state->parent);
-					var->econtext = NULL;
-					var->mcxt = NULL;
-					var->evaluated = false;
-					var->value = (Datum) 0;
-					var->isnull = true;
-
-					jsestate->args =
-						lappend(jsestate->args, var);
-				}
-
-				jsestate->cache = NULL;
-
-				if (jexpr->coercions)
-				{
-					JsonCoercion **coercion;
-					struct JsonCoercionState *cstate;
-					Datum	   *caseval;
-					bool	   *casenull;
-
-					jsestate->coercion_expr =
-						palloc(sizeof(*jsestate->coercion_expr));
-
-					caseval = &jsestate->coercion_expr->value;
-					casenull = &jsestate->coercion_expr->isnull;
-
-					for (cstate = &jsestate->coercions.null,
-						 coercion = &jexpr->coercions->null;
-						 coercion <= &jexpr->coercions->composite;
-						 coercion++, cstate++)
-					{
-						cstate->coercion = *coercion;
-						cstate->estate = *coercion ?
-							ExecInitExprWithCaseValue((Expr *) (*coercion)->expr,
-													  state->parent,
-													  caseval, casenull) : NULL;
-					}
-				}
-
-				ExprEvalPushStep(state, &scratch);
-				break;
-			}
-
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -2719,7 +2625,7 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 	ListCell   *lc;
 
 	/* Check permission to call function */
-	aclresult = pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE);
+	aclresult = object_aclcheck(ProcedureRelationId, funcid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
 	InvokeFunctionExecuteHook(funcid);
@@ -2809,36 +2715,38 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 }
 
 /*
- * Add expression steps deforming the ExprState's inner/outer/scan slots
- * as much as required by the expression.
+ * Add expression steps performing setup that's needed before any of the
+ * main execution of the expression.
  */
 static void
-ExecInitExprSlots(ExprState *state, Node *node)
+ExecCreateExprSetupSteps(ExprState *state, Node *node)
 {
-	LastAttnumInfo info = {0, 0, 0};
+	ExprSetupInfo info = {0, 0, 0, NIL};
 
-	/*
-	 * Figure out which attributes we're going to need.
-	 */
-	get_last_attnums_walker(node, &info);
+	/* Prescan to find out what we need. */
+	expr_setup_walker(node, &info);
 
-	ExecPushExprSlots(state, &info);
+	/* And generate those steps. */
+	ExecPushExprSetupSteps(state, &info);
 }
 
 /*
- * Add steps deforming the ExprState's inner/out/scan slots as much as
- * indicated by info. This is useful when building an ExprState covering more
- * than one expression.
+ * Add steps performing expression setup as indicated by "info".
+ * This is useful when building an ExprState covering more than one expression.
  */
 static void
-ExecPushExprSlots(ExprState *state, LastAttnumInfo *info)
+ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 {
 	ExprEvalStep scratch = {0};
+	ListCell   *lc;
 
 	scratch.resvalue = NULL;
 	scratch.resnull = NULL;
 
-	/* Emit steps as needed */
+	/*
+	 * Add steps deforming the ExprState's inner/outer/scan slots as much as
+	 * required by any Vars appearing in the expression.
+	 */
 	if (info->last_inner > 0)
 	{
 		scratch.opcode = EEOP_INNER_FETCHSOME;
@@ -2869,13 +2777,48 @@ ExecPushExprSlots(ExprState *state, LastAttnumInfo *info)
 		if (ExecComputeSlotInfo(state, &scratch))
 			ExprEvalPushStep(state, &scratch);
 	}
+
+	/*
+	 * Add steps to execute any MULTIEXPR SubPlans appearing in the
+	 * expression.  We need to evaluate these before any of the Params
+	 * referencing their outputs are used, but after we've prepared for any
+	 * Var references they may contain.  (There cannot be cross-references
+	 * between MULTIEXPR SubPlans, so we needn't worry about their order.)
+	 */
+	foreach(lc, info->multiexpr_subplans)
+	{
+		SubPlan    *subplan = (SubPlan *) lfirst(lc);
+		SubPlanState *sstate;
+
+		Assert(subplan->subLinkType == MULTIEXPR_SUBLINK);
+
+		/* This should match what ExecInitExprRec does for other SubPlans: */
+
+		if (!state->parent)
+			elog(ERROR, "SubPlan found with no parent plan");
+
+		sstate = ExecInitSubPlan(subplan, state->parent);
+
+		/* add SubPlanState nodes to state->parent->subPlan */
+		state->parent->subPlan = lappend(state->parent->subPlan,
+										 sstate);
+
+		scratch.opcode = EEOP_SUBPLAN;
+		scratch.d.subplan.sstate = sstate;
+
+		/* The result can be ignored, but we better put it somewhere */
+		scratch.resvalue = &state->resvalue;
+		scratch.resnull = &state->resnull;
+
+		ExprEvalPushStep(state, &scratch);
+	}
 }
 
 /*
- * get_last_attnums_walker: expression walker for ExecInitExprSlots
+ * expr_setup_walker: expression walker for ExecCreateExprSetupSteps
  */
 static bool
-get_last_attnums_walker(Node *node, LastAttnumInfo *info)
+expr_setup_walker(Node *node, ExprSetupInfo *info)
 {
 	if (node == NULL)
 		return false;
@@ -2903,6 +2846,16 @@ get_last_attnums_walker(Node *node, LastAttnumInfo *info)
 		return false;
 	}
 
+	/* Collect all MULTIEXPR SubPlans, too */
+	if (IsA(node, SubPlan))
+	{
+		SubPlan    *subplan = (SubPlan *) node;
+
+		if (subplan->subLinkType == MULTIEXPR_SUBLINK)
+			info->multiexpr_subplans = lappend(info->multiexpr_subplans,
+											   subplan);
+	}
+
 	/*
 	 * Don't examine the arguments or filters of Aggrefs or WindowFuncs,
 	 * because those do not represent expressions to be evaluated within the
@@ -2915,7 +2868,7 @@ get_last_attnums_walker(Node *node, LastAttnumInfo *info)
 		return false;
 	if (IsA(node, GroupingFunc))
 		return false;
-	return expression_tree_walker(node, get_last_attnums_walker,
+	return expression_tree_walker(node, expr_setup_walker,
 								  (void *) info);
 }
 
@@ -3338,8 +3291,8 @@ ExecInitSubscriptingRef(ExprEvalStep *scratch, SubscriptingRef *sbsref,
  * trees in which each level of assignment has its own CaseTestExpr, and the
  * recursive structure appears within the newvals or refassgnexpr field.
  * There is an exception, though: if the array is an array-of-domain, we will
- * have a CoerceToDomain as the refassgnexpr, and we need to be able to look
- * through that.
+ * have a CoerceToDomain or RelabelType as the refassgnexpr, and we need to
+ * be able to look through that.
  */
 static bool
 isAssignmentIndirectionExpr(Expr *expr)
@@ -3366,6 +3319,12 @@ isAssignmentIndirectionExpr(Expr *expr)
 
 		return isAssignmentIndirectionExpr(cd->arg);
 	}
+	else if (IsA(expr, RelabelType))
+	{
+		RelabelType *r = (RelabelType *) expr;
+
+		return isAssignmentIndirectionExpr(r->arg);
+	}
 	return false;
 }
 
@@ -3385,6 +3344,7 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 	/* we'll allocate workspace only if needed */
 	scratch->d.domaincheck.checkvalue = NULL;
 	scratch->d.domaincheck.checknull = NULL;
+	scratch->d.domaincheck.escontext = state->escontext;
 
 	/*
 	 * Evaluate argument - it's fine to directly store it into resv/resnull,
@@ -3534,7 +3494,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 	PlanState  *parent = &aggstate->ss.ps;
 	ExprEvalStep scratch = {0};
 	bool		isCombine = DO_AGGSPLIT_COMBINE(aggstate->aggsplit);
-	LastAttnumInfo deform = {0, 0, 0};
+	ExprSetupInfo deform = {0, 0, 0, NIL};
 
 	state->expr = (Expr *) aggstate;
 	state->parent = parent;
@@ -3550,18 +3510,18 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 	{
 		AggStatePerTrans pertrans = &aggstate->pertrans[transno];
 
-		get_last_attnums_walker((Node *) pertrans->aggref->aggdirectargs,
-								&deform);
-		get_last_attnums_walker((Node *) pertrans->aggref->args,
-								&deform);
-		get_last_attnums_walker((Node *) pertrans->aggref->aggorder,
-								&deform);
-		get_last_attnums_walker((Node *) pertrans->aggref->aggdistinct,
-								&deform);
-		get_last_attnums_walker((Node *) pertrans->aggref->aggfilter,
-								&deform);
+		expr_setup_walker((Node *) pertrans->aggref->aggdirectargs,
+						  &deform);
+		expr_setup_walker((Node *) pertrans->aggref->args,
+						  &deform);
+		expr_setup_walker((Node *) pertrans->aggref->aggorder,
+						  &deform);
+		expr_setup_walker((Node *) pertrans->aggref->aggdistinct,
+						  &deform);
+		expr_setup_walker((Node *) pertrans->aggref->aggfilter,
+						  &deform);
 	}
-	ExecPushExprSlots(state, &deform);
+	ExecPushExprSetupSteps(state, &deform);
 
 	/*
 	 * Emit instructions for each transition value / grouping set combination.
@@ -3666,19 +3626,30 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 				scratch.resnull = &state->resnull;
 			}
 			argno++;
+
+			Assert(pertrans->numInputs == argno);
 		}
-		else if (pertrans->numSortCols == 0)
+		else if (!pertrans->aggsortrequired)
 		{
 			ListCell   *arg;
 
 			/*
-			 * Normal transition function without ORDER BY / DISTINCT.
+			 * Normal transition function without ORDER BY / DISTINCT or with
+			 * ORDER BY / DISTINCT but the planner has given us pre-sorted
+			 * input.
 			 */
 			strictargs = trans_fcinfo->args + 1;
 
 			foreach(arg, pertrans->aggref->args)
 			{
 				TargetEntry *source_tle = (TargetEntry *) lfirst(arg);
+
+				/*
+				 * Don't initialize args for any ORDER BY clause that might
+				 * exist in a presorted aggregate.
+				 */
+				if (argno == pertrans->numTransInputs)
+					break;
 
 				/*
 				 * Start from 1, since the 0th arg will be the transition
@@ -3689,14 +3660,16 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 								&trans_fcinfo->args[argno + 1].isnull);
 				argno++;
 			}
+			Assert(pertrans->numTransInputs == argno);
 		}
 		else if (pertrans->numInputs == 1)
 		{
 			/*
-			 * DISTINCT and/or ORDER BY case, with a single column sorted on.
+			 * Non-presorted DISTINCT and/or ORDER BY case, with a single
+			 * column sorted on.
 			 */
 			TargetEntry *source_tle =
-			(TargetEntry *) linitial(pertrans->aggref->args);
+				(TargetEntry *) linitial(pertrans->aggref->args);
 
 			Assert(list_length(pertrans->aggref->args) == 1);
 
@@ -3705,11 +3678,14 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 							&state->resnull);
 			strictnulls = &state->resnull;
 			argno++;
+
+			Assert(pertrans->numInputs == argno);
 		}
 		else
 		{
 			/*
-			 * DISTINCT and/or ORDER BY case, with multiple columns sorted on.
+			 * Non-presorted DISTINCT and/or ORDER BY case, with multiple
+			 * columns sorted on.
 			 */
 			Datum	   *values = pertrans->sortslot->tts_values;
 			bool	   *nulls = pertrans->sortslot->tts_isnull;
@@ -3725,8 +3701,8 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 								&values[argno], &nulls[argno]);
 				argno++;
 			}
+			Assert(pertrans->numInputs == argno);
 		}
-		Assert(pertrans->numInputs == argno);
 
 		/*
 		 * For a strict transfn, nothing happens when there's a NULL input; we
@@ -3743,6 +3719,21 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			scratch.d.agg_strict_input_check.args = strictargs;
 			scratch.d.agg_strict_input_check.jumpnull = -1; /* adjust later */
 			scratch.d.agg_strict_input_check.nargs = pertrans->numTransInputs;
+			ExprEvalPushStep(state, &scratch);
+			adjust_bailout = lappend_int(adjust_bailout,
+										 state->steps_len - 1);
+		}
+
+		/* Handle DISTINCT aggregates which have pre-sorted input */
+		if (pertrans->numDistinctCols > 0 && !pertrans->aggsortrequired)
+		{
+			if (pertrans->numDistinctCols > 1)
+				scratch.opcode = EEOP_AGG_PRESORTED_DISTINCT_MULTI;
+			else
+				scratch.opcode = EEOP_AGG_PRESORTED_DISTINCT_SINGLE;
+
+			scratch.d.agg_presorted_distinctcheck.pertrans = pertrans;
+			scratch.d.agg_presorted_distinctcheck.jumpdistinct = -1;	/* adjust later */
 			ExprEvalPushStep(state, &scratch);
 			adjust_bailout = lappend_int(adjust_bailout,
 										 state->steps_len - 1);
@@ -3808,6 +3799,12 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 				Assert(as->d.agg_deserialize.jumpnull == -1);
 				as->d.agg_deserialize.jumpnull = state->steps_len;
 			}
+			else if (as->opcode == EEOP_AGG_PRESORTED_DISTINCT_SINGLE ||
+					 as->opcode == EEOP_AGG_PRESORTED_DISTINCT_MULTI)
+			{
+				Assert(as->d.agg_presorted_distinctcheck.jumpdistinct == -1);
+				as->d.agg_presorted_distinctcheck.jumpdistinct = state->steps_len;
+			}
 			else
 				Assert(false);
 		}
@@ -3857,7 +3854,8 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 	/*
 	 * Determine appropriate transition implementation.
 	 *
-	 * For non-ordered aggregates:
+	 * For non-ordered aggregates and ORDER BY / DISTINCT aggregates with
+	 * presorted input:
 	 *
 	 * If the initial value for the transition state doesn't exist in the
 	 * pg_aggregate table then we will let the first non-NULL value returned
@@ -3887,7 +3885,7 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 	 * process_ordered_aggregate_{single, multi} and
 	 * advance_transition_function.
 	 */
-	if (pertrans->numSortCols == 0)
+	if (!pertrans->aggsortrequired)
 	{
 		if (pertrans->transtypeByVal)
 		{
@@ -4016,7 +4014,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 		AclResult	aclresult;
 
 		/* Check permission to call function */
-		aclresult = pg_proc_aclcheck(foid, GetUserId(), ACL_EXECUTE);
+		aclresult = object_aclcheck(ProcedureRelationId, foid, GetUserId(), ACL_EXECUTE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(foid));
 
@@ -4150,7 +4148,7 @@ ExecBuildParamSetEqual(TupleDesc desc,
 		AclResult	aclresult;
 
 		/* Check permission to call function */
-		aclresult = pg_proc_aclcheck(foid, GetUserId(), ACL_EXECUTE);
+		aclresult = object_aclcheck(ProcedureRelationId, foid, GetUserId(), ACL_EXECUTE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(foid));
 
@@ -4218,4 +4216,289 @@ ExecBuildParamSetEqual(TupleDesc desc,
 	ExecReadyExpr(state);
 
 	return state;
+}
+
+/*
+ * Push steps to evaluate a JsonExpr and its various subsidiary expressions.
+ */
+static void
+ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
+				 Datum *resv, bool *resnull,
+				 ExprEvalStep *scratch)
+{
+	JsonExprState *jsestate = palloc0(sizeof(JsonExprState));
+	ListCell   *argexprlc;
+	ListCell   *argnamelc;
+	List	   *jumps_return_null = NIL;
+	List	   *jumps_to_end = NIL;
+	ListCell   *lc;
+	ErrorSaveContext *escontext =
+		jsexpr->on_error->btype != JSON_BEHAVIOR_ERROR ?
+		&jsestate->escontext : NULL;
+
+	jsestate->jsexpr = jsexpr;
+
+	/*
+	 * Evaluate formatted_expr storing the result into
+	 * jsestate->formatted_expr.
+	 */
+	ExecInitExprRec((Expr *) jsexpr->formatted_expr, state,
+					&jsestate->formatted_expr.value,
+					&jsestate->formatted_expr.isnull);
+
+	/* JUMP to return NULL if formatted_expr evaluates to NULL */
+	jumps_return_null = lappend_int(jumps_return_null, state->steps_len);
+	scratch->opcode = EEOP_JUMP_IF_NULL;
+	scratch->resnull = &jsestate->formatted_expr.isnull;
+	scratch->d.jump.jumpdone = -1;	/* set below */
+	ExprEvalPushStep(state, scratch);
+
+	/*
+	 * Evaluate pathspec expression storing the result into
+	 * jsestate->pathspec.
+	 */
+	ExecInitExprRec((Expr *) jsexpr->path_spec, state,
+					&jsestate->pathspec.value,
+					&jsestate->pathspec.isnull);
+
+	/* JUMP to return NULL if path_spec evaluates to NULL */
+	jumps_return_null = lappend_int(jumps_return_null, state->steps_len);
+	scratch->opcode = EEOP_JUMP_IF_NULL;
+	scratch->resnull = &jsestate->pathspec.isnull;
+	scratch->d.jump.jumpdone = -1;	/* set below */
+	ExprEvalPushStep(state, scratch);
+
+	/* Steps to compute PASSING args. */
+	jsestate->args = NIL;
+	forboth(argexprlc, jsexpr->passing_values,
+			argnamelc, jsexpr->passing_names)
+	{
+		Expr	   *argexpr = (Expr *) lfirst(argexprlc);
+		String	   *argname = lfirst_node(String, argnamelc);
+		JsonPathVariable *var = palloc(sizeof(*var));
+
+		var->name = argname->sval;
+		var->typid = exprType((Node *) argexpr);
+		var->typmod = exprTypmod((Node *) argexpr);
+
+		ExecInitExprRec((Expr *) argexpr, state, &var->value, &var->isnull);
+
+		jsestate->args = lappend(jsestate->args, var);
+	}
+
+	/* Step for jsonpath evaluation; see ExecEvalJsonExprPath(). */
+	scratch->opcode = EEOP_JSONEXPR_PATH;
+	scratch->resvalue = resv;
+	scratch->resnull = resnull;
+	scratch->d.jsonexpr.jsestate = jsestate;
+	ExprEvalPushStep(state, scratch);
+
+	/*
+	 * Step to return NULL after jumping to skip the EEOP_JSONEXPR_PATH step
+	 * when either formatted_expr or pathspec is NULL.  Adjust jump target
+	 * addresses of JUMPs that we added above.
+	 */
+	foreach(lc, jumps_return_null)
+	{
+		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+
+		as->d.jump.jumpdone = state->steps_len;
+	}
+	scratch->opcode = EEOP_CONST;
+	scratch->resvalue = resv;
+	scratch->resnull = resnull;
+	scratch->d.constval.value = (Datum) 0;
+	scratch->d.constval.isnull = true;
+	ExprEvalPushStep(state, scratch);
+
+	/*
+	 * Jump to coerce the NULL using coercion_expr if present.  Coercing NULL
+	 * is only interesting when the RETURNING type is a domain whose
+	 * constraints must be checked.  jsexpr->coercion_expr containing a
+	 * CoerceToDomain node must have been set in that case.
+	 */
+	if (jsexpr->coercion_expr)
+	{
+		scratch->opcode = EEOP_JUMP;
+		scratch->d.jump.jumpdone = state->steps_len + 1;
+		ExprEvalPushStep(state, scratch);
+	}
+
+	/*
+	 * To handle coercion errors softly, use the following ErrorSaveContext to
+	 * pass to ExecInitExprRec() when initializing the coercion expressions
+	 * and in the EEOP_JSONEXPR_COERCION step.
+	 */
+	jsestate->escontext.type = T_ErrorSaveContext;
+
+	/*
+	 * Steps to coerce the result value computed by EEOP_JSONEXPR_PATH or the
+	 * NULL returned on NULL input as described above.
+	 */
+	jsestate->jump_eval_coercion = -1;
+	if (jsexpr->coercion_expr)
+	{
+		Datum	   *save_innermost_caseval;
+		bool	   *save_innermost_casenull;
+		ErrorSaveContext *save_escontext;
+
+		jsestate->jump_eval_coercion = state->steps_len;
+
+		save_innermost_caseval = state->innermost_caseval;
+		save_innermost_casenull = state->innermost_casenull;
+		save_escontext = state->escontext;
+
+		state->innermost_caseval = resv;
+		state->innermost_casenull = resnull;
+		state->escontext = escontext;
+
+		ExecInitExprRec((Expr *) jsexpr->coercion_expr, state, resv, resnull);
+
+		state->innermost_caseval = save_innermost_caseval;
+		state->innermost_casenull = save_innermost_casenull;
+		state->escontext = save_escontext;
+	}
+	else if (jsexpr->use_json_coercion)
+	{
+		jsestate->jump_eval_coercion = state->steps_len;
+
+		ExecInitJsonCoercion(state, jsexpr->returning, escontext, resv, resnull);
+	}
+	else if (jsexpr->use_io_coercion)
+	{
+		/*
+		 * Here we only need to initialize the FunctionCallInfo for the target
+		 * type's input function, which is called by ExecEvalJsonExprPath()
+		 * itself, so no additional step is necessary.
+		 */
+		Oid			typinput;
+		Oid			typioparam;
+		FmgrInfo   *finfo;
+		FunctionCallInfo fcinfo;
+
+		getTypeInputInfo(jsexpr->returning->typid, &typinput, &typioparam);
+		finfo = palloc0(sizeof(FmgrInfo));
+		fcinfo = palloc0(SizeForFunctionCallInfo(3));
+		fmgr_info(typinput, finfo);
+		fmgr_info_set_expr((Node *) jsexpr->returning, finfo);
+		InitFunctionCallInfoData(*fcinfo, finfo, 3, InvalidOid, NULL, NULL);
+
+		/*
+		 * We can preload the second and third arguments for the input
+		 * function, since they're constants.
+		 */
+		fcinfo->args[1].value = ObjectIdGetDatum(typioparam);
+		fcinfo->args[1].isnull = false;
+		fcinfo->args[2].value = Int32GetDatum(jsexpr->returning->typmod);
+		fcinfo->args[2].isnull = false;
+		fcinfo->context = (Node *) escontext;
+
+		jsestate->input_fcinfo = fcinfo;
+	}
+
+	/*
+	 * Add a special step, if needed, to check if the coercion evaluation ran
+	 * into an error but was not thrown because the ON ERROR behavior is not
+	 * ERROR.  It will set jsestate->error if an error did occur.
+	 */
+	if (jsestate->jump_eval_coercion >= 0 && escontext != NULL)
+	{
+		scratch->opcode = EEOP_JSONEXPR_COERCION_FINISH;
+		scratch->d.jsonexpr.jsestate = jsestate;
+		ExprEvalPushStep(state, scratch);
+	}
+
+	jsestate->jump_empty = jsestate->jump_error = -1;
+
+	/*
+	 * Step to check jsestate->error and return the ON ERROR expression if
+	 * there is one.  This handles both the errors that occur during jsonpath
+	 * evaluation in EEOP_JSONEXPR_PATH and subsequent coercion evaluation.
+	 */
+	if (jsexpr->on_error &&
+		jsexpr->on_error->btype != JSON_BEHAVIOR_ERROR)
+	{
+		jsestate->jump_error = state->steps_len;
+
+		/* JUMP to end if false, that is, skip the ON ERROR expression. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP_IF_NOT_TRUE;
+		scratch->resvalue = &jsestate->error.value;
+		scratch->resnull = &jsestate->error.isnull;
+		scratch->d.jump.jumpdone = -1;	/* set below */
+		ExprEvalPushStep(state, scratch);
+
+		/* Steps to evaluate the ON ERROR expression */
+		ExecInitExprRec((Expr *) jsexpr->on_error->expr,
+						state, resv, resnull);
+
+		/* Step to coerce the ON ERROR expression if needed */
+		if (jsexpr->on_error->coerce)
+			ExecInitJsonCoercion(state, jsexpr->returning, escontext, resv,
+								 resnull);
+
+		/* JUMP to end to skip the ON EMPTY steps added below. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP;
+		scratch->d.jump.jumpdone = -1;
+		ExprEvalPushStep(state, scratch);
+	}
+
+	/*
+	 * Step to check jsestate->empty and return the ON EMPTY expression if
+	 * there is one.
+	 */
+	if (jsexpr->on_empty != NULL &&
+		jsexpr->on_empty->btype != JSON_BEHAVIOR_ERROR)
+	{
+		jsestate->jump_empty = state->steps_len;
+
+		/* JUMP to end if false, that is, skip the ON EMPTY expression. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP_IF_NOT_TRUE;
+		scratch->resvalue = &jsestate->empty.value;
+		scratch->resnull = &jsestate->empty.isnull;
+		scratch->d.jump.jumpdone = -1;	/* set below */
+		ExprEvalPushStep(state, scratch);
+
+		/* Steps to evaluate the ON EMPTY expression */
+		ExecInitExprRec((Expr *) jsexpr->on_empty->expr,
+						state, resv, resnull);
+
+		/* Step to coerce the ON EMPTY expression if needed */
+		if (jsexpr->on_empty->coerce)
+			ExecInitJsonCoercion(state, jsexpr->returning, escontext, resv,
+								 resnull);
+	}
+
+	foreach(lc, jumps_to_end)
+	{
+		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+
+		as->d.jump.jumpdone = state->steps_len;
+	}
+
+	jsestate->jump_end = state->steps_len;
+}
+
+/*
+ * Initialize a EEOP_JSONEXPR_COERCION step to coerce the value given in resv
+ * to the given RETURNING type.
+ */
+static void
+ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
+					 ErrorSaveContext *escontext,
+					 Datum *resv, bool *resnull)
+{
+	ExprEvalStep scratch = {0};
+
+	/* For json_populate_type() */
+	scratch.opcode = EEOP_JSONEXPR_COERCION;
+	scratch.resvalue = resv;
+	scratch.resnull = resnull;
+	scratch.d.jsonexpr_coercion.targettype = returning->typid;
+	scratch.d.jsonexpr_coercion.targettypmod = returning->typmod;
+	scratch.d.jsonexpr_coercion.json_populate_type_cache = NULL;
+	scratch.d.jsonexpr_coercion.escontext = escontext;
+	ExprEvalPushStep(state, &scratch);
 }

@@ -3,7 +3,7 @@
  * signalfuncs.c
  *	  Functions for signaling backends
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 
 
 /*
@@ -74,8 +74,13 @@ pg_signal_backend(int pid, int sig)
 		return SIGNAL_BACKEND_ERROR;
 	}
 
-	/* Only allow superusers to signal superuser-owned backends. */
-	if (superuser_arg(proc->roleId) && !superuser())
+	/*
+	 * Only allow superusers to signal superuser-owned backends.  Any process
+	 * not advertising a role might have the importance of a superuser-owned
+	 * backend, so treat it that way.
+	 */
+	if ((!OidIsValid(proc->roleId) || superuser_arg(proc->roleId)) &&
+		!superuser())
 		return SIGNAL_BACKEND_NOSUPERUSER;
 
 	/* Users can signal backends they have role membership in. */
@@ -121,12 +126,16 @@ pg_cancel_backend(PG_FUNCTION_ARGS)
 	if (r == SIGNAL_BACKEND_NOSUPERUSER)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be a superuser to cancel superuser query")));
+				 errmsg("permission denied to cancel query"),
+				 errdetail("Only roles with the %s attribute may cancel queries of roles with the %s attribute.",
+						   "SUPERUSER", "SUPERUSER")));
 
 	if (r == SIGNAL_BACKEND_NOPERMISSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be a member of the role whose query is being canceled or member of pg_signal_backend")));
+				 errmsg("permission denied to cancel query"),
+				 errdetail("Only roles with privileges of the role whose query is being canceled or with privileges of the \"%s\" role may cancel this query.",
+						   "pg_signal_backend")));
 
 	PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
 }
@@ -223,12 +232,16 @@ pg_terminate_backend(PG_FUNCTION_ARGS)
 	if (r == SIGNAL_BACKEND_NOSUPERUSER)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be a superuser to terminate superuser process")));
+				 errmsg("permission denied to terminate process"),
+				 errdetail("Only roles with the %s attribute may terminate processes of roles with the %s attribute.",
+						   "SUPERUSER", "SUPERUSER")));
 
 	if (r == SIGNAL_BACKEND_NOPERMISSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be a member of the role whose process is being terminated or member of pg_signal_backend")));
+				 errmsg("permission denied to terminate process"),
+				 errdetail("Only roles with privileges of the role whose process is being terminated or with privileges of the \"%s\" role may terminate this process.",
+						   "pg_signal_backend")));
 
 	/* Wait only on success and if actually requested */
 	if (r == SIGNAL_BACKEND_SUCCESS && timeout > 0)
@@ -260,38 +273,11 @@ pg_reload_conf(PG_FUNCTION_ARGS)
 /*
  * Rotate log file
  *
- * This function is kept to support adminpack 1.0.
- */
-Datum
-pg_rotate_logfile(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to rotate log files with adminpack 1.0"),
-		/* translator: %s is a SQL function name */
-				 errhint("Consider using %s, which is part of core, instead.",
-						 "pg_logfile_rotate()")));
-
-	if (!Logging_collector)
-	{
-		ereport(WARNING,
-				(errmsg("rotation not possible because log collection not active")));
-		PG_RETURN_BOOL(false);
-	}
-
-	SendPostmasterSignal(PMSIGNAL_ROTATE_LOGFILE);
-	PG_RETURN_BOOL(true);
-}
-
-/*
- * Rotate log file
- *
  * Permission checking for this function is managed through the normal
  * GRANT system.
  */
 Datum
-pg_rotate_logfile_v2(PG_FUNCTION_ARGS)
+pg_rotate_logfile(PG_FUNCTION_ARGS)
 {
 	if (!Logging_collector)
 	{

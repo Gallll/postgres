@@ -1,10 +1,10 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Verify that ALTER TABLE optimizes certain operations as expected
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -25,8 +25,8 @@ sub run_sql_command
 	$node->psql(
 		'postgres',
 		$sql,
-		stderr        => \$stderr,
-		on_error_die  => 1,
+		stderr => \$stderr,
+		on_error_die => 1,
 		on_error_stop => 1);
 	return $stderr;
 }

@@ -3,7 +3,7 @@
  * array_typanalyze.c
  *	  Functions for gathering statistics from array columns
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,8 +17,8 @@
 #include "access/detoast.h"
 #include "commands/vacuum.h"
 #include "utils/array.h"
-#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -218,7 +218,6 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 {
 	ArrayAnalyzeExtraData *extra_data;
 	int			num_mcelem;
-	int			null_cnt = 0;
 	int			null_elem_cnt = 0;
 	int			analyzed_rows = 0;
 
@@ -264,7 +263,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	 * the number of individual elements tracked in pg_statistic ought to be
 	 * more than the number of values for a simple scalar column.
 	 */
-	num_mcelem = stats->attr->attstattarget * 10;
+	num_mcelem = stats->attstattarget * 10;
 
 	/*
 	 * We set bucket width equal to num_mcelem / 0.007 as per the comment
@@ -320,8 +319,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		value = fetchfunc(stats, array_no, &isnull);
 		if (isnull)
 		{
-			/* array is null, just count that */
-			null_cnt++;
+			/* ignore arrays that are null overall */
 			continue;
 		}
 
@@ -364,7 +362,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			/* Lookup current element in hashtable, adding it if new */
 			elem_value = elem_values[j];
 			item = (TrackItem *) hash_search(elements_tab,
-											 (const void *) &elem_value,
+											 &elem_value,
 											 HASH_ENTER, &found);
 
 			if (found)
@@ -543,12 +541,12 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 */
 			for (i = 0; i < num_mcelem; i++)
 			{
-				TrackItem  *item = sort_table[i];
+				TrackItem  *titem = sort_table[i];
 
-				mcelem_values[i] = datumCopy(item->key,
+				mcelem_values[i] = datumCopy(titem->key,
 											 extra_data->typbyval,
 											 extra_data->typlen);
-				mcelem_freqs[i] = (double) item->frequency /
+				mcelem_freqs[i] = (double) titem->frequency /
 					(double) nonnull_cnt;
 			}
 			mcelem_freqs[i++] = (double) minfreq / (double) nonnull_cnt;
@@ -577,7 +575,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		count_items_count = hash_get_num_entries(count_tab);
 		if (count_items_count > 0)
 		{
-			int			num_hist = stats->attr->attstattarget;
+			int			num_hist = stats->attstattarget;
 			DECountItem **sorted_count_items;
 			int			j;
 			int			delta;
@@ -692,7 +690,7 @@ prune_element_hashtable(HTAB *elements_tab, int b_current)
 		{
 			Datum		value = item->key;
 
-			if (hash_search(elements_tab, (const void *) &item->key,
+			if (hash_search(elements_tab, &item->key,
 							HASH_REMOVE, NULL) == NULL)
 				elog(ERROR, "hash table corrupted");
 			/* We should free memory if element is not passed by value */

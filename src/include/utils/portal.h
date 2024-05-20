@@ -36,7 +36,7 @@
  * to look like NO SCROLL cursors.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/portal.h
@@ -92,7 +92,7 @@ typedef enum PortalStrategy
 	PORTAL_ONE_RETURNING,
 	PORTAL_ONE_MOD_WITH,
 	PORTAL_UTIL_SELECT,
-	PORTAL_MULTI_QUERY
+	PORTAL_MULTI_QUERY,
 } PortalStrategy;
 
 /*
@@ -107,7 +107,7 @@ typedef enum PortalStatus
 	PORTAL_READY,				/* PortalStart complete, can run it */
 	PORTAL_ACTIVE,				/* portal is running (can't delete it) */
 	PORTAL_DONE,				/* portal is finished (don't re-run it) */
-	PORTAL_FAILED				/* portal got error (can't re-run it) */
+	PORTAL_FAILED,				/* portal got error (can't re-run it) */
 } PortalStatus;
 
 typedef struct PortalData *Portal;

@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -45,7 +45,7 @@ typedef enum
 {
 	ST_INDEXSCAN,				/* must support amgettuple */
 	ST_BITMAPSCAN,				/* must support amgetbitmap */
-	ST_ANYSCAN					/* either is okay */
+	ST_ANYSCAN,					/* either is okay */
 } ScanTypeControl;
 
 /* Data structure for collecting qual clauses that match an index */
@@ -99,7 +99,6 @@ static void get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								 List **considered_relids);
 static bool eclass_already_used(EquivalenceClass *parent_ec, Relids oldrelids,
 								List *indexjoinclauses);
-static bool bms_equal_any(Relids relids, List *relids_list);
 static void get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 							IndexOptInfo *index, IndexClauseSet *clauses,
 							List **bitindexpaths);
@@ -107,8 +106,7 @@ static List *build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 							   IndexOptInfo *index, IndexClauseSet *clauses,
 							   bool useful_predicate,
 							   ScanTypeControl scantype,
-							   bool *skip_nonnative_saop,
-							   bool *skip_lower_saop);
+							   bool *skip_nonnative_saop);
 static List *build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 								List *clauses, List *other_clauses);
 static List *generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -153,6 +151,7 @@ static IndexClause *match_clause_to_indexcol(PlannerInfo *root,
 											 RestrictInfo *rinfo,
 											 int indexcol,
 											 IndexOptInfo *index);
+static bool IsBooleanOpfamily(Oid opfamily);
 static IndexClause *match_boolean_index_clause(PlannerInfo *root,
 											   RestrictInfo *rinfo,
 											   int indexcol, IndexOptInfo *index);
@@ -361,7 +360,6 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	if (bitjoinpaths != NIL)
 	{
 		List	   *all_path_outers;
-		ListCell   *lc;
 
 		/* Identify each distinct parameterization seen in bitjoinpaths */
 		all_path_outers = NIL;
@@ -370,8 +368,8 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			Path	   *path = (Path *) lfirst(lc);
 			Relids		required_outer = PATH_REQ_OUTER(path);
 
-			if (!bms_equal_any(required_outer, all_path_outers))
-				all_path_outers = lappend(all_path_outers, required_outer);
+			all_path_outers = list_append_unique(all_path_outers,
+												 required_outer);
 		}
 
 		/* Now, for each distinct parameterization set ... */
@@ -517,7 +515,7 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		int			num_considered_relids;
 
 		/* If we already tried its relids set, no need to do so again */
-		if (bms_equal_any(clause_relids, *considered_relids))
+		if (list_member(*considered_relids, clause_relids))
 			continue;
 
 		/*
@@ -612,7 +610,7 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	int			indexcol;
 
 	/* If we already considered this relids set, don't repeat the work */
-	if (bms_equal_any(relids, *considered_relids))
+	if (list_member(*considered_relids, relids))
 		return;
 
 	/* Identify indexclauses usable with this relids set */
@@ -694,25 +692,6 @@ eclass_already_used(EquivalenceClass *parent_ec, Relids oldrelids,
 	return false;
 }
 
-/*
- * bms_equal_any
- *		True if relids is bms_equal to any member of relids_list
- *
- * Perhaps this should be in bitmapset.c someday.
- */
-static bool
-bms_equal_any(Relids relids, List *relids_list)
-{
-	ListCell   *lc;
-
-	foreach(lc, relids_list)
-	{
-		if (bms_equal(relids, (Relids) lfirst(lc)))
-			return true;
-	}
-	return false;
-}
-
 
 /*
  * get_index_paths
@@ -726,8 +705,6 @@ bms_equal_any(Relids relids, List *relids_list)
  * index AM supports them natively, we should just include them in simple
  * index paths.  If not, we should exclude them while building simple index
  * paths, and then make a separate attempt to include them in bitmap paths.
- * Furthermore, we should consider excluding lower-order ScalarArrayOpExpr
- * quals so as to create ordered paths.
  */
 static void
 get_index_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -736,37 +713,17 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 {
 	List	   *indexpaths;
 	bool		skip_nonnative_saop = false;
-	bool		skip_lower_saop = false;
 	ListCell   *lc;
 
 	/*
 	 * Build simple index paths using the clauses.  Allow ScalarArrayOpExpr
-	 * clauses only if the index AM supports them natively, and skip any such
-	 * clauses for index columns after the first (so that we produce ordered
-	 * paths if possible).
+	 * clauses only if the index AM supports them natively.
 	 */
 	indexpaths = build_index_paths(root, rel,
 								   index, clauses,
 								   index->predOK,
 								   ST_ANYSCAN,
-								   &skip_nonnative_saop,
-								   &skip_lower_saop);
-
-	/*
-	 * If we skipped any lower-order ScalarArrayOpExprs on an index with an AM
-	 * that supports them, then try again including those clauses.  This will
-	 * produce paths with more selectivity but no ordering.
-	 */
-	if (skip_lower_saop)
-	{
-		indexpaths = list_concat(indexpaths,
-								 build_index_paths(root, rel,
-												   index, clauses,
-												   index->predOK,
-												   ST_ANYSCAN,
-												   &skip_nonnative_saop,
-												   NULL));
-	}
+								   &skip_nonnative_saop);
 
 	/*
 	 * Submit all the ones that can form plain IndexScan plans to add_path. (A
@@ -804,7 +761,6 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									   index, clauses,
 									   false,
 									   ST_BITMAPSCAN,
-									   NULL,
 									   NULL);
 		*bitindexpaths = list_concat(*bitindexpaths, indexpaths);
 	}
@@ -837,27 +793,19 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
  * to true if we found any such clauses (caller must initialize the variable
  * to false).  If it's NULL, we do not ignore ScalarArrayOpExpr clauses.
  *
- * If skip_lower_saop is non-NULL, we ignore ScalarArrayOpExpr clauses for
- * non-first index columns, and we set *skip_lower_saop to true if we found
- * any such clauses (caller must initialize the variable to false).  If it's
- * NULL, we do not ignore non-first ScalarArrayOpExpr clauses, but they will
- * result in considering the scan's output to be unordered.
- *
  * 'rel' is the index's heap relation
  * 'index' is the index for which we want to generate paths
  * 'clauses' is the collection of indexable clauses (IndexClause nodes)
  * 'useful_predicate' indicates whether the index has a useful predicate
  * 'scantype' indicates whether we need plain or bitmap scan support
  * 'skip_nonnative_saop' indicates whether to accept SAOP if index AM doesn't
- * 'skip_lower_saop' indicates whether to accept non-first-column SAOP
  */
 static List *
 build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				  IndexOptInfo *index, IndexClauseSet *clauses,
 				  bool useful_predicate,
 				  ScanTypeControl scantype,
-				  bool *skip_nonnative_saop,
-				  bool *skip_lower_saop)
+				  bool *skip_nonnative_saop)
 {
 	List	   *result = NIL;
 	IndexPath  *ipath;
@@ -868,11 +816,12 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	List	   *orderbyclausecols;
 	List	   *index_pathkeys;
 	List	   *useful_pathkeys;
-	bool		found_lower_saop_clause;
 	bool		pathkeys_possibly_useful;
 	bool		index_is_ordered;
 	bool		index_only_scan;
 	int			indexcol;
+
+	Assert(skip_nonnative_saop != NULL || scantype == ST_BITMAPSCAN);
 
 	/*
 	 * Check that index supports the desired scan type(s)
@@ -900,19 +849,11 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * on by btree and possibly other places.)  The list can be empty, if the
 	 * index AM allows that.
 	 *
-	 * found_lower_saop_clause is set true if we accept a ScalarArrayOpExpr
-	 * index clause for a non-first index column.  This prevents us from
-	 * assuming that the scan result is ordered.  (Actually, the result is
-	 * still ordered if there are equality constraints for all earlier
-	 * columns, but it seems too expensive and non-modular for this code to be
-	 * aware of that refinement.)
-	 *
 	 * We also build a Relids set showing which outer rels are required by the
 	 * selected clauses.  Any lateral_relids are included in that, but not
 	 * otherwise accounted for.
 	 */
 	index_clauses = NIL;
-	found_lower_saop_clause = false;
 	outer_relids = bms_copy(rel->lateral_relids);
 	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
@@ -923,30 +864,18 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			IndexClause *iclause = (IndexClause *) lfirst(lc);
 			RestrictInfo *rinfo = iclause->rinfo;
 
-			/* We might need to omit ScalarArrayOpExpr clauses */
-			if (IsA(rinfo->clause, ScalarArrayOpExpr))
+			if (skip_nonnative_saop && !index->amsearcharray &&
+				IsA(rinfo->clause, ScalarArrayOpExpr))
 			{
-				if (!index->amsearcharray)
-				{
-					if (skip_nonnative_saop)
-					{
-						/* Ignore because not supported by index */
-						*skip_nonnative_saop = true;
-						continue;
-					}
-					/* Caller had better intend this only for bitmap scan */
-					Assert(scantype == ST_BITMAPSCAN);
-				}
-				if (indexcol > 0)
-				{
-					if (skip_lower_saop)
-					{
-						/* Caller doesn't want to lose index ordering */
-						*skip_lower_saop = true;
-						continue;
-					}
-					found_lower_saop_clause = true;
-				}
+				/*
+				 * Caller asked us to generate IndexPaths that omit any
+				 * ScalarArrayOpExpr clauses when the underlying index AM
+				 * lacks native support.
+				 *
+				 * We must omit this clause (and tell caller about it).
+				 */
+				*skip_nonnative_saop = true;
+				continue;
 			}
 
 			/* OK to include this clause */
@@ -969,9 +898,6 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 
 	/* We do not want the index's rel itself listed in outer_relids */
 	outer_relids = bms_del_member(outer_relids, rel->relid);
-	/* Enforce convention that outer_relids is exactly NULL if empty */
-	if (bms_is_empty(outer_relids))
-		outer_relids = NULL;
 
 	/* Compute loop_count for cost estimation purposes */
 	loop_count = get_loop_count(root, rel->relid, outer_relids);
@@ -979,11 +905,9 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/*
 	 * 2. Compute pathkeys describing index's ordering, if any, then see how
 	 * many of them are actually useful for this query.  This is not relevant
-	 * if we are only trying to build bitmap indexscans, nor if we have to
-	 * assume the scan is unordered.
+	 * if we are only trying to build bitmap indexscans.
 	 */
 	pathkeys_possibly_useful = (scantype != ST_BITMAPSCAN &&
-								!found_lower_saop_clause &&
 								has_useful_pathkeys(root, rel));
 	index_is_ordered = (index->sortopfamily != NULL);
 	if (index_is_ordered && pathkeys_possibly_useful)
@@ -997,14 +921,20 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	}
 	else if (index->amcanorderbyop && pathkeys_possibly_useful)
 	{
-		/* see if we can generate ordering operators for query_pathkeys */
+		/*
+		 * See if we can generate ordering operators for query_pathkeys or at
+		 * least some prefix thereof.  Matching to just a prefix of the
+		 * query_pathkeys will allow an incremental sort to be considered on
+		 * the index's partially sorted results.
+		 */
 		match_pathkeys_to_index(index, root->query_pathkeys,
 								&orderbyclauses,
 								&orderbyclausecols);
-		if (orderbyclauses)
+		if (list_length(root->query_pathkeys) == list_length(orderbyclauses))
 			useful_pathkeys = root->query_pathkeys;
 		else
-			useful_pathkeys = NIL;
+			useful_pathkeys = list_copy_head(root->query_pathkeys,
+											 list_length(orderbyclauses));
 	}
 	else
 	{
@@ -1035,9 +965,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								  orderbyclauses,
 								  orderbyclausecols,
 								  useful_pathkeys,
-								  index_is_ordered ?
-								  ForwardScanDirection :
-								  NoMovementScanDirection,
+								  ForwardScanDirection,
 								  index_only_scan,
 								  outer_relids,
 								  loop_count,
@@ -1057,9 +985,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									  orderbyclauses,
 									  orderbyclausecols,
 									  useful_pathkeys,
-									  index_is_ordered ?
-									  ForwardScanDirection :
-									  NoMovementScanDirection,
+									  ForwardScanDirection,
 									  index_only_scan,
 									  outer_relids,
 									  loop_count,
@@ -1233,7 +1159,6 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 									   index, &clauseset,
 									   useful_predicate,
 									   ST_BITMAPSCAN,
-									   NULL,
 									   NULL);
 		result = list_concat(result, indexpaths);
 	}
@@ -1303,11 +1228,11 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 			}
 			else
 			{
-				RestrictInfo *rinfo = castNode(RestrictInfo, orarg);
+				RestrictInfo *ri = castNode(RestrictInfo, orarg);
 				List	   *orargs;
 
-				Assert(!restriction_is_or_clause(rinfo));
-				orargs = list_make1(rinfo);
+				Assert(!restriction_is_or_clause(ri));
+				orargs = list_make1(ri);
 
 				indlist = build_paths_for_OR(root, rel,
 											 orargs,
@@ -2188,7 +2113,7 @@ match_clause_to_index(PlannerInfo *root,
 		/* Ignore duplicates */
 		foreach(lc, clauseset->indexclauses[indexcol])
 		{
-			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			iclause = (IndexClause *) lfirst(lc);
 
 			if (iclause->rinfo == rinfo)
 				return;
@@ -2341,6 +2266,23 @@ match_clause_to_indexcol(PlannerInfo *root,
 	}
 
 	return NULL;
+}
+
+/*
+ * IsBooleanOpfamily
+ *	  Detect whether an opfamily supports boolean equality as an operator.
+ *
+ * If the opfamily OID is in the range of built-in objects, we can rely
+ * on hard-wired knowledge of which built-in opfamilies support this.
+ * For extension opfamilies, there's no choice but to do a catcache lookup.
+ */
+static bool
+IsBooleanOpfamily(Oid opfamily)
+{
+	if (opfamily < FirstNormalObjectId)
+		return IsBuiltinBooleanOpfamily(opfamily);
+	else
+		return op_in_opfamily(BooleanEqualOperator, opfamily);
 }
 
 /*
@@ -3061,24 +3003,24 @@ expand_indexqual_rowcompare(PlannerInfo *root,
 
 /*
  * match_pathkeys_to_index
- *		Test whether an index can produce output ordered according to the
- *		given pathkeys using "ordering operators".
+ *		For the given 'index' and 'pathkeys', output a list of suitable ORDER
+ *		BY expressions, each of the form "indexedcol operator pseudoconstant",
+ *		along with an integer list of the index column numbers (zero based)
+ *		that each clause would be used with.
  *
- * If it can, return a list of suitable ORDER BY expressions, each of the form
- * "indexedcol operator pseudoconstant", along with an integer list of the
- * index column numbers (zero based) that each clause would be used with.
- * NIL lists are returned if the ordering is not achievable this way.
- *
- * On success, the result list is ordered by pathkeys, and in fact is
- * one-to-one with the requested pathkeys.
+ * This attempts to find an ORDER BY and index column number for all items in
+ * the pathkey list, however, if we're unable to match any given pathkey to an
+ * index column, we return just the ones matched by the function so far.  This
+ * allows callers who are interested in partial matches to get them.  Callers
+ * can determine a partial match vs a full match by checking the outputted
+ * list lengths.  A full match will have one item in the output lists for each
+ * item in the given 'pathkeys' list.
  */
 static void
 match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 						List **orderby_clauses_p,
 						List **clause_columns_p)
 {
-	List	   *orderby_clauses = NIL;
-	List	   *clause_columns = NIL;
 	ListCell   *lc1;
 
 	*orderby_clauses_p = NIL;	/* set default results */
@@ -3094,10 +3036,6 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 		bool		found = false;
 		ListCell   *lc2;
 
-		/*
-		 * Note: for any failure to match, we just return NIL immediately.
-		 * There is no value in matching just some of the pathkeys.
-		 */
 
 		/* Pathkey must request default sort order for the target opfamily */
 		if (pathkey->pk_strategy != BTLessStrategyNumber ||
@@ -3143,8 +3081,8 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 												   pathkey->pk_opfamily);
 				if (expr)
 				{
-					orderby_clauses = lappend(orderby_clauses, expr);
-					clause_columns = lappend_int(clause_columns, indexcol);
+					*orderby_clauses_p = lappend(*orderby_clauses_p, expr);
+					*clause_columns_p = lappend_int(*clause_columns_p, indexcol);
 					found = true;
 					break;
 				}
@@ -3154,12 +3092,13 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 				break;
 		}
 
-		if (!found)				/* fail if no match for this pathkey */
+		/*
+		 * Return the matches found so far when this pathkey couldn't be
+		 * matched to the index.
+		 */
+		if (!found)
 			return;
 	}
-
-	*orderby_clauses_p = orderby_clauses;	/* success! */
-	*clause_columns_p = clause_columns;
 }
 
 /*
@@ -3355,13 +3294,16 @@ check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
 	 * Add on any equivalence-derivable join clauses.  Computing the correct
 	 * relid sets for generate_join_implied_equalities is slightly tricky
 	 * because the rel could be a child rel rather than a true baserel, and in
-	 * that case we must remove its parents' relid(s) from all_baserels.
+	 * that case we must subtract its parents' relid(s) from all_query_rels.
+	 * Additionally, we mustn't consider clauses that are only computable
+	 * after outer joins that can null the rel.
 	 */
 	if (rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
-		otherrels = bms_difference(root->all_baserels,
+		otherrels = bms_difference(root->all_query_rels,
 								   find_childrel_parents(root, rel));
 	else
-		otherrels = bms_difference(root->all_baserels, rel->relids);
+		otherrels = bms_difference(root->all_query_rels, rel->relids);
+	otherrels = bms_del_members(otherrels, rel->nulling_relids);
 
 	if (!bms_is_empty(otherrels))
 		clauselist =
@@ -3370,18 +3312,20 @@ check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
 														 bms_union(rel->relids,
 																   otherrels),
 														 otherrels,
-														 rel));
+														 rel,
+														 NULL));
 
 	/*
 	 * Normally we remove quals that are implied by a partial index's
 	 * predicate from indrestrictinfo, indicating that they need not be
 	 * checked explicitly by an indexscan plan using this index.  However, if
-	 * the rel is a target relation of UPDATE/DELETE/SELECT FOR UPDATE, we
-	 * cannot remove such quals from the plan, because they need to be in the
-	 * plan so that they will be properly rechecked by EvalPlanQual testing.
-	 * Some day we might want to remove such quals from the main plan anyway
-	 * and pass them through to EvalPlanQual via a side channel; but for now,
-	 * we just don't remove implied quals at all for target relations.
+	 * the rel is a target relation of UPDATE/DELETE/MERGE/SELECT FOR UPDATE,
+	 * we cannot remove such quals from the plan, because they need to be in
+	 * the plan so that they will be properly rechecked by EvalPlanQual
+	 * testing.  Some day we might want to remove such quals from the main
+	 * plan anyway and pass them through to EvalPlanQual via a side channel;
+	 * but for now, we just don't remove implied quals at all for target
+	 * relations.
 	 */
 	is_target_rel = (bms_is_member(rel->relid, root->all_result_relids) ||
 					 get_plan_rowmark(root->rowMarks, rel->relid) != NULL);
@@ -3554,10 +3498,13 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 
 		/*
 		 * If the index is not unique, or not immediately enforced, or if it's
-		 * a partial index that doesn't match the query, it's useless here.
+		 * a partial index, it's useless here.  We're unable to make use of
+		 * predOK partial unique indexes due to the fact that
+		 * check_index_predicates() also makes use of join predicates to
+		 * determine if the partial index is usable. Here we need proofs that
+		 * hold true before any joins are evaluated.
 		 */
-		if (!ind->unique || !ind->immediate ||
-			(ind->indpred != NIL && !ind->predOK))
+		if (!ind->unique || !ind->immediate || ind->indpred != NIL)
 			continue;
 
 		/*
@@ -3738,7 +3685,8 @@ match_index_to_operand(Node *operand,
 		 */
 		if (operand && IsA(operand, Var) &&
 			index->rel->relid == ((Var *) operand)->varno &&
-			indkey == ((Var *) operand)->varattno)
+			indkey == ((Var *) operand)->varattno &&
+			((Var *) operand)->varnullingrels == NULL)
 			return true;
 	}
 	else

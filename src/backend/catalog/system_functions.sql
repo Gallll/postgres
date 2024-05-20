@@ -1,11 +1,11 @@
 /*
  * PostgreSQL System Functions
  *
- * Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/backend/catalog/system_functions.sql
  *
- * This file redefines certain built-in functions that it's impractical
+ * This file redefines certain built-in functions that are impractical
  * to fully define in pg_proc.dat.  In most cases that's because they use
  * SQL-standard function bodies and/or default expressions.  The node
  * tree representations of those are too unreadable, platform-dependent,
@@ -65,6 +65,13 @@ CREATE OR REPLACE FUNCTION bit_length(text)
  LANGUAGE sql
  IMMUTABLE PARALLEL SAFE STRICT COST 1
 RETURN octet_length($1) * 8;
+
+CREATE OR REPLACE FUNCTION
+ random_normal(mean float8 DEFAULT 0, stddev float8 DEFAULT 1)
+ RETURNS float8
+ LANGUAGE internal
+ VOLATILE PARALLEL RESTRICTED STRICT COST 1
+AS 'drandom_normal';
 
 CREATE OR REPLACE FUNCTION log(numeric)
  RETURNS numeric
@@ -439,6 +446,26 @@ LANGUAGE INTERNAL
 VOLATILE ROWS 1000 COST 1000
 AS 'pg_logical_slot_peek_binary_changes';
 
+CREATE OR REPLACE FUNCTION pg_logical_emit_message(
+    transactional boolean,
+    prefix text,
+    message text,
+    flush boolean DEFAULT false)
+RETURNS pg_lsn
+LANGUAGE INTERNAL
+STRICT VOLATILE
+AS 'pg_logical_emit_message_text';
+
+CREATE OR REPLACE FUNCTION pg_logical_emit_message(
+    transactional boolean,
+    prefix text,
+    message bytea,
+    flush boolean DEFAULT false)
+RETURNS pg_lsn
+LANGUAGE INTERNAL
+STRICT VOLATILE
+AS 'pg_logical_emit_message_bytea';
+
 CREATE OR REPLACE FUNCTION pg_create_physical_replication_slot(
     IN slot_name name, IN immediately_reserve boolean DEFAULT false,
     IN temporary boolean DEFAULT false,
@@ -452,6 +479,7 @@ CREATE OR REPLACE FUNCTION pg_create_logical_replication_slot(
     IN slot_name name, IN plugin name,
     IN temporary boolean DEFAULT false,
     IN twophase boolean DEFAULT false,
+    IN failover boolean DEFAULT false,
     OUT slot_name name, OUT lsn pg_lsn)
 RETURNS RECORD
 LANGUAGE INTERNAL
@@ -594,6 +622,20 @@ LANGUAGE internal
 STRICT IMMUTABLE PARALLEL SAFE
 AS 'unicode_is_normalized';
 
+CREATE OR REPLACE FUNCTION
+  pg_stat_reset_shared(target text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
+AS 'pg_stat_reset_shared';
+
+CREATE OR REPLACE FUNCTION
+  pg_stat_reset_slru(target text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
+AS 'pg_stat_reset_slru';
+
 --
 -- The default permissions for functions mean that anyone can execute them.
 -- A number of functions shouldn't be executable by just anyone, but rather
@@ -610,6 +652,8 @@ REVOKE EXECUTE ON FUNCTION pg_backup_stop(boolean) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_create_restore_point(text) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_switch_wal() FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_log_standby_snapshot() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_wal_replay_pause() FROM public;
 
@@ -659,11 +703,15 @@ REVOKE EXECUTE ON FUNCTION pg_ls_tmpdir(oid) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_read_file(text) FROM public;
 
+REVOKE EXECUTE ON FUNCTION pg_read_file(text,boolean) FROM public;
+
 REVOKE EXECUTE ON FUNCTION pg_read_file(text,bigint,bigint) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_read_file(text,bigint,bigint,boolean) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text,boolean) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text,bigint,bigint) FROM public;
 
@@ -728,6 +776,10 @@ GRANT EXECUTE ON FUNCTION pg_ls_logicalsnapdir() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION pg_ls_logicalmapdir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_replslotdir(text) TO pg_monitor;
+
+GRANT EXECUTE ON FUNCTION pg_current_logfile() TO pg_monitor;
+
+GRANT EXECUTE ON FUNCTION pg_current_logfile(text) TO pg_monitor;
 
 GRANT pg_read_all_settings TO pg_monitor;
 

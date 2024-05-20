@@ -3,7 +3,7 @@
  * pg_shdepend.c
  *	  routines to support manipulation of the pg_shdepend relation
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
@@ -32,7 +33,6 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_largeobject.h"
-#include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -47,14 +47,10 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
-#include "commands/collationcmds.h"
-#include "commands/conversioncmds.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
-#include "commands/extension.h"
 #include "commands/policy.h"
-#include "commands/proclang.h"
 #include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/subscriptioncmds.h"
@@ -72,7 +68,7 @@ typedef enum
 {
 	LOCAL_OBJECT,
 	SHARED_OBJECT,
-	REMOTE_OBJECT
+	REMOTE_OBJECT,
 } SharedDependencyObjectType;
 
 typedef struct
@@ -88,6 +84,11 @@ static void shdepChangeDep(Relation sdepRel,
 						   Oid classid, Oid objid, int32 objsubid,
 						   Oid refclassid, Oid refobjid,
 						   SharedDependencyType deptype);
+static void updateAclDependenciesWorker(Oid classId, Oid objectId,
+										int32 objsubId, Oid ownerId,
+										SharedDependencyType deptype,
+										int noldmembers, Oid *oldmembers,
+										int nnewmembers, Oid *newmembers);
 static void shdepAddDependency(Relation sdepRel,
 							   Oid classId, Oid objectId, int32 objsubId,
 							   Oid refclassId, Oid refobjId,
@@ -344,6 +345,11 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
 						AuthIdRelationId, newOwnerId,
 						SHARED_DEPENDENCY_ACL);
 
+	/* The same applies to SHARED_DEPENDENCY_INITACL */
+	shdepDropDependency(sdepRel, classId, objectId, 0, true,
+						AuthIdRelationId, newOwnerId,
+						SHARED_DEPENDENCY_INITACL);
+
 	table_close(sdepRel, RowExclusiveLock);
 }
 
@@ -483,6 +489,38 @@ updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
 					  int noldmembers, Oid *oldmembers,
 					  int nnewmembers, Oid *newmembers)
 {
+	updateAclDependenciesWorker(classId, objectId, objsubId,
+								ownerId, SHARED_DEPENDENCY_ACL,
+								noldmembers, oldmembers,
+								nnewmembers, newmembers);
+}
+
+/*
+ * updateInitAclDependencies
+ *		Update the pg_shdepend info for a pg_init_privs entry.
+ *
+ * Exactly like updateAclDependencies, except we are considering a
+ * pg_init_privs ACL for the specified object.
+ */
+void
+updateInitAclDependencies(Oid classId, Oid objectId, int32 objsubId,
+						  Oid ownerId,
+						  int noldmembers, Oid *oldmembers,
+						  int nnewmembers, Oid *newmembers)
+{
+	updateAclDependenciesWorker(classId, objectId, objsubId,
+								ownerId, SHARED_DEPENDENCY_INITACL,
+								noldmembers, oldmembers,
+								nnewmembers, newmembers);
+}
+
+/* Common code for the above two functions */
+static void
+updateAclDependenciesWorker(Oid classId, Oid objectId, int32 objsubId,
+							Oid ownerId, SharedDependencyType deptype,
+							int noldmembers, Oid *oldmembers,
+							int nnewmembers, Oid *newmembers)
+{
 	Relation	sdepRel;
 	int			i;
 
@@ -517,7 +555,7 @@ updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
 
 			shdepAddDependency(sdepRel, classId, objectId, objsubId,
 							   AuthIdRelationId, roleid,
-							   SHARED_DEPENDENCY_ACL);
+							   deptype);
 		}
 
 		/* Drop no-longer-used old dependencies */
@@ -536,7 +574,7 @@ updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
 			shdepDropDependency(sdepRel, classId, objectId, objsubId,
 								false,	/* exact match on objsubId */
 								AuthIdRelationId, roleid,
-								SHARED_DEPENDENCY_ACL);
+								deptype);
 		}
 
 		table_close(sdepRel, RowExclusiveLock);
@@ -761,7 +799,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	 * Sort and report local and shared objects.
 	 */
 	if (numobjects > 1)
-		qsort((void *) objects, numobjects,
+		qsort(objects, numobjects,
 			  sizeof(ShDependObjectInfo), shared_dependency_comparator);
 
 	for (int i = 0; i < numobjects; i++)
@@ -1253,6 +1291,8 @@ storeObjectDescription(StringInfo descs,
 				appendStringInfo(descs, _("owner of %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_ACL)
 				appendStringInfo(descs, _("privileges for %s"), objdesc);
+			else if (deptype == SHARED_DEPENDENCY_INITACL)
+				appendStringInfo(descs, _("initial privileges for %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_POLICY)
 				appendStringInfo(descs, _("target of %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_TABLESPACE)
@@ -1364,11 +1404,6 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 				case SHARED_DEPENDENCY_INVALID:
 					elog(ERROR, "unexpected dependency type");
 					break;
-				case SHARED_DEPENDENCY_ACL:
-					RemoveRoleFromObjectACL(roleid,
-											sdepForm->classid,
-											sdepForm->objid);
-					break;
 				case SHARED_DEPENDENCY_POLICY:
 
 					/*
@@ -1398,9 +1433,34 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 						add_exact_object_address(&obj, deleteobjs);
 					}
 					break;
+				case SHARED_DEPENDENCY_ACL:
+
+					/*
+					 * Dependencies on role grants are recorded using
+					 * SHARED_DEPENDENCY_ACL, but unlike a regular ACL list
+					 * which stores all permissions for a particular object in
+					 * a single ACL array, there's a separate catalog row for
+					 * each grant - so removing the grant just means removing
+					 * the entire row.
+					 */
+					if (sdepForm->classid != AuthMemRelationId)
+					{
+						RemoveRoleFromObjectACL(roleid,
+												sdepForm->classid,
+												sdepForm->objid);
+						break;
+					}
+					/* FALLTHROUGH */
+
 				case SHARED_DEPENDENCY_OWNER:
-					/* If a local object, save it for deletion below */
-					if (sdepForm->dbid == MyDatabaseId)
+
+					/*
+					 * Save it for deletion below, if it's a local object or a
+					 * role grant. Other shared objects, such as databases,
+					 * should not be removed here.
+					 */
+					if (sdepForm->dbid == MyDatabaseId ||
+						sdepForm->classid == AuthMemRelationId)
 					{
 						obj.classId = sdepForm->classid;
 						obj.objectId = sdepForm->objid;
@@ -1414,6 +1474,14 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 						}
 						add_exact_object_address(&obj, deleteobjs);
 					}
+					break;
+				case SHARED_DEPENDENCY_INITACL:
+					/* Shouldn't see a role grant here */
+					Assert(sdepForm->classid != AuthMemRelationId);
+					RemoveRoleFromInitPriv(roleid,
+										   sdepForm->classid,
+										   sdepForm->objid,
+										   sdepForm->objsubid);
 					break;
 			}
 		}
@@ -1593,20 +1661,9 @@ shdepReassignOwned(List *roleids, Oid newrole)
 				case DatabaseRelationId:
 				case TSConfigRelationId:
 				case TSDictionaryRelationId:
-					{
-						Oid			classId = sdepForm->classid;
-						Relation	catalog;
-
-						if (classId == LargeObjectRelationId)
-							classId = LargeObjectMetadataRelationId;
-
-						catalog = table_open(classId, RowExclusiveLock);
-
-						AlterObjectOwner_internal(catalog, sdepForm->objid,
-												  newrole);
-
-						table_close(catalog, NoLock);
-					}
+					AlterObjectOwner_internal(sdepForm->classid,
+											  sdepForm->objid,
+											  newrole);
 					break;
 
 				default:

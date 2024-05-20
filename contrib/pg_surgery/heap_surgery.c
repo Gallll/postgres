@@ -3,7 +3,7 @@
  * heap_surgery.c
  *	  Functions to perform surgery on the damaged heap table.
  *
- * Copyright (c) 2020-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2020-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pg_surgery/heap_surgery.c
@@ -20,6 +20,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
@@ -28,7 +29,7 @@ PG_MODULE_MAGIC;
 typedef enum HeapTupleForceOption
 {
 	HEAP_FORCE_KILL,
-	HEAP_FORCE_FREEZE
+	HEAP_FORCE_FREEZE,
 } HeapTupleForceOption;
 
 PG_FUNCTION_INFO_V1(heap_force_kill);
@@ -94,7 +95,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is in progress"),
-				 errhint("heap surgery functions cannot be executed during recovery.")));
+				 errhint("Heap surgery functions cannot be executed during recovery.")));
 
 	/* Check inputs. */
 	sanity_check_tid_array(ta, &ntids);
@@ -117,7 +118,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 				 errmsg("only heap AM is supported")));
 
 	/* Must be owner of the table or superuser. */
-	if (!pg_class_ownercheck(RelationGetRelid(rel), GetUserId()))
+	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER,
 					   get_relkind_objtype(rel->rd_rel->relkind),
 					   RelationGetRelationName(rel));
@@ -130,7 +131,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 	 * array.
 	 */
 	if (ntids > 1)
-		qsort((void *) tids, ntids, sizeof(ItemPointerData), tidcmp);
+		qsort(tids, ntids, sizeof(ItemPointerData), tidcmp);
 
 	curr_start_ptr = next_start_ptr = 0;
 	nblocks = RelationGetNumberOfBlocks(rel);

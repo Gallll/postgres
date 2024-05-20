@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/brin.sgml -->
 
-<chapter id="brin">
+<sect1 id="brin">
 <title>BRIN Indexes</title>
 
    <indexterm>
@@ -8,7 +8,7 @@
     <secondary>BRIN</secondary>
    </indexterm>
 
-<sect1 id="brin-intro">
+<sect2 id="brin-intro">
  <title>Introduction</title>
 
  <para>
@@ -64,7 +64,7 @@
   be more precise and more data blocks can be skipped during an index scan.
  </para>
 
- <sect2 id="brin-operation">
+ <sect3 id="brin-operation">
   <title>Index Maintenance</title>
 
   <para>
@@ -75,7 +75,7 @@
    summarized will cause the summary information to be updated with data
    from the new tuples.
    When a new page is created that does not fall within the last
-   summarized range, the range that the new page belongs into
+   summarized range, the range that the new page belongs to
    does not automatically acquire a summary tuple;
    those tuples remain unsummarized until a summarization run is
    invoked later, creating the initial summary for that range.
@@ -95,7 +95,9 @@
   </para>
 
   <para>
-   Lastly, the following functions can be used:
+   Lastly, the following functions can be used (while these functions run,
+   <xref linkend="guc-search-path"/> is temporarily changed to
+   <literal>pg_catalog, pg_temp</literal>):
    <simplelist>
     <member>
      <function>brin_summarize_new_values(regclass)</function>
@@ -134,10 +136,10 @@ LOG:  request for BRIN range summarization for index "brin_wi_idx" page 128 was 
    See <xref linkend="functions-admin-index"/> for details.
   </para>
 
- </sect2>
-</sect1>
+ </sect3>
+</sect2>
 
-<sect1 id="brin-builtin-opclasses">
+<sect2 id="brin-builtin-opclasses">
  <title>Built-in Operator Classes</title>
 
  <para>
@@ -741,7 +743,7 @@ LOG:  request for BRIN range summarization for index "brin_wi_idx" page 128 was 
   </tgroup>
  </table>
 
-  <sect2 id="brin-builtin-opclasses--parameters">
+  <sect3 id="brin-builtin-opclasses--parameters">
    <title>Operator Class Parameters</title>
 
    <para>
@@ -806,11 +808,11 @@ LOG:  request for BRIN range summarization for index "brin_wi_idx" page 128 was 
    </varlistentry>
 
    </variablelist>
-  </sect2>
+  </sect3>
 
-</sect1>
+</sect2>
 
-<sect1 id="brin-extensibility">
+<sect2 id="brin-extensibility">
  <title>Extensibility</title>
 
  <para>
@@ -1229,6 +1231,10 @@ typedef struct BrinOpcInfo
      <entry>internal function <function>brin_bloom_union()</function></entry>
     </row>
     <row>
+     <entry>Support Procedure 5</entry>
+     <entry>internal function <function>brin_bloom_options()</function></entry>
+    </row>
+    <row>
      <entry>Support Procedure 11</entry>
      <entry>function to compute hash of an element</entry>
     </row>
@@ -1287,6 +1293,10 @@ typedef struct BrinOpcInfo
      <entry>internal function <function>brin_minmax_multi_union()</function></entry>
     </row>
     <row>
+     <entry>Support Procedure 5</entry>
+     <entry>internal function <function>brin_minmax_multi_options()</function></entry>
+    </row>
+    <row>
      <entry>Support Procedure 11</entry>
      <entry>function to compute distance between two values (length of a range)</entry>
     </row>
@@ -1330,5 +1340,5 @@ typedef struct BrinOpcInfo
     <literal>float4_minmax_ops</literal> as an example of minmax, and
     <literal>box_inclusion_ops</literal> as an example of inclusion.
  </para>
+</sect2>
 </sect1>
-</chapter>

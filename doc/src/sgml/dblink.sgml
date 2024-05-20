@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/dblink.sgml -->
 
 <sect1 id="dblink" xreflabel="dblink">
- <title>dblink</title>
+ <title>dblink &mdash; connect to other PostgreSQL databases</title>
 
  <indexterm zone="dblink">
   <primary>dblink</primary>
@@ -12,6 +12,41 @@
   other <productname>PostgreSQL</productname> databases from within a database
   session.
  </para>
+
+ <para>
+  <filename>dblink</filename> can report the following wait events under the wait
+  event type <literal>Extension</literal>.
+ </para>
+
+ <variablelist>
+  <varlistentry>
+   <term><literal>DblinkConnect</literal></term>
+   <listitem>
+    <para>
+     Waiting to establish a connection to a remote server.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>DblinkGetConnect</literal></term>
+   <listitem>
+    <para>
+     Waiting to establish a connection to a remote server when it could not
+     be found in the list of already-opened connections.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>DblinkGetResult</literal></term>
+   <listitem>
+    <para>
+     Waiting to receive the results of a query from a remote server.
+    </para>
+   </listitem>
+  </varlistentry>
+ </variablelist>
 
  <para>
   See also <xref linkend="postgres-fdw"/>, which provides roughly the same
@@ -117,8 +152,9 @@ dblink_connect(text connname, text connstr) returns text
 
    <para>
     Only superusers may use <function>dblink_connect</function> to create
-    non-password-authenticated connections.  If non-superusers need this
-    capability, use <function>dblink_connect_u</function> instead.
+    non-password-authenticated and non-GSSAPI-authenticated connections.
+    If non-superusers need this capability, use
+    <function>dblink_connect_u</function> instead.
    </para>
 
    <para>

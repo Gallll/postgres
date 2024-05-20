@@ -3,7 +3,7 @@
 # parser generator for ecpg version 2
 # call with backend parser as stdin
 #
-# Copyright (c) 2007-2022, PostgreSQL Global Development Group
+# Copyright (c) 2007-2024, PostgreSQL Global Development Group
 #
 # Written by Mike Aubury <mike.aubury@aubit.com>
 #            Michael Meskes <meskes@postgresql.org>
@@ -13,12 +13,12 @@
 #
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Getopt::Long;
 
-my $srcdir  = '.';
+my $srcdir = '.';
 my $outfile = '';
-my $parser  = '';
+my $parser = '';
 
 GetOptions(
 	'srcdir=s' => \$srcdir,
@@ -29,13 +29,14 @@ GetOptions(
 open(my $parserfh, '<', $parser) or die "could not open parser file $parser";
 open(my $outfh, '>', $outfile) or die "could not open output file $outfile";
 
-my $copymode              = 0;
-my $brace_indent          = 0;
-my $yaccmode              = 0;
-my $in_rule               = 0;
-my $header_included       = 0;
-my $feature_not_supported = 0;
-my $tokenmode             = 0;
+my $copymode = 0;
+my $brace_indent = 0;
+my $yaccmode = 0;
+my $in_rule = 0;
+my $header_included = 0;
+my $has_feature_not_supported = 0;
+my $has_if_command = 0;
+my $tokenmode = 0;
 
 my (%buff, $infield, $comment, %tokens, %addons);
 my ($stmt_mode, @fields);
@@ -50,67 +51,67 @@ my %replace_token = (
 	'FCONST' => 'ecpg_fconst',
 	'Sconst' => 'ecpg_sconst',
 	'XCONST' => 'ecpg_xconst',
-	'IDENT'  => 'ecpg_ident',
-	'PARAM'  => 'ecpg_param',);
+	'IDENT' => 'ecpg_ident',
+	'PARAM' => 'ecpg_param',);
 
 # or in the block
 my %replace_string = (
-	'NOT_LA'         => 'not',
-	'NULLS_LA'       => 'nulls',
-	'WITH_LA'        => 'with',
-	'WITH_LA_UNIQUE' => 'with',
-	'WITHOUT_LA'     => 'without',
-	'TYPECAST'       => '::',
-	'DOT_DOT'        => '..',
-	'COLON_EQUALS'   => ':=',
+	'FORMAT_LA' => 'format',
+	'NOT_LA' => 'not',
+	'NULLS_LA' => 'nulls',
+	'WITH_LA' => 'with',
+	'WITHOUT_LA' => 'without',
+	'TYPECAST' => '::',
+	'DOT_DOT' => '..',
+	'COLON_EQUALS' => ':=',
 	'EQUALS_GREATER' => '=>',
-	'LESS_EQUALS'    => '<=',
+	'LESS_EQUALS' => '<=',
 	'GREATER_EQUALS' => '>=',
-	'NOT_EQUALS'     => '<>',);
+	'NOT_EQUALS' => '<>',);
 
 # specific replace_types for specific non-terminals - never include the ':'
 # ECPG-only replace_types are defined in ecpg-replace_types
 my %replace_types = (
-	'PrepareStmt'      => '<prep>',
-	'ExecuteStmt'      => '<exec>',
+	'PrepareStmt' => '<prep>',
+	'ExecuteStmt' => '<exec>',
 	'opt_array_bounds' => '<index>',
 
 	# "ignore" means: do not create type and rules for this non-term-id
-	'parse_toplevel'      => 'ignore',
-	'stmtmulti'           => 'ignore',
-	'CreateAsStmt'        => 'ignore',
-	'DeallocateStmt'      => 'ignore',
-	'ColId'               => 'ignore',
-	'type_function_name'  => 'ignore',
-	'ColLabel'            => 'ignore',
-	'Sconst'              => 'ignore',
+	'parse_toplevel' => 'ignore',
+	'stmtmulti' => 'ignore',
+	'CreateAsStmt' => 'ignore',
+	'DeallocateStmt' => 'ignore',
+	'ColId' => 'ignore',
+	'type_function_name' => 'ignore',
+	'ColLabel' => 'ignore',
+	'Sconst' => 'ignore',
 	'opt_distinct_clause' => 'ignore',
-	'PLpgSQL_Expr'        => 'ignore',
-	'PLAssignStmt'        => 'ignore',
-	'plassign_target'     => 'ignore',
-	'plassign_equals'     => 'ignore',);
+	'PLpgSQL_Expr' => 'ignore',
+	'PLAssignStmt' => 'ignore',
+	'plassign_target' => 'ignore',
+	'plassign_equals' => 'ignore',);
 
 # these replace_line commands excise certain keywords from the core keyword
 # lists.  Be sure to account for these in ColLabel and related productions.
 my %replace_line = (
 	'unreserved_keywordCONNECTION' => 'ignore',
-	'unreserved_keywordCURRENT_P'  => 'ignore',
-	'unreserved_keywordDAY_P'      => 'ignore',
-	'unreserved_keywordHOUR_P'     => 'ignore',
-	'unreserved_keywordINPUT_P'    => 'ignore',
-	'unreserved_keywordMINUTE_P'   => 'ignore',
-	'unreserved_keywordMONTH_P'    => 'ignore',
-	'unreserved_keywordSECOND_P'   => 'ignore',
-	'unreserved_keywordYEAR_P'     => 'ignore',
-	'col_name_keywordCHAR_P'       => 'ignore',
-	'col_name_keywordINT_P'        => 'ignore',
-	'col_name_keywordVALUES'       => 'ignore',
-	'reserved_keywordTO'           => 'ignore',
-	'reserved_keywordUNION'        => 'ignore',
+	'unreserved_keywordCURRENT_P' => 'ignore',
+	'unreserved_keywordDAY_P' => 'ignore',
+	'unreserved_keywordHOUR_P' => 'ignore',
+	'unreserved_keywordINPUT_P' => 'ignore',
+	'unreserved_keywordMINUTE_P' => 'ignore',
+	'unreserved_keywordMONTH_P' => 'ignore',
+	'unreserved_keywordSECOND_P' => 'ignore',
+	'unreserved_keywordYEAR_P' => 'ignore',
+	'col_name_keywordCHAR_P' => 'ignore',
+	'col_name_keywordINT_P' => 'ignore',
+	'col_name_keywordVALUES' => 'ignore',
+	'reserved_keywordTO' => 'ignore',
+	'reserved_keywordUNION' => 'ignore',
 
 	# some other production rules have to be ignored or replaced
-	'fetch_argsFORWARDopt_from_incursor_name'      => 'ignore',
-	'fetch_argsBACKWARDopt_from_incursor_name'     => 'ignore',
+	'fetch_argsFORWARDopt_from_incursor_name' => 'ignore',
+	'fetch_argsBACKWARDopt_from_incursor_name' => 'ignore',
 	"opt_array_boundsopt_array_bounds'['Iconst']'" => 'ignore',
 	'VariableShowStmtSHOWvar_name' => 'SHOW var_name ecpg_into',
 	'VariableShowStmtSHOWTIMEZONE' => 'SHOW TIME ZONE ecpg_into',
@@ -139,7 +140,7 @@ dump_buffer('tokens');
 dump_buffer('types');
 dump_buffer('ecpgtype');
 dump_buffer('orig_tokens');
-print $outfh '%%',                "\n";
+print $outfh '%%', "\n";
 print $outfh 'prog: statements;', "\n";
 dump_buffer('rules');
 include_file('trailer', 'ecpg.trailer');
@@ -151,12 +152,6 @@ sub main
 {
   line: while (<$parserfh>)
 	{
-		if (/ERRCODE_FEATURE_NOT_SUPPORTED/)
-		{
-			$feature_not_supported = 1;
-			next line;
-		}
-
 		chomp;
 
 		# comment out the line below to make the result file match (blank line wise)
@@ -177,9 +172,16 @@ sub main
 		if (/^%%/)
 		{
 			$tokenmode = 2;
-			$copymode  = 1;
+			$copymode = 1;
 			$yaccmode++;
 			$infield = 0;
+		}
+
+		if ($yaccmode == 1)
+		{
+			# Check for rules that throw FEATURE_NOT_SUPPORTED
+			$has_feature_not_supported = 1 if /ERRCODE_FEATURE_NOT_SUPPORTED/;
+			$has_if_command = 1 if /^\s*if/;
 		}
 
 		my $prec = 0;
@@ -212,14 +214,14 @@ sub main
 		}
 		elsif ($arr[0] eq '%type' && $header_included == 0)
 		{
-			include_file('header',   'ecpg.header');
+			include_file('header', 'ecpg.header');
 			include_file('ecpgtype', 'ecpg.type');
 			$header_included = 1;
 		}
 
 		if ($tokenmode == 1)
 		{
-			my $str   = '';
+			my $str = '';
 			my $prior = '';
 			for my $a (@arr)
 			{
@@ -320,9 +322,9 @@ sub main
 				{
 					$copymode = 1;
 				}
-				@fields  = ();
+				@fields = ();
 				$infield = 0;
-				$line    = '';
+				$line = '';
 				$in_rule = 0;
 				next;
 			}
@@ -365,7 +367,7 @@ sub main
 				elsif ($replace_types{$non_term_id} eq 'ignore')
 				{
 					$copymode = 0;
-					$line     = '';
+					$line = '';
 					next line;
 				}
 				$line = $line . ' ' . $arr[$fieldIndexer];
@@ -390,7 +392,7 @@ sub main
 					$stmt_mode = 0;
 				}
 				my $tstr =
-				    '%type '
+					'%type '
 				  . $replace_types{$non_term_id} . ' '
 				  . $non_term_id;
 				add_to_buffer('types', $tstr);
@@ -399,8 +401,8 @@ sub main
 				{
 					add_to_buffer('rules', $line);
 				}
-				$line    = '';
-				@fields  = ();
+				$line = '';
+				@fields = ();
 				$infield = 1;
 				die "unterminated rule at grammar line $.\n"
 				  if $in_rule;
@@ -541,20 +543,17 @@ sub dump_fields
 
 		#Normal
 		add_to_buffer('rules', $ln);
-		if ($feature_not_supported == 1)
+		if ($has_feature_not_supported and not $has_if_command)
 		{
-
-			# we found an unsupported feature, but we have to
-			# filter out ExecuteStmt: CREATE OptTemp TABLE ...
-			# because the warning there is only valid in some situations
-			if ($flds->[0] ne 'create' || $flds->[2] ne 'table')
-			{
-				add_to_buffer('rules',
-					'mmerror(PARSE_ERROR, ET_WARNING, "unsupported feature will be passed to server");'
-				);
-			}
-			$feature_not_supported = 0;
+			# The backend unconditionally reports
+			# FEATURE_NOT_SUPPORTED in this rule, so let's emit
+			# a warning on the ecpg side.
+			add_to_buffer('rules',
+				'mmerror(PARSE_ERROR, ET_WARNING, "unsupported feature will be passed to server");'
+			);
 		}
+		$has_feature_not_supported = 0;
+		$has_if_command = 0;
 
 		if ($len == 0)
 		{
@@ -699,11 +698,11 @@ sub preload_addons
 				{
 					push(@{ $x->{lines} }, @code);
 				}
-				@code       = ();
+				@code = ();
 				@needsRules = ();
 			}
-			$record          = {};
-			$record->{type}  = $2;
+			$record = {};
+			$record->{type} = $2;
 			$record->{lines} = [];
 			if (exists $addons{$1}) { die "Ga! there are dups!\n"; }
 			$addons{$1} = $record;

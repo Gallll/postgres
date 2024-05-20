@@ -4,7 +4,7 @@
  *	  implementation of insert algorithm
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,6 +19,7 @@
 #include "access/spgist_private.h"
 #include "access/spgxlog.h"
 #include "access/xloginsert.h"
+#include "common/int.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -110,9 +111,7 @@ addNode(SpGistState *state, SpGistInnerTuple tuple, Datum label, int offset)
 static int
 cmpOffsetNumbers(const void *a, const void *b)
 {
-	if (*(const OffsetNumber *) a == *(const OffsetNumber *) b)
-		return 0;
-	return (*(const OffsetNumber *) a > *(const OffsetNumber *) b) ? 1 : -1;
+	return pg_cmp_u16(*(const OffsetNumber *) a, *(const OffsetNumber *) b);
 }
 
 /*
@@ -395,7 +394,6 @@ moveLeafs(Relation index, SpGistState *state,
 				size;
 	Buffer		nbuf;
 	Page		npage;
-	SpGistLeafTuple it;
 	OffsetNumber r = InvalidOffsetNumber,
 				startOffset = InvalidOffsetNumber;
 	bool		replaceDead = false;
@@ -467,6 +465,8 @@ moveLeafs(Relation index, SpGistState *state,
 	{
 		for (i = 0; i < nDelete; i++)
 		{
+			SpGistLeafTuple it;
+
 			it = (SpGistLeafTuple) PageGetItem(current->page,
 											   PageGetItemId(current->page, toDelete[i]));
 			Assert(it->tupstate == SPGIST_LIVE);

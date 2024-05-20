@@ -8,6 +8,7 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    bbstreamer_tar.c \
                    bbstreamer_zstd.c \
                    pg_basebackup.c \
+                   pg_createsubscriber.c \
                    pg_receivewal.c \
                    pg_recvlogical.c \
                    receivelog.c \
@@ -18,5 +19,5 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    ../../common/file_utils.c \
                    ../../fe_utils/option_utils.c \
                    ../../fe_utils/recovery_gen.c
-GETTEXT_TRIGGERS = $(FRONTEND_COMMON_GETTEXT_TRIGGERS) simple_prompt tar_set_error
+GETTEXT_TRIGGERS = $(FRONTEND_COMMON_GETTEXT_TRIGGERS) simple_prompt
 GETTEXT_FLAGS    = $(FRONTEND_COMMON_GETTEXT_FLAGS)

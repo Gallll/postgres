@@ -5,7 +5,7 @@
  * Basically this is stuff that is useful in both pg_dump and pg_dumpall.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/dumputils.c
@@ -184,7 +184,9 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 							  prefix, privs->data, type);
 			if (nspname && *nspname)
 				appendPQExpBuffer(firstsql, "%s.", fmtId(nspname));
-			appendPQExpBuffer(firstsql, "%s FROM ", name);
+			if (name && *name)
+				appendPQExpBuffer(firstsql, "%s ", name);
+			appendPQExpBufferStr(firstsql, "FROM ");
 			if (grantee->len == 0)
 				appendPQExpBufferStr(firstsql, "PUBLIC;\n");
 			else
@@ -253,7 +255,9 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 									  prefix, privs->data, type);
 					if (nspname && *nspname)
 						appendPQExpBuffer(thissql, "%s.", fmtId(nspname));
-					appendPQExpBuffer(thissql, "%s TO ", name);
+					if (name && *name)
+						appendPQExpBuffer(thissql, "%s ", name);
+					appendPQExpBufferStr(thissql, "TO ");
 					if (grantee->len == 0)
 						appendPQExpBufferStr(thissql, "PUBLIC;\n");
 					else
@@ -265,7 +269,9 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 									  prefix, privswgo->data, type);
 					if (nspname && *nspname)
 						appendPQExpBuffer(thissql, "%s.", fmtId(nspname));
-					appendPQExpBuffer(thissql, "%s TO ", name);
+					if (name && *name)
+						appendPQExpBuffer(thissql, "%s ", name);
+					appendPQExpBufferStr(thissql, "TO ");
 					if (grantee->len == 0)
 						appendPQExpBufferStr(thissql, "PUBLIC");
 					else
@@ -457,6 +463,7 @@ do { \
 				CONVERT_PRIV('d', "DELETE");
 				CONVERT_PRIV('t', "TRIGGER");
 				CONVERT_PRIV('D', "TRUNCATE");
+				CONVERT_PRIV('m', "MAINTAIN");
 			}
 		}
 
@@ -676,7 +683,7 @@ emitShSecLabels(PGconn *conn, PGresult *res, PQExpBuffer buffer,
  * currently known to guc.c, so that it'd be unsafe for extensions to declare
  * GUC_LIST_QUOTE variables anyway.  Lacking a solution for that, it doesn't
  * seem worth the work to do more than have this list, which must be kept in
- * sync with the variables actually marked GUC_LIST_QUOTE in guc.c.
+ * sync with the variables actually marked GUC_LIST_QUOTE in guc_tables.c.
  */
 bool
 variable_is_guc_list_quote(const char *name)

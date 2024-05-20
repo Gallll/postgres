@@ -4,7 +4,7 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/rel.h
@@ -16,6 +16,7 @@
 
 #include "access/tupdesc.h"
 #include "access/xlog.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_publication.h"
@@ -56,7 +57,7 @@ typedef struct RelationData
 	RelFileLocator rd_locator;	/* relation physical identifier */
 	SMgrRelation rd_smgr;		/* cached file handle, or NULL */
 	int			rd_refcnt;		/* reference count */
-	BackendId	rd_backend;		/* owning backend id, if temporary relation */
+	ProcNumber	rd_backend;		/* owning backend's proc number, if temp rel */
 	bool		rd_islocaltemp; /* rel is a temp rel of this session */
 	bool		rd_isnailed;	/* rel is nailed in cache */
 	bool		rd_isvalid;		/* relcache entry is valid */
@@ -149,17 +150,20 @@ typedef struct RelationData
 
 	/* data managed by RelationGetIndexList: */
 	List	   *rd_indexlist;	/* list of OIDs of indexes on relation */
-	Oid			rd_pkindex;		/* OID of primary key, if any */
+	Oid			rd_pkindex;		/* OID of (deferrable?) primary key, if any */
+	bool		rd_ispkdeferrable;	/* is rd_pkindex a deferrable PK? */
 	Oid			rd_replidindex; /* OID of replica identity index, if any */
 
 	/* data managed by RelationGetStatExtList: */
 	List	   *rd_statlist;	/* list of OIDs of extended stats */
 
 	/* data managed by RelationGetIndexAttrBitmap: */
-	Bitmapset  *rd_indexattr;	/* identifies columns used in indexes */
+	bool		rd_attrsvalid;	/* are bitmaps of attrs valid? */
 	Bitmapset  *rd_keyattr;		/* cols that can be ref'd by foreign keys */
 	Bitmapset  *rd_pkattr;		/* cols included in primary key */
 	Bitmapset  *rd_idattr;		/* included in replica identity index */
+	Bitmapset  *rd_hotblockingattr; /* cols blocking HOT update */
+	Bitmapset  *rd_summarizedattr;	/* cols indexed by summarizing indexes */
 
 	PublicationDesc *rd_pubdesc;	/* publication descriptor, or NULL */
 
@@ -268,7 +272,7 @@ typedef struct RelationData
  */
 typedef struct ForeignKeyCacheInfo
 {
-	pg_node_attr(no_equal, no_read)
+	pg_node_attr(no_equal, no_read, no_query_jumble)
 
 	NodeTag		type;
 	/* oid of the constraint itself */
@@ -326,7 +330,7 @@ typedef enum StdRdOptIndexCleanup
 {
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO = 0,
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF,
-	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON
+	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
 } StdRdOptIndexCleanup;
 
 typedef struct StdRdOptions
@@ -399,7 +403,7 @@ typedef enum ViewOptCheckOption
 {
 	VIEW_OPTION_CHECK_OPTION_NOT_SET,
 	VIEW_OPTION_CHECK_OPTION_LOCAL,
-	VIEW_OPTION_CHECK_OPTION_CASCADED
+	VIEW_OPTION_CHECK_OPTION_CASCADED,
 } ViewOptCheckOption;
 
 /*
@@ -558,36 +562,33 @@ typedef struct ViewOptions
  *
  * Very little code is authorized to touch rel->rd_smgr directly.  Instead
  * use this function to fetch its value.
- *
- * Note: since a relcache flush can cause the file handle to be closed again,
- * it's unwise to hold onto the pointer returned by this function for any
- * long period.  Recommended practice is to just re-execute RelationGetSmgr
- * each time you need to access the SMgrRelation.  It's quite cheap in
- * comparison to whatever an smgr function is going to do.
  */
 static inline SMgrRelation
 RelationGetSmgr(Relation rel)
 {
 	if (unlikely(rel->rd_smgr == NULL))
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
+	{
+		rel->rd_smgr = smgropen(rel->rd_locator, rel->rd_backend);
+		smgrpin(rel->rd_smgr);
+	}
 	return rel->rd_smgr;
 }
-#endif
 
 /*
  * RelationCloseSmgr
  *		Close the relation at the smgr level, if not already done.
- *
- * Note: smgrclose should unhook from owner pointer, hence the Assert.
  */
-#define RelationCloseSmgr(relation) \
-	do { \
-		if ((relation)->rd_smgr != NULL) \
-		{ \
-			smgrclose((relation)->rd_smgr); \
-			Assert((relation)->rd_smgr == NULL); \
-		} \
-	} while (0)
+static inline void
+RelationCloseSmgr(Relation relation)
+{
+	if (relation->rd_smgr != NULL)
+	{
+		smgrunpin(relation->rd_smgr);
+		smgrclose(relation->rd_smgr);
+		relation->rd_smgr = NULL;
+	}
+}
+#endif							/* !FRONTEND */
 
 /*
  * RelationGetTargetBlock

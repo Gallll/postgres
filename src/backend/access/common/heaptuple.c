@@ -45,7 +45,7 @@
  * and we'd like to still refer to them via C struct offsets.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,17 +60,80 @@
 #include "access/heaptoast.h"
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
-#include "executor/tuptable.h"
+#include "common/hashfn.h"
+#include "utils/datum.h"
 #include "utils/expandeddatum.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 
-/* Does att's datatype allow packing into the 1-byte-header varlena format? */
+/*
+ * Does att's datatype allow packing into the 1-byte-header varlena format?
+ * While functions that use TupleDescAttr() and assign attstorage =
+ * TYPSTORAGE_PLAIN cannot use packed varlena headers, functions that call
+ * TupleDescInitEntry() use typeForm->typstorage (TYPSTORAGE_EXTENDED) and
+ * can use packed varlena headers, e.g.:
+ *     CREATE TABLE test(a VARCHAR(10000) STORAGE PLAIN);
+ *     INSERT INTO test VALUES (repeat('A',10));
+ * This can be verified with pageinspect.
+ */
 #define ATT_IS_PACKABLE(att) \
 	((att)->attlen == -1 && (att)->attstorage != TYPSTORAGE_PLAIN)
 /* Use this if it's already known varlena */
 #define VARLENA_ATT_IS_PACKABLE(att) \
 	((att)->attstorage != TYPSTORAGE_PLAIN)
 
+/*
+ * Setup for caching pass-by-ref missing attributes in a way that survives
+ * tupleDesc destruction.
+ */
+
+typedef struct
+{
+	int			len;
+	Datum		value;
+} missing_cache_key;
+
+static HTAB *missing_cache = NULL;
+
+static uint32
+missing_hash(const void *key, Size keysize)
+{
+	const missing_cache_key *entry = (missing_cache_key *) key;
+
+	return hash_bytes((const unsigned char *) entry->value, entry->len);
+}
+
+static int
+missing_match(const void *key1, const void *key2, Size keysize)
+{
+	const missing_cache_key *entry1 = (missing_cache_key *) key1;
+	const missing_cache_key *entry2 = (missing_cache_key *) key2;
+
+	if (entry1->len != entry2->len)
+		return entry1->len > entry2->len ? 1 : -1;
+
+	return memcmp(DatumGetPointer(entry1->value),
+				  DatumGetPointer(entry2->value),
+				  entry1->len);
+}
+
+static void
+init_missing_cache()
+{
+	HASHCTL		hash_ctl;
+
+	hash_ctl.keysize = sizeof(missing_cache_key);
+	hash_ctl.entrysize = sizeof(missing_cache_key);
+	hash_ctl.hcxt = TopMemoryContext;
+	hash_ctl.hash = missing_hash;
+	hash_ctl.match = missing_match;
+	missing_cache =
+		hash_create("Missing Values Cache",
+					32,
+					&hash_ctl,
+					HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION | HASH_COMPARE);
+}
 
 /* ----------------------------------------------------------------
  *						misc support routines
@@ -102,8 +165,41 @@ getmissingattr(TupleDesc tupleDesc,
 
 		if (attrmiss->am_present)
 		{
+			missing_cache_key key;
+			missing_cache_key *entry;
+			bool		found;
+			MemoryContext oldctx;
+
 			*isnull = false;
-			return attrmiss->am_value;
+
+			/* no  need to cache by-value attributes */
+			if (att->attbyval)
+				return attrmiss->am_value;
+
+			/* set up cache if required */
+			if (missing_cache == NULL)
+				init_missing_cache();
+
+			/* check if there's a cache entry */
+			Assert(att->attlen > 0 || att->attlen == -1);
+			if (att->attlen > 0)
+				key.len = att->attlen;
+			else
+				key.len = VARSIZE_ANY(attrmiss->am_value);
+			key.value = attrmiss->am_value;
+
+			entry = hash_search(missing_cache, &key, HASH_ENTER, &found);
+
+			if (!found)
+			{
+				/* cache miss, so we need a non-transient copy of the datum */
+				oldctx = MemoryContextSwitchTo(TopMemoryContext);
+				entry->value =
+					datumCopy(attrmiss->am_value, false, att->attlen);
+				MemoryContextSwitchTo(oldctx);
+			}
+
+			return entry->value;
 		}
 	}
 
@@ -117,8 +213,8 @@ getmissingattr(TupleDesc tupleDesc,
  */
 Size
 heap_compute_data_size(TupleDesc tupleDesc,
-					   Datum *values,
-					   bool *isnull)
+					   const Datum *values,
+					   const bool *isnull)
 {
 	Size		data_length = 0;
 	int			i;
@@ -302,7 +398,7 @@ fill_val(Form_pg_attribute att,
  */
 void
 heap_fill_tuple(TupleDesc tupleDesc,
-				Datum *values, bool *isnull,
+				const Datum *values, const bool *isnull,
 				char *data, Size data_size,
 				uint16 *infomask, bits8 *bit)
 {
@@ -420,13 +516,13 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
  * ----------------
  */
 Datum
-nocachegetattr(HeapTuple tuple,
+nocachegetattr(HeapTuple tup,
 			   int attnum,
 			   TupleDesc tupleDesc)
 {
-	HeapTupleHeader tup = tuple->t_data;
+	HeapTupleHeader td = tup->t_data;
 	char	   *tp;				/* ptr to data part of tuple */
-	bits8	   *bp = tup->t_bits;	/* ptr to null bitmap in tuple */
+	bits8	   *bp = td->t_bits;	/* ptr to null bitmap in tuple */
 	bool		slow = false;	/* do we have to walk attrs? */
 	int			off;			/* current offset within data */
 
@@ -441,7 +537,7 @@ nocachegetattr(HeapTuple tuple,
 
 	attnum--;
 
-	if (!HeapTupleNoNulls(tuple))
+	if (!HeapTupleNoNulls(tup))
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -470,7 +566,7 @@ nocachegetattr(HeapTuple tuple,
 		}
 	}
 
-	tp = (char *) tup + tup->t_hoff;
+	tp = (char *) td + td->t_hoff;
 
 	if (!slow)
 	{
@@ -489,7 +585,7 @@ nocachegetattr(HeapTuple tuple,
 		 * target.  If there aren't any, it's safe to cheaply initialize the
 		 * cached offsets for these attrs.
 		 */
-		if (HeapTupleHasVarWidth(tuple))
+		if (HeapTupleHasVarWidth(tup))
 		{
 			int			j;
 
@@ -565,7 +661,7 @@ nocachegetattr(HeapTuple tuple,
 		{
 			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 
-			if (HeapTupleHasNulls(tuple) && att_isnull(i, bp))
+			if (HeapTupleHasNulls(tup) && att_isnull(i, bp))
 			{
 				usecache = false;
 				continue;		/* this cannot be the target att */
@@ -1018,8 +1114,8 @@ heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
  */
 HeapTuple
 heap_form_tuple(TupleDesc tupleDescriptor,
-				Datum *values,
-				bool *isnull)
+				const Datum *values,
+				const bool *isnull)
 {
 	HeapTuple	tuple;			/* return tuple */
 	HeapTupleHeader td;			/* tuple data */
@@ -1112,9 +1208,9 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 HeapTuple
 heap_modify_tuple(HeapTuple tuple,
 				  TupleDesc tupleDesc,
-				  Datum *replValues,
-				  bool *replIsnull,
-				  bool *doReplace)
+				  const Datum *replValues,
+				  const bool *replIsnull,
+				  const bool *doReplace)
 {
 	int			numberOfAttributes = tupleDesc->natts;
 	int			attoff;
@@ -1181,9 +1277,9 @@ HeapTuple
 heap_modify_tuple_by_cols(HeapTuple tuple,
 						  TupleDesc tupleDesc,
 						  int nCols,
-						  int *replCols,
-						  Datum *replValues,
-						  bool *replIsnull)
+						  const int *replCols,
+						  const Datum *replValues,
+						  const bool *replIsnull)
 {
 	int			numberOfAttributes = tupleDesc->natts;
 	Datum	   *values;
@@ -1354,8 +1450,8 @@ heap_freetuple(HeapTuple htup)
  */
 MinimalTuple
 heap_form_minimal_tuple(TupleDesc tupleDescriptor,
-						Datum *values,
-						bool *isnull)
+						const Datum *values,
+						const bool *isnull)
 {
 	MinimalTuple tuple;			/* return tuple */
 	Size		len,

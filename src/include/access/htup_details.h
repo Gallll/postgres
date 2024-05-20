@@ -4,7 +4,7 @@
  *	  POSTGRES heap tuple header definitions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/htup_details.h
@@ -19,6 +19,7 @@
 #include "access/tupdesc.h"
 #include "access/tupmacs.h"
 #include "storage/bufpage.h"
+#include "varatt.h"
 
 /*
  * MaxTupleAttributeNumber limits the number of (user) columns in a tuple.
@@ -426,6 +427,9 @@ do { \
 	(tup)->t_choice.t_heap.t_field3.t_xvac = (xid); \
 } while (0)
 
+StaticAssertDecl(MaxOffsetNumber < SpecTokenOffsetNumber,
+				 "invalid speculative token constant");
+
 #define HeapTupleHeaderIsSpeculative(tup) \
 ( \
 	(ItemPointerGetOffsetNumberNoCheck(&(tup)->t_ctid) == SpecTokenOffsetNumber) \
@@ -692,14 +696,14 @@ struct MinimalTupleData
 
 /* prototypes for functions in common/heaptuple.c */
 extern Size heap_compute_data_size(TupleDesc tupleDesc,
-								   Datum *values, bool *isnull);
+								   const Datum *values, const bool *isnull);
 extern void heap_fill_tuple(TupleDesc tupleDesc,
-							Datum *values, bool *isnull,
+							const Datum *values, const bool *isnull,
 							char *data, Size data_size,
 							uint16 *infomask, bits8 *bit);
 extern bool heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc);
 extern Datum nocachegetattr(HeapTuple tup, int attnum,
-							TupleDesc att);
+							TupleDesc tupleDesc);
 extern Datum heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
 							 bool *isnull);
 extern Datum getmissingattr(TupleDesc tupleDesc,
@@ -708,23 +712,23 @@ extern HeapTuple heap_copytuple(HeapTuple tuple);
 extern void heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest);
 extern Datum heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc);
 extern HeapTuple heap_form_tuple(TupleDesc tupleDescriptor,
-								 Datum *values, bool *isnull);
+								 const Datum *values, const bool *isnull);
 extern HeapTuple heap_modify_tuple(HeapTuple tuple,
 								   TupleDesc tupleDesc,
-								   Datum *replValues,
-								   bool *replIsnull,
-								   bool *doReplace);
+								   const Datum *replValues,
+								   const bool *replIsnull,
+								   const bool *doReplace);
 extern HeapTuple heap_modify_tuple_by_cols(HeapTuple tuple,
 										   TupleDesc tupleDesc,
 										   int nCols,
-										   int *replCols,
-										   Datum *replValues,
-										   bool *replIsnull);
+										   const int *replCols,
+										   const Datum *replValues,
+										   const bool *replIsnull);
 extern void heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 							  Datum *values, bool *isnull);
 extern void heap_freetuple(HeapTuple htup);
 extern MinimalTuple heap_form_minimal_tuple(TupleDesc tupleDescriptor,
-											Datum *values, bool *isnull);
+											const Datum *values, const bool *isnull);
 extern void heap_free_minimal_tuple(MinimalTuple mtup);
 extern MinimalTuple heap_copy_minimal_tuple(MinimalTuple mtup);
 extern HeapTuple heap_tuple_from_minimal_tuple(MinimalTuple mtup);

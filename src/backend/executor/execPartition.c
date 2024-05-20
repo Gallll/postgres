@@ -3,7 +3,7 @@
  * execPartition.c
  *	  Support routines for partitioning.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,15 +16,12 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/partition.h"
-#include "catalog/pg_inherits.h"
-#include "catalog/pg_type.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
 #include "executor/nodeModifyTable.h"
 #include "foreign/fdwapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partprune.h"
@@ -361,7 +358,7 @@ ExecFindPartition(ModifyTableState *mtstate,
 				if (rri)
 				{
 					/* Verify this ResultRelInfo allows INSERTs */
-					CheckValidResultRel(rri, CMD_INSERT);
+					CheckValidResultRel(rri, CMD_INSERT, NIL);
 
 					/*
 					 * Initialize information needed to insert this and
@@ -463,7 +460,7 @@ ExecFindPartition(ModifyTableState *mtstate,
 			 */
 			if (is_leaf)
 			{
-				TupleConversionMap *map = rri->ri_RootToPartitionMap;
+				TupleConversionMap *map = ExecGetRootToChildMap(rri, estate);
 
 				if (map)
 					slot = execute_attr_map_slot(map->attrMap, rootslot,
@@ -527,7 +524,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * partition-key becomes a DELETE+INSERT operation, so this check is still
 	 * required when the operation is CMD_UPDATE.
 	 */
-	CheckValidResultRel(leaf_part_rri, CMD_INSERT);
+	CheckValidResultRel(leaf_part_rri, CMD_INSERT, NIL);
 
 	/*
 	 * Open partition indices.  The user may have asked to check for conflicts
@@ -545,8 +542,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * Build WITH CHECK OPTION constraints for the partition.  Note that we
 	 * didn't build the withCheckOptionList for partitions within the planner,
 	 * but simple translation of varattnos will suffice.  This only occurs for
-	 * the INSERT case or in the case of UPDATE tuple routing where we didn't
-	 * find a result rel to reuse.
+	 * the INSERT case or in the case of UPDATE/MERGE tuple routing where we
+	 * didn't find a result rel to reuse.
 	 */
 	if (node && node->withCheckOptionLists != NIL)
 	{
@@ -557,12 +554,15 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		/*
 		 * In the case of INSERT on a partitioned table, there is only one
 		 * plan.  Likewise, there is only one WCO list, not one per partition.
-		 * For UPDATE, there are as many WCO lists as there are plans.
+		 * For UPDATE/MERGE, there are as many WCO lists as there are plans.
 		 */
 		Assert((node->operation == CMD_INSERT &&
 				list_length(node->withCheckOptionLists) == 1 &&
 				list_length(node->resultRelations) == 1) ||
 			   (node->operation == CMD_UPDATE &&
+				list_length(node->withCheckOptionLists) ==
+				list_length(node->resultRelations)) ||
+			   (node->operation == CMD_MERGE &&
 				list_length(node->withCheckOptionLists) ==
 				list_length(node->resultRelations)));
 
@@ -582,7 +582,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		 */
 		part_attmap =
 			build_attrmap_by_name(RelationGetDescr(partrel),
-								  RelationGetDescr(firstResultRel));
+								  RelationGetDescr(firstResultRel),
+								  false);
 		wcoList = (List *)
 			map_variable_attnos((Node *) wcoList,
 								firstVarno, 0,
@@ -608,8 +609,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * Build the RETURNING projection for the partition.  Note that we didn't
 	 * build the returningList for partitions within the planner, but simple
 	 * translation of varattnos will suffice.  This only occurs for the INSERT
-	 * case or in the case of UPDATE tuple routing where we didn't find a
-	 * result rel to reuse.
+	 * case or in the case of UPDATE/MERGE tuple routing where we didn't find
+	 * a result rel to reuse.
 	 */
 	if (node && node->returningLists != NIL)
 	{
@@ -622,6 +623,9 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				list_length(node->returningLists) == 1 &&
 				list_length(node->resultRelations) == 1) ||
 			   (node->operation == CMD_UPDATE &&
+				list_length(node->returningLists) ==
+				list_length(node->resultRelations)) ||
+			   (node->operation == CMD_MERGE &&
 				list_length(node->returningLists) ==
 				list_length(node->resultRelations)));
 
@@ -639,7 +643,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		if (part_attmap == NULL)
 			part_attmap =
 				build_attrmap_by_name(RelationGetDescr(partrel),
-									  RelationGetDescr(firstResultRel));
+									  RelationGetDescr(firstResultRel),
+									  false);
 		returningList = (List *)
 			map_variable_attnos((Node *) returningList,
 								firstVarno, 0,
@@ -685,7 +690,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		 * list and searching for ancestry relationships to each index in the
 		 * ancestor table.
 		 */
-		if (list_length(rootResultRelInfo->ri_onConflictArbiterIndexes) > 0)
+		if (rootResultRelInfo->ri_onConflictArbiterIndexes != NIL)
 		{
 			List	   *childIdxs;
 
@@ -725,7 +730,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			OnConflictSetState *onconfl = makeNode(OnConflictSetState);
 			TupleConversionMap *map;
 
-			map = leaf_part_rri->ri_RootToPartitionMap;
+			map = ExecGetRootToChildMap(leaf_part_rri, estate);
 
 			Assert(node->onConflictSet != NIL);
 			Assert(rootResultRelInfo->ri_onConflict != NULL);
@@ -768,7 +773,6 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			{
 				List	   *onconflset;
 				List	   *onconflcols;
-				bool		found_whole_row;
 
 				/*
 				 * Translate expressions in onConflictSet to account for
@@ -781,7 +785,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				if (part_attmap == NULL)
 					part_attmap =
 						build_attrmap_by_name(RelationGetDescr(partrel),
-											  RelationGetDescr(firstResultRel));
+											  RelationGetDescr(firstResultRel),
+											  false);
 				onconflset = (List *)
 					map_variable_attnos((Node *) onconflset,
 										INNER_VAR, 0,
@@ -875,32 +880,42 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		List	   *firstMergeActionList = linitial(node->mergeActionLists);
 		ListCell   *lc;
 		ExprContext *econtext = mtstate->ps.ps_ExprContext;
+		Node	   *joinCondition;
 
 		if (part_attmap == NULL)
 			part_attmap =
 				build_attrmap_by_name(RelationGetDescr(partrel),
-									  RelationGetDescr(firstResultRel));
+									  RelationGetDescr(firstResultRel),
+									  false);
 
 		if (unlikely(!leaf_part_rri->ri_projectNewInfoValid))
 			ExecInitMergeTupleSlots(mtstate, leaf_part_rri);
+
+		/* Initialize state for join condition checking. */
+		joinCondition =
+			map_variable_attnos(linitial(node->mergeJoinConditions),
+								firstVarno, 0,
+								part_attmap,
+								RelationGetForm(partrel)->reltype,
+								&found_whole_row);
+		/* We ignore the value of found_whole_row. */
+		leaf_part_rri->ri_MergeJoinCondition =
+			ExecInitQual((List *) joinCondition, &mtstate->ps);
 
 		foreach(lc, firstMergeActionList)
 		{
 			/* Make a copy for this relation to be safe.  */
 			MergeAction *action = copyObject(lfirst(lc));
 			MergeActionState *action_state;
-			List	  **list;
 
 			/* Generate the action's state for this relation */
 			action_state = makeNode(MergeActionState);
 			action_state->mas_action = action;
 
 			/* And put the action in the appropriate list */
-			if (action->matched)
-				list = &leaf_part_rri->ri_matchedMergeAction;
-			else
-				list = &leaf_part_rri->ri_notMatchedMergeAction;
-			*list = lappend(*list, action_state);
+			leaf_part_rri->ri_MergeActions[action->matchKind] =
+				lappend(leaf_part_rri->ri_MergeActions[action->matchKind],
+						action_state);
 
 			switch (action->commandType)
 			{
@@ -974,33 +989,24 @@ ExecInitRoutingInfo(ModifyTableState *mtstate,
 					int partidx,
 					bool is_borrowed_rel)
 {
-	ResultRelInfo *rootRelInfo = partRelInfo->ri_RootResultRelInfo;
 	MemoryContext oldcxt;
 	int			rri_index;
 
 	oldcxt = MemoryContextSwitchTo(proute->memcxt);
 
 	/*
-	 * Set up a tuple conversion map to convert a tuple routed to the
-	 * partition from the parent's type to the partition's.
+	 * Set up tuple conversion between root parent and the partition if the
+	 * two have different rowtypes.  If conversion is indeed required, also
+	 * initialize a slot dedicated to storing this partition's converted
+	 * tuples.  Various operations that are applied to tuples after routing,
+	 * such as checking constraints, will refer to this slot.
 	 */
-	partRelInfo->ri_RootToPartitionMap =
-		convert_tuples_by_name(RelationGetDescr(rootRelInfo->ri_RelationDesc),
-							   RelationGetDescr(partRelInfo->ri_RelationDesc));
-
-	/*
-	 * If a partition has a different rowtype than the root parent, initialize
-	 * a slot dedicated to storing this partition's tuples.  The slot is used
-	 * for various operations that are applied to tuples after routing, such
-	 * as checking constraints.
-	 */
-	if (partRelInfo->ri_RootToPartitionMap != NULL)
+	if (ExecGetRootToChildMap(partRelInfo, estate) != NULL)
 	{
 		Relation	partrel = partRelInfo->ri_RelationDesc;
 
 		/*
-		 * Initialize the slot itself setting its descriptor to this
-		 * partition's TupleDesc; TupleDesc reference will be released at the
+		 * This pins the partition's TupleDesc, which will be released at the
 		 * end of the command.
 		 */
 		partRelInfo->ri_PartitionTupleSlot =
@@ -1024,8 +1030,7 @@ ExecInitRoutingInfo(ModifyTableState *mtstate,
 	 *
 	 * If the FDW does not support batching, we set the batch size to 1.
 	 */
-	if (mtstate->operation == CMD_INSERT &&
-		partRelInfo->ri_FdwRoutine != NULL &&
+	if (partRelInfo->ri_FdwRoutine != NULL &&
 		partRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize &&
 		partRelInfo->ri_FdwRoutine->ExecForeignBatchInsert)
 		partRelInfo->ri_BatchSize =
@@ -1141,7 +1146,8 @@ ExecInitPartitionDispatchInfo(EState *estate,
 		 * routing.
 		 */
 		pd->tupmap = build_attrmap_by_name_if_req(RelationGetDescr(parent_pd->reldesc),
-												  tupdesc);
+												  tupdesc,
+												  false);
 		pd->tupslot = pd->tupmap ?
 			MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual) : NULL;
 	}
@@ -1333,9 +1339,48 @@ FormPartitionKeyDatum(PartitionDispatch pd,
 }
 
 /*
+ * The number of times the same partition must be found in a row before we
+ * switch from a binary search for the given values to just checking if the
+ * values belong to the last found partition.  This must be above 0.
+ */
+#define PARTITION_CACHED_FIND_THRESHOLD			16
+
+/*
  * get_partition_for_tuple
  *		Finds partition of relation which accepts the partition key specified
- *		in values and isnull
+ *		in values and isnull.
+ *
+ * Calling this function can be quite expensive when LIST and RANGE
+ * partitioned tables have many partitions.  This is due to the binary search
+ * that's done to find the correct partition.  Many of the use cases for LIST
+ * and RANGE partitioned tables make it likely that the same partition is
+ * found in subsequent ExecFindPartition() calls.  This is especially true for
+ * cases such as RANGE partitioned tables on a TIMESTAMP column where the
+ * partition key is the current time.  When asked to find a partition for a
+ * RANGE or LIST partitioned table, we record the partition index and datum
+ * offset we've found for the given 'values' in the PartitionDesc (which is
+ * stored in relcache), and if we keep finding the same partition
+ * PARTITION_CACHED_FIND_THRESHOLD times in a row, then we'll enable caching
+ * logic and instead of performing a binary search to find the correct
+ * partition, we'll just double-check that 'values' still belong to the last
+ * found partition, and if so, we'll return that partition index, thus
+ * skipping the need for the binary search.  If we fail to match the last
+ * partition when double checking, then we fall back on doing a binary search.
+ * In this case, unless we find 'values' belong to the DEFAULT partition,
+ * we'll reset the number of times we've hit the same partition so that we
+ * don't attempt to use the cache again until we've found that partition at
+ * least PARTITION_CACHED_FIND_THRESHOLD times in a row.
+ *
+ * For cases where the partition changes on each lookup, the amount of
+ * additional work required just amounts to recording the last found partition
+ * and bound offset then resetting the found counter.  This is cheap and does
+ * not appear to cause any meaningful slowdowns for such cases.
+ *
+ * No caching of partitions is done when the last found partition is the
+ * DEFAULT or NULL partition.  For the case of the DEFAULT partition, there
+ * is no bound offset storing the matching datum, so we cannot confirm the
+ * indexes match.  For the NULL partition, this is just so cheap, there's no
+ * sense in caching.
  *
  * Return value is index of the partition (>= 0 and < partdesc->nparts) if one
  * found or -1 if none found.
@@ -1343,11 +1388,23 @@ FormPartitionKeyDatum(PartitionDispatch pd,
 static int
 get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
 {
-	int			bound_offset;
+	int			bound_offset = -1;
 	int			part_index = -1;
 	PartitionKey key = pd->key;
 	PartitionDesc partdesc = pd->partdesc;
 	PartitionBoundInfo boundinfo = partdesc->boundinfo;
+
+	/*
+	 * In the switch statement below, when we perform a cached lookup for
+	 * RANGE and LIST partitioned tables, if we find that the last found
+	 * partition matches the 'values', we return the partition index right
+	 * away.  We do this instead of breaking out of the switch as we don't
+	 * want to execute the code about the DEFAULT partition or do any updates
+	 * for any of the cache-related fields.  That would be a waste of effort
+	 * as we already know it's not the DEFAULT partition and have no need to
+	 * increment the number of times we found the same partition any higher
+	 * than PARTITION_CACHED_FIND_THRESHOLD.
+	 */
 
 	/* Route as appropriate based on partitioning strategy. */
 	switch (key->strategy)
@@ -1356,24 +1413,59 @@ get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
 			{
 				uint64		rowHash;
 
+				/* hash partitioning is too cheap to bother caching */
 				rowHash = compute_partition_hash_value(key->partnatts,
 													   key->partsupfunc,
 													   key->partcollation,
 													   values, isnull);
 
-				part_index = boundinfo->indexes[rowHash % boundinfo->nindexes];
+				/*
+				 * HASH partitions can't have a DEFAULT partition and we don't
+				 * do any caching work for them, so just return the part index
+				 */
+				return boundinfo->indexes[rowHash % boundinfo->nindexes];
 			}
-			break;
 
 		case PARTITION_STRATEGY_LIST:
 			if (isnull[0])
 			{
+				/* this is far too cheap to bother doing any caching */
 				if (partition_bound_accepts_nulls(boundinfo))
-					part_index = boundinfo->null_index;
+				{
+					/*
+					 * When there is a NULL partition we just return that
+					 * directly.  We don't have a bound_offset so it's not
+					 * valid to drop into the code after the switch which
+					 * checks and updates the cache fields.  We perhaps should
+					 * be invalidating the details of the last cached
+					 * partition but there's no real need to.  Keeping those
+					 * fields set gives a chance at matching to the cached
+					 * partition on the next lookup.
+					 */
+					return boundinfo->null_index;
+				}
 			}
 			else
 			{
-				bool		equal = false;
+				bool		equal;
+
+				if (partdesc->last_found_count >= PARTITION_CACHED_FIND_THRESHOLD)
+				{
+					int			last_datum_offset = partdesc->last_found_datum_index;
+					Datum		lastDatum = boundinfo->datums[last_datum_offset][0];
+					int32		cmpval;
+
+					/* does the last found datum index match this datum? */
+					cmpval = DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[0],
+															 key->partcollation[0],
+															 lastDatum,
+															 values[0]));
+
+					if (cmpval == 0)
+						return boundinfo->indexes[last_datum_offset];
+
+					/* fall-through and do a manual lookup */
+				}
 
 				bound_offset = partition_list_bsearch(key->partsupfunc,
 													  key->partcollation,
@@ -1403,23 +1495,64 @@ get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
 					}
 				}
 
-				if (!range_partkey_has_null)
+				/* NULLs belong in the DEFAULT partition */
+				if (range_partkey_has_null)
+					break;
+
+				if (partdesc->last_found_count >= PARTITION_CACHED_FIND_THRESHOLD)
 				{
-					bound_offset = partition_range_datum_bsearch(key->partsupfunc,
-																 key->partcollation,
-																 boundinfo,
-																 key->partnatts,
-																 values,
-																 &equal);
+					int			last_datum_offset = partdesc->last_found_datum_index;
+					Datum	   *lastDatums = boundinfo->datums[last_datum_offset];
+					PartitionRangeDatumKind *kind = boundinfo->kind[last_datum_offset];
+					int32		cmpval;
+
+					/* check if the value is >= to the lower bound */
+					cmpval = partition_rbound_datum_cmp(key->partsupfunc,
+														key->partcollation,
+														lastDatums,
+														kind,
+														values,
+														key->partnatts);
 
 					/*
-					 * The bound at bound_offset is less than or equal to the
-					 * tuple value, so the bound at offset+1 is the upper
-					 * bound of the partition we're looking for, if there
-					 * actually exists one.
+					 * If it's equal to the lower bound then no need to check
+					 * the upper bound.
 					 */
-					part_index = boundinfo->indexes[bound_offset + 1];
+					if (cmpval == 0)
+						return boundinfo->indexes[last_datum_offset + 1];
+
+					if (cmpval < 0 && last_datum_offset + 1 < boundinfo->ndatums)
+					{
+						/* check if the value is below the upper bound */
+						lastDatums = boundinfo->datums[last_datum_offset + 1];
+						kind = boundinfo->kind[last_datum_offset + 1];
+						cmpval = partition_rbound_datum_cmp(key->partsupfunc,
+															key->partcollation,
+															lastDatums,
+															kind,
+															values,
+															key->partnatts);
+
+						if (cmpval > 0)
+							return boundinfo->indexes[last_datum_offset + 1];
+					}
+					/* fall-through and do a manual lookup */
 				}
+
+				bound_offset = partition_range_datum_bsearch(key->partsupfunc,
+															 key->partcollation,
+															 boundinfo,
+															 key->partnatts,
+															 values,
+															 &equal);
+
+				/*
+				 * The bound at bound_offset is less than or equal to the
+				 * tuple value, so the bound at offset+1 is the upper bound of
+				 * the partition we're looking for, if there actually exists
+				 * one.
+				 */
+				part_index = boundinfo->indexes[bound_offset + 1];
 			}
 			break;
 
@@ -1433,7 +1566,34 @@ get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
 	 * the default partition, if there is one.
 	 */
 	if (part_index < 0)
-		part_index = boundinfo->default_index;
+	{
+		/*
+		 * No need to reset the cache fields here.  The next set of values
+		 * might end up belonging to the cached partition, so leaving the
+		 * cache alone improves the chances of a cache hit on the next lookup.
+		 */
+		return boundinfo->default_index;
+	}
+
+	/* we should only make it here when the code above set bound_offset */
+	Assert(bound_offset >= 0);
+
+	/*
+	 * Attend to the cache fields.  If the bound_offset matches the last
+	 * cached bound offset then we've found the same partition as last time,
+	 * so bump the count by one.  If all goes well, we'll eventually reach
+	 * PARTITION_CACHED_FIND_THRESHOLD and try the cache path next time
+	 * around.  Otherwise, we'll reset the cache count back to 1 to mark that
+	 * we've found this partition for the first time.
+	 */
+	if (bound_offset == partdesc->last_found_datum_index)
+		partdesc->last_found_count++;
+	else
+	{
+		partdesc->last_found_count = 1;
+		partdesc->last_found_part_index = part_index;
+		partdesc->last_found_datum_index = bound_offset;
+	}
 
 	return part_index;
 }
@@ -1876,10 +2036,13 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			pprune->present_parts = bms_copy(pinfo->present_parts);
 
 			/*
-			 * Initialize pruning contexts as needed.
+			 * Initialize pruning contexts as needed.  Note that we must skip
+			 * execution-time partition pruning in EXPLAIN (GENERIC_PLAN),
+			 * since parameter values may be missing.
 			 */
 			pprune->initial_pruning_steps = pinfo->initial_pruning_steps;
-			if (pinfo->initial_pruning_steps)
+			if (pinfo->initial_pruning_steps &&
+				!(econtext->ecxt_estate->es_top_eflags & EXEC_FLAG_EXPLAIN_GENERIC))
 			{
 				InitPartitionPruneContext(&pprune->initial_context,
 										  pinfo->initial_pruning_steps,
@@ -1889,7 +2052,8 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 				prunestate->do_initial_prune = true;
 			}
 			pprune->exec_pruning_steps = pinfo->exec_pruning_steps;
-			if (pinfo->exec_pruning_steps)
+			if (pinfo->exec_pruning_steps &&
+				!(econtext->ecxt_estate->es_top_eflags & EXEC_FLAG_EXPLAIN_GENERIC))
 			{
 				InitPartitionPruneContext(&pprune->exec_context,
 										  pinfo->exec_pruning_steps,
@@ -1952,7 +2116,7 @@ InitPartitionPruneContext(PartitionPruneContext *context,
 	foreach(lc, pruning_steps)
 	{
 		PartitionPruneStepOp *step = (PartitionPruneStepOp *) lfirst(lc);
-		ListCell   *lc2;
+		ListCell   *lc2 = list_head(step->exprs);
 		int			keyno;
 
 		/* not needed for other step kinds */
@@ -1961,34 +2125,39 @@ InitPartitionPruneContext(PartitionPruneContext *context,
 
 		Assert(list_length(step->exprs) <= partnatts);
 
-		keyno = 0;
-		foreach(lc2, step->exprs)
+		for (keyno = 0; keyno < partnatts; keyno++)
 		{
-			Expr	   *expr = (Expr *) lfirst(lc2);
+			if (bms_is_member(keyno, step->nullkeys))
+				continue;
 
-			/* not needed for Consts */
-			if (!IsA(expr, Const))
+			if (lc2 != NULL)
 			{
-				int			stateidx = PruneCxtStateIdx(partnatts,
-														step->step.step_id,
-														keyno);
+				Expr	   *expr = lfirst(lc2);
 
-				/*
-				 * When planstate is NULL, pruning_steps is known not to
-				 * contain any expressions that depend on the parent plan.
-				 * Information of any available EXTERN parameters must be
-				 * passed explicitly in that case, which the caller must have
-				 * made available via econtext.
-				 */
-				if (planstate == NULL)
-					context->exprstates[stateidx] =
-						ExecInitExprWithParams(expr,
-											   econtext->ecxt_param_list_info);
-				else
-					context->exprstates[stateidx] =
-						ExecInitExpr(expr, context->planstate);
+				/* not needed for Consts */
+				if (!IsA(expr, Const))
+				{
+					int			stateidx = PruneCxtStateIdx(partnatts,
+															step->step.step_id,
+															keyno);
+
+					/*
+					 * When planstate is NULL, pruning_steps is known not to
+					 * contain any expressions that depend on the parent plan.
+					 * Information of any available EXTERN parameters must be
+					 * passed explicitly in that case, which the caller must
+					 * have made available via econtext.
+					 */
+					if (planstate == NULL)
+						context->exprstates[stateidx] =
+							ExecInitExprWithParams(expr,
+												   econtext->ecxt_param_list_info);
+					else
+						context->exprstates[stateidx] =
+							ExecInitExpr(expr, context->planstate);
+				}
+				lc2 = lnext(step->exprs, lc2);
 			}
-			keyno++;
 		}
 	}
 }
@@ -2002,8 +2171,8 @@ InitPartitionPruneContext(PartitionPruneContext *context,
  * Current values of the indexes present in PartitionPruneState count all the
  * subplans that would be present before initial pruning was done.  If initial
  * pruning got rid of some of the subplans, any subsequent pruning passes will
- * will be looking at a different set of target subplans to choose from than
- * those in the pre-initial-pruning set, so the maps in PartitionPruneState
+ * be looking at a different set of target subplans to choose from than those
+ * in the pre-initial-pruning set, so the maps in PartitionPruneState
  * containing those indexes must be updated to reflect the new indexes of
  * subplans in the post-initial-pruning set.
  */

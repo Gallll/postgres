@@ -46,7 +46,7 @@
  * exported rather than being "static" in this file.)
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -57,18 +57,14 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
-#include "access/xact.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
 #include "funcapi.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
+#include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parsetree.h"
-#include "parser/parse_expr.h"
 #include "pgstat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -76,12 +72,10 @@
 #include "utils/datum.h"
 #include "utils/expandedrecord.h"
 #include "utils/json.h"
-#include "utils/jsonb.h"
 #include "utils/jsonfuncs.h"
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
@@ -186,6 +180,7 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  AggStatePerGroup pergroup,
 															  ExprContext *aggcontext,
 															  int setno);
+static char *ExecGetJsonValueItemString(JsonbValue *item, bool *resnull);
 
 /*
  * ScalarArrayOpExprHashEntry
@@ -458,6 +453,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_CASE_TESTVAL,
 		&&CASE_EEOP_MAKE_READONLY,
 		&&CASE_EEOP_IOCOERCE,
+		&&CASE_EEOP_IOCOERCE_SAFE,
 		&&CASE_EEOP_DISTINCT,
 		&&CASE_EEOP_NOT_DISTINCT,
 		&&CASE_EEOP_NULLIF,
@@ -484,13 +480,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_SCALARARRAYOP,
 		&&CASE_EEOP_HASHED_SCALARARRAYOP,
 		&&CASE_EEOP_XMLEXPR,
+		&&CASE_EEOP_JSON_CONSTRUCTOR,
+		&&CASE_EEOP_IS_JSON,
+		&&CASE_EEOP_JSONEXPR_PATH,
+		&&CASE_EEOP_JSONEXPR_COERCION,
+		&&CASE_EEOP_JSONEXPR_COERCION_FINISH,
 		&&CASE_EEOP_AGGREF,
 		&&CASE_EEOP_GROUPING_FUNC,
 		&&CASE_EEOP_WINDOW_FUNC,
+		&&CASE_EEOP_MERGE_SUPPORT_FUNC,
 		&&CASE_EEOP_SUBPLAN,
-		&&CASE_EEOP_JSON_CONSTRUCTOR,
-		&&CASE_EEOP_IS_JSON,
-		&&CASE_EEOP_JSONEXPR,
 		&&CASE_EEOP_AGG_STRICT_DESERIALIZE,
 		&&CASE_EEOP_AGG_DESERIALIZE,
 		&&CASE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
@@ -502,12 +501,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF,
 		&&CASE_EEOP_AGG_PLAIN_TRANS_STRICT_BYREF,
 		&&CASE_EEOP_AGG_PLAIN_TRANS_BYREF,
+		&&CASE_EEOP_AGG_PRESORTED_DISTINCT_SINGLE,
+		&&CASE_EEOP_AGG_PRESORTED_DISTINCT_MULTI,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_DATUM,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_TUPLE,
 		&&CASE_EEOP_LAST
 	};
 
-	StaticAssertStmt(EEOP_LAST + 1 == lengthof(dispatch_table),
+	StaticAssertDecl(lengthof(dispatch_table) == EEOP_LAST + 1,
 					 "dispatch_table out of whack with ExprEvalOp");
 
 	if (unlikely(state == NULL))
@@ -1155,6 +1156,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * Evaluate a CoerceViaIO node.  This can be quite a hot path, so
 			 * inline as much work as possible.  The source value is in our
 			 * result variable.
+			 *
+			 * Also look at ExecEvalCoerceViaIOSafe() if you change anything
+			 * here.
 			 */
 			char	   *str;
 
@@ -1207,6 +1211,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				}
 			}
 
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_IOCOERCE_SAFE)
+		{
+			ExecEvalCoerceViaIOSafe(state, op);
 			EEO_NEXT();
 		}
 
@@ -1533,6 +1543,43 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		EEO_CASE(EEOP_JSON_CONSTRUCTOR)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonConstructor(state, op, econtext);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_IS_JSON)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonIsPredicate(state, op);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_PATH)
+		{
+			/* too complex for an inline implementation */
+			EEO_JUMP(ExecEvalJsonExprPath(state, op, econtext));
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_COERCION)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonCoercion(state, op, econtext);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_COERCION_FINISH)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonCoercionFinish(state, op);
+
+			EEO_NEXT();
+		}
+
 		EEO_CASE(EEOP_AGGREF)
 		{
 			/*
@@ -1568,6 +1615,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 			*op->resvalue = econtext->ecxt_aggvalues[wfunc->wfuncno];
 			*op->resnull = econtext->ecxt_aggnulls[wfunc->wfuncno];
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_MERGE_SUPPORT_FUNC)
+		{
+			/* too complex/uncommon for an inline implementation */
+			ExecEvalMergeSupportFunc(state, op, econtext);
 
 			EEO_NEXT();
 		}
@@ -1649,7 +1704,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerGroup pergroup_allaggs =
-			aggstate->all_pergroups[op->d.agg_plain_pergroup_nullcheck.setoff];
+				aggstate->all_pergroups[op->d.agg_plain_pergroup_nullcheck.setoff];
 
 			if (pergroup_allaggs == NULL)
 				EEO_JUMP(op->d.agg_plain_pergroup_nullcheck.jumpnull);
@@ -1674,7 +1729,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1702,7 +1757,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1720,7 +1775,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1737,7 +1792,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1758,7 +1813,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1775,7 +1830,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1784,6 +1839,28 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 								   op->d.agg_trans.setno);
 
 			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
+		{
+			AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
+			AggState   *aggstate = castNode(AggState, state->parent);
+
+			if (ExecEvalPreOrderedDistinctSingle(aggstate, pertrans))
+				EEO_NEXT();
+			else
+				EEO_JUMP(op->d.agg_presorted_distinctcheck.jumpdistinct);
+		}
+
+		EEO_CASE(EEOP_AGG_PRESORTED_DISTINCT_MULTI)
+		{
+			AggState   *aggstate = castNode(AggState, state->parent);
+			AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
+
+			if (ExecEvalPreOrderedDistinctMulti(aggstate, pertrans))
+				EEO_NEXT();
+			else
+				EEO_JUMP(op->d.agg_presorted_distinctcheck.jumpdistinct);
 		}
 
 		/* process single-column ordered aggregate datum */
@@ -1800,27 +1877,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			/* too complex for an inline implementation */
 			ExecEvalAggOrderedTransTuple(state, op, econtext);
-			EEO_NEXT();
-		}
 
-		EEO_CASE(EEOP_JSON_CONSTRUCTOR)
-		{
-			/* too complex for an inline implementation */
-			ExecEvalJsonConstructor(state, op, econtext);
-			EEO_NEXT();
-		}
-
-		EEO_CASE(EEOP_IS_JSON)
-		{
-			/* too complex for an inline implementation */
-			ExecEvalJsonIsPredicate(state, op);
-			EEO_NEXT();
-		}
-
-		EEO_CASE(EEOP_JSONEXPR)
-		{
-			/* too complex for an inline implementation */
-			ExecEvalJson(state, op, econtext);
 			EEO_NEXT();
 		}
 
@@ -2003,7 +2060,8 @@ CheckOpSlotCompatibility(ExprEvalStep *op, TupleTableSlot *slot)
  * changed: if not NULL, *changed is set to true on any update
  *
  * The returned TupleDesc is not guaranteed pinned; caller must pin it
- * to use it across any operation that might incur cache invalidation.
+ * to use it across any operation that might incur cache invalidation,
+ * including for example detoasting of input tuples.
  * (The TupleDesc is always refcounted, so just use IncrTupleDescRefCount.)
  *
  * NOTE: because composite types can change contents, we must be prepared
@@ -2498,6 +2556,71 @@ ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
+ * Evaluate a CoerceViaIO node in soft-error mode.
+ *
+ * The source value is in op's result variable.
+ *
+ * Note: This implements EEOP_IOCOERCE_SAFE. If you change anything here,
+ * also look at the inline code for EEOP_IOCOERCE.
+ */
+void
+ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op)
+{
+	char	   *str;
+
+	/* call output function (similar to OutputFunctionCall) */
+	if (*op->resnull)
+	{
+		/* output functions are not called on nulls */
+		str = NULL;
+	}
+	else
+	{
+		FunctionCallInfo fcinfo_out;
+
+		fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+		fcinfo_out->args[0].value = *op->resvalue;
+		fcinfo_out->args[0].isnull = false;
+
+		fcinfo_out->isnull = false;
+		str = DatumGetCString(FunctionCallInvoke(fcinfo_out));
+
+		/* OutputFunctionCall assumes result isn't null */
+		Assert(!fcinfo_out->isnull);
+	}
+
+	/* call input function (similar to InputFunctionCallSafe) */
+	if (!op->d.iocoerce.finfo_in->fn_strict || str != NULL)
+	{
+		FunctionCallInfo fcinfo_in;
+
+		fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+		fcinfo_in->args[0].value = PointerGetDatum(str);
+		fcinfo_in->args[0].isnull = *op->resnull;
+		/* second and third arguments are already set up */
+
+		/* ErrorSaveContext must be present. */
+		Assert(IsA(fcinfo_in->context, ErrorSaveContext));
+
+		fcinfo_in->isnull = false;
+		*op->resvalue = FunctionCallInvoke(fcinfo_in);
+
+		if (SOFT_ERROR_OCCURRED(fcinfo_in->context))
+		{
+			*op->resnull = true;
+			*op->resvalue = (Datum) 0;
+			return;
+		}
+
+		/* Should get null result if and only if str is NULL */
+		if (str == NULL)
+			Assert(*op->resnull);
+		else
+			Assert(!*op->resnull);
+	}
+}
+
+/*
  * Evaluate a SQLValueFunction expression.
  */
 void
@@ -2740,7 +2863,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 	{
 		/* Must be nested array expressions */
 		int			nbytes = 0;
-		int			nitems = 0;
+		int			nitems;
 		int			outer_nelems = 0;
 		int			elem_ndims = 0;
 		int		   *elem_dims = NULL;
@@ -2835,9 +2958,14 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			subbitmaps[outer_nelems] = ARR_NULLBITMAP(array);
 			subbytes[outer_nelems] = ARR_SIZE(array) - ARR_DATA_OFFSET(array);
 			nbytes += subbytes[outer_nelems];
+			/* check for overflow of total request */
+			if (!AllocSizeIsValid(nbytes))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxAllocSize)));
 			subnitems[outer_nelems] = ArrayGetNItems(this_ndims,
 													 ARR_DIMS(array));
-			nitems += subnitems[outer_nelems];
 			havenulls |= ARR_HASNULL(array);
 			outer_nelems++;
 		}
@@ -2871,7 +2999,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 		}
 
 		/* check for subscript overflow */
-		(void) ArrayGetNItems(ndims, dims);
+		nitems = ArrayGetNItems(ndims, dims);
 		ArrayCheckBounds(ndims, dims, lbs);
 
 		if (havenulls)
@@ -2885,7 +3013,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			nbytes += ARR_OVERHEAD_NONULLS(ndims);
 		}
 
-		result = (ArrayType *) palloc(nbytes);
+		result = (ArrayType *) palloc0(nbytes);
 		SET_VARSIZE(result, nbytes);
 		result->ndim = ndims;
 		result->dataoffset = dataoffset;
@@ -3157,17 +3285,6 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 void
 ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
-	TupleDesc	tupDesc;
-
-	/* Lookup tupdesc if first time through or if type changes */
-	tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
-								 op->d.fieldstore.rowcache, NULL);
-
-	/* Check that current tupdesc doesn't have more fields than we allocated */
-	if (unlikely(tupDesc->natts > op->d.fieldstore.ncolumns))
-		elog(ERROR, "too many columns in composite type %u",
-			 op->d.fieldstore.fstore->resulttype);
-
 	if (*op->resnull)
 	{
 		/* Convert null input tuple into an all-nulls row */
@@ -3183,12 +3300,27 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 		Datum		tupDatum = *op->resvalue;
 		HeapTupleHeader tuphdr;
 		HeapTupleData tmptup;
+		TupleDesc	tupDesc;
 
 		tuphdr = DatumGetHeapTupleHeader(tupDatum);
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(tuphdr);
 		ItemPointerSetInvalid(&(tmptup.t_self));
 		tmptup.t_tableOid = InvalidOid;
 		tmptup.t_data = tuphdr;
+
+		/*
+		 * Lookup tupdesc if first time through or if type changes.  Because
+		 * we don't pin the tupdesc, we must not do this lookup until after
+		 * doing DatumGetHeapTupleHeader: that could do database access while
+		 * detoasting the datum.
+		 */
+		tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
+									 op->d.fieldstore.rowcache, NULL);
+
+		/* Check that current tupdesc doesn't have more fields than allocated */
+		if (unlikely(tupDesc->natts > op->d.fieldstore.ncolumns))
+			elog(ERROR, "too many columns in composite type %u",
+				 op->d.fieldstore.fstore->resulttype);
 
 		heap_deform_tuple(&tmptup, tupDesc,
 						  op->d.fieldstore.values,
@@ -3708,7 +3840,7 @@ void
 ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op)
 {
 	if (*op->resnull)
-		ereport(ERROR,
+		errsave((Node *) op->d.domaincheck.escontext,
 				(errcode(ERRCODE_NOT_NULL_VIOLATION),
 				 errmsg("domain %s does not allow null values",
 						format_type_be(op->d.domaincheck.resulttype)),
@@ -3723,7 +3855,7 @@ ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op)
 {
 	if (!*op->d.domaincheck.checknull &&
 		!DatumGetBool(*op->d.domaincheck.checkvalue))
-		ereport(ERROR,
+		errsave((Node *) op->d.domaincheck.escontext,
 				(errcode(ERRCODE_CHECK_VIOLATION),
 				 errmsg("value for domain %s violates check constraint \"%s\"",
 						format_type_be(op->d.domaincheck.resulttype),
@@ -3918,8 +4050,10 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 					return;
 				value = argvalue[0];
 
-				*op->resvalue = PointerGetDatum(xmltotext_with_xmloption(DatumGetXmlP(value),
-																		 xexpr->xmloption));
+				*op->resvalue =
+					PointerGetDatum(xmltotext_with_options(DatumGetXmlP(value),
+														   xexpr->xmloption,
+														   xexpr->indent));
 				*op->resnull = false;
 			}
 			break;
@@ -3948,6 +4082,87 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 	}
 }
 
+/*
+ * Evaluate a JSON constructor expression.
+ */
+void
+ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+						ExprContext *econtext)
+{
+	Datum		res;
+	JsonConstructorExprState *jcstate = op->d.json_constructor.jcstate;
+	JsonConstructorExpr *ctor = jcstate->constructor;
+	bool		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+	bool		isnull = false;
+
+	if (ctor->type == JSCTOR_JSON_ARRAY)
+		res = (is_jsonb ?
+			   jsonb_build_array_worker :
+			   json_build_array_worker) (jcstate->nargs,
+										 jcstate->arg_values,
+										 jcstate->arg_nulls,
+										 jcstate->arg_types,
+										 jcstate->constructor->absent_on_null);
+	else if (ctor->type == JSCTOR_JSON_OBJECT)
+		res = (is_jsonb ?
+			   jsonb_build_object_worker :
+			   json_build_object_worker) (jcstate->nargs,
+										  jcstate->arg_values,
+										  jcstate->arg_nulls,
+										  jcstate->arg_types,
+										  jcstate->constructor->absent_on_null,
+										  jcstate->constructor->unique);
+	else if (ctor->type == JSCTOR_JSON_SCALAR)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			Oid			outfuncid = jcstate->arg_type_cache[0].outfuncid;
+			JsonTypeCategory category = (JsonTypeCategory)
+				jcstate->arg_type_cache[0].category;
+
+			if (is_jsonb)
+				res = datum_to_jsonb(value, category, outfuncid);
+			else
+				res = datum_to_json(value, category, outfuncid);
+		}
+	}
+	else if (ctor->type == JSCTOR_JSON_PARSE)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			text	   *js = DatumGetTextP(value);
+
+			if (is_jsonb)
+				res = jsonb_from_text(js, true);
+			else
+			{
+				(void) json_validate(js, true, true);
+				res = value;
+			}
+		}
+	}
+	else
+		elog(ERROR, "invalid JsonConstructorExpr type %d", ctor->type);
+
+	*op->resvalue = res;
+	*op->resnull = isnull;
+}
+
+/*
+ * Evaluate a IS JSON predicate.
+ */
 void
 ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
 {
@@ -4034,6 +4249,324 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
 }
 
 /*
+ * Evaluate a jsonpath against a document, both of which must have been
+ * evaluated and their values saved in op->d.jsonexpr.jsestate.
+ *
+ * If an error occurs during JsonPath* evaluation or when coercing its result
+ * to the RETURNING type, JsonExprState.error is set to true, provided the
+ * ON ERROR behavior is not ERROR.  Similarly, if JsonPath{Query|Value}() found
+ * no matching items, JsonExprState.empty is set to true, provided the ON EMPTY
+ * behavior is not ERROR.  That is to signal to the subsequent steps that check
+ * those flags to return the ON ERROR / ON EMPTY expression.
+ *
+ * Return value is the step address to be performed next.  It will be one of
+ * jump_error, jump_empty, jump_eval_coercion, or jump_end, all given in
+ * op->d.jsonexpr.jsestate.
+ */
+int
+ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
+					 ExprContext *econtext)
+{
+	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+	JsonExpr   *jsexpr = jsestate->jsexpr;
+	Datum		item;
+	JsonPath   *path;
+	bool		throw_error = jsexpr->on_error->btype == JSON_BEHAVIOR_ERROR;
+	bool		error = false,
+				empty = false;
+	int			jump_eval_coercion = jsestate->jump_eval_coercion;
+	char	   *val_string = NULL;
+
+	item = jsestate->formatted_expr.value;
+	path = DatumGetJsonPathP(jsestate->pathspec.value);
+
+	/* Set error/empty to false. */
+	memset(&jsestate->error, 0, sizeof(NullableDatum));
+	memset(&jsestate->empty, 0, sizeof(NullableDatum));
+
+	/*
+	 * Also reset ErrorSaveContext contents for the next row.  Since we don't
+	 * set details_wanted, we don't need to also reset error_data, which would
+	 * be NULL anyway.
+	 */
+	Assert(!jsestate->escontext.details_wanted &&
+		   jsestate->escontext.error_data == NULL);
+	jsestate->escontext.error_occurred = false;
+
+	switch (jsexpr->op)
+	{
+		case JSON_EXISTS_OP:
+			{
+				bool		exists = JsonPathExists(item, path,
+													!throw_error ? &error : NULL,
+													jsestate->args);
+
+				if (!error)
+				{
+					*op->resvalue = BoolGetDatum(exists);
+					*op->resnull = false;
+				}
+			}
+			break;
+
+		case JSON_QUERY_OP:
+			*op->resvalue = JsonPathQuery(item, path, jsexpr->wrapper, &empty,
+										  !throw_error ? &error : NULL,
+										  jsestate->args,
+										  jsexpr->column_name);
+
+			*op->resnull = (DatumGetPointer(*op->resvalue) == NULL);
+
+			/* Handle OMIT QUOTES. */
+			if (!*op->resnull && jsexpr->omit_quotes)
+			{
+				val_string = JsonbUnquote(DatumGetJsonbP(*op->resvalue));
+
+				/*
+				 * Pass the string as a text value to the cast expression if
+				 * one present.  If not, use the input function call below to
+				 * do the coercion.
+				 */
+				if (jump_eval_coercion >= 0)
+					*op->resvalue =
+						DirectFunctionCall1(textin,
+											PointerGetDatum(val_string));
+			}
+			break;
+
+		case JSON_VALUE_OP:
+			{
+				JsonbValue *jbv = JsonPathValue(item, path, &empty,
+												!throw_error ? &error : NULL,
+												jsestate->args,
+												jsexpr->column_name);
+
+				if (jbv == NULL)
+				{
+					/* Will be coerced with coercion_expr, if any. */
+					*op->resvalue = (Datum) 0;
+					*op->resnull = true;
+				}
+				else if (!error && !empty)
+				{
+					if (jsexpr->returning->typid == JSONOID ||
+						jsexpr->returning->typid == JSONBOID)
+					{
+						val_string = DatumGetCString(DirectFunctionCall1(jsonb_out,
+																		 JsonbPGetDatum(JsonbValueToJsonb(jbv))));
+					}
+					else
+					{
+						val_string = ExecGetJsonValueItemString(jbv, op->resnull);
+
+						/*
+						 * Pass the string as a text value to the cast
+						 * expression if one present.  If not, use the input
+						 * function call below to do the coercion.
+						 */
+						*op->resvalue = PointerGetDatum(val_string);
+						if (jump_eval_coercion >= 0)
+							*op->resvalue = DirectFunctionCall1(textin, *op->resvalue);
+					}
+				}
+				break;
+			}
+
+			/* JSON_TABLE_OP can't happen here */
+
+		default:
+			elog(ERROR, "unrecognized SQL/JSON expression op %d",
+				 (int) jsexpr->op);
+			return false;
+	}
+
+	/*
+	 * Coerce the result value to the RETURNING type by calling its input
+	 * function.
+	 */
+	if (!*op->resnull && jsexpr->use_io_coercion)
+	{
+		FunctionCallInfo fcinfo;
+
+		Assert(jump_eval_coercion == -1);
+		fcinfo = jsestate->input_fcinfo;
+		Assert(fcinfo != NULL);
+		Assert(val_string != NULL);
+		fcinfo->args[0].value = PointerGetDatum(val_string);
+		fcinfo->args[0].isnull = *op->resnull;
+
+		/*
+		 * Second and third arguments are already set up in
+		 * ExecInitJsonExpr().
+		 */
+
+		fcinfo->isnull = false;
+		*op->resvalue = FunctionCallInvoke(fcinfo);
+		if (SOFT_ERROR_OCCURRED(&jsestate->escontext))
+			error = true;
+	}
+
+	/* Handle ON EMPTY. */
+	if (empty)
+	{
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+		if (jsexpr->on_empty)
+		{
+			if (jsexpr->on_empty->btype != JSON_BEHAVIOR_ERROR)
+			{
+				jsestate->empty.value = BoolGetDatum(true);
+				Assert(jsestate->jump_empty >= 0);
+				return jsestate->jump_empty;
+			}
+		}
+		else if (jsexpr->on_error->btype != JSON_BEHAVIOR_ERROR)
+		{
+			jsestate->error.value = BoolGetDatum(true);
+			Assert(!throw_error && jsestate->jump_error >= 0);
+			return jsestate->jump_error;
+		}
+
+		if (jsexpr->column_name)
+			ereport(ERROR,
+					errcode(ERRCODE_NO_SQL_JSON_ITEM),
+					errmsg("no SQL/JSON item found for specified path of column \"%s\"",
+						   jsexpr->column_name));
+		else
+			ereport(ERROR,
+					errcode(ERRCODE_NO_SQL_JSON_ITEM),
+					errmsg("no SQL/JSON item found for specified path"));
+	}
+
+	/*
+	 * ON ERROR. Wouldn't get here if the behavior is ERROR, because they
+	 * would have already been thrown.
+	 */
+	if (error)
+	{
+		Assert(!throw_error && jsestate->jump_error >= 0);
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+		jsestate->error.value = BoolGetDatum(true);
+		return jsestate->jump_error;
+	}
+
+	return jump_eval_coercion >= 0 ? jump_eval_coercion : jsestate->jump_end;
+}
+
+/*
+ * Convert the given JsonbValue to its C string representation
+ *
+ * *resnull is set if the JsonbValue is a jbvNull.
+ */
+static char *
+ExecGetJsonValueItemString(JsonbValue *item, bool *resnull)
+{
+	*resnull = false;
+
+	/* get coercion state reference and datum of the corresponding SQL type */
+	switch (item->type)
+	{
+		case jbvNull:
+			*resnull = true;
+			return NULL;
+
+		case jbvString:
+			{
+				char	   *str = palloc(item->val.string.len + 1);
+
+				memcpy(str, item->val.string.val, item->val.string.len);
+				str[item->val.string.len] = '\0';
+				return str;
+			}
+
+		case jbvNumeric:
+			return DatumGetCString(DirectFunctionCall1(numeric_out,
+													   NumericGetDatum(item->val.numeric)));
+
+		case jbvBool:
+			return DatumGetCString(DirectFunctionCall1(boolout,
+													   BoolGetDatum(item->val.boolean)));
+
+		case jbvDatetime:
+			switch (item->val.datetime.typid)
+			{
+				case DATEOID:
+					return DatumGetCString(DirectFunctionCall1(date_out,
+															   item->val.datetime.value));
+				case TIMEOID:
+					return DatumGetCString(DirectFunctionCall1(time_out,
+															   item->val.datetime.value));
+				case TIMETZOID:
+					return DatumGetCString(DirectFunctionCall1(timetz_out,
+															   item->val.datetime.value));
+				case TIMESTAMPOID:
+					return DatumGetCString(DirectFunctionCall1(timestamp_out,
+															   item->val.datetime.value));
+				case TIMESTAMPTZOID:
+					return DatumGetCString(DirectFunctionCall1(timestamptz_out,
+															   item->val.datetime.value));
+				default:
+					elog(ERROR, "unexpected jsonb datetime type oid %u",
+						 item->val.datetime.typid);
+			}
+			break;
+
+		case jbvArray:
+		case jbvObject:
+		case jbvBinary:
+			return DatumGetCString(DirectFunctionCall1(jsonb_out,
+													   JsonbPGetDatum(JsonbValueToJsonb(item))));
+
+		default:
+			elog(ERROR, "unexpected jsonb value type %d", item->type);
+	}
+
+	Assert(false);
+	*resnull = true;
+	return NULL;
+}
+
+/*
+ * Coerce a jsonb value produced by ExecEvalJsonExprPath() or an ON ERROR /
+ * ON EMPTY behavior expression to the target type.
+ *
+ * Any soft errors that occur here will be checked by
+ * EEOP_JSONEXPR_COERCION_FINISH that will run after this.
+ */
+void
+ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
+					 ExprContext *econtext)
+{
+	ErrorSaveContext *escontext = op->d.jsonexpr_coercion.escontext;
+
+	*op->resvalue = json_populate_type(*op->resvalue, JSONBOID,
+									   op->d.jsonexpr_coercion.targettype,
+									   op->d.jsonexpr_coercion.targettypmod,
+									   &op->d.jsonexpr_coercion.json_populate_type_cache,
+									   econtext->ecxt_per_query_memory,
+									   op->resnull, (Node *) escontext);
+}
+
+/*
+ * Checks if an error occurred either when evaluating JsonExpr.coercion_expr or
+ * in ExecEvalJsonCoercion().  If so, this sets JsonExprState.error to trigger
+ * the ON ERROR handling steps.
+ */
+void
+ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op)
+{
+	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+
+	if (SOFT_ERROR_OCCURRED(&jsestate->escontext))
+	{
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+		jsestate->error.value = BoolGetDatum(true);
+	}
+}
+
+/*
  * ExecEvalGroupingFunc
  *
  * Computes a bitmask with a bit for each (unevaluated) argument expression
@@ -4062,6 +4595,45 @@ ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op)
 
 	*op->resvalue = Int32GetDatum(result);
 	*op->resnull = false;
+}
+
+/*
+ * ExecEvalMergeSupportFunc
+ *
+ * Returns information about the current MERGE action for its RETURNING list.
+ */
+void
+ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
+						 ExprContext *econtext)
+{
+	ModifyTableState *mtstate = castNode(ModifyTableState, state->parent);
+	MergeActionState *relaction = mtstate->mt_merge_action;
+
+	if (!relaction)
+		elog(ERROR, "no merge action in progress");
+
+	/* Return the MERGE action ("INSERT", "UPDATE", or "DELETE") */
+	switch (relaction->mas_action->commandType)
+	{
+		case CMD_INSERT:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("INSERT", 6));
+			*op->resnull = false;
+			break;
+		case CMD_UPDATE:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("UPDATE", 6));
+			*op->resnull = false;
+			break;
+		case CMD_DELETE:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("DELETE", 6));
+			*op->resnull = false;
+			break;
+		case CMD_NOTHING:
+			elog(ERROR, "unexpected merge action: DO NOTHING");
+			break;
+		default:
+			elog(ERROR, "unrecognized commandType: %d",
+				 (int) relaction->mas_action->commandType);
+	}
 }
 
 /*
@@ -4354,15 +4926,40 @@ ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup
 }
 
 /*
- * Ensure that the current transition value is a child of the aggcontext,
- * rather than the per-tuple context.
+ * Ensure that the new transition value is stored in the aggcontext,
+ * rather than the per-tuple context.  This should be invoked only when
+ * we know (a) the transition data type is pass-by-reference, and (b)
+ * the newValue is distinct from the oldValue.
  *
  * NB: This can change the current memory context.
+ *
+ * We copy the presented newValue into the aggcontext, except when the datum
+ * points to a R/W expanded object that is already a child of the aggcontext,
+ * in which case we need not copy.  We then delete the oldValue, if not null.
+ *
+ * If the presented datum points to a R/W expanded object that is a child of
+ * some other context, ideally we would just reparent it under the aggcontext.
+ * Unfortunately, that doesn't work easily, and it wouldn't help anyway for
+ * aggregate-aware transfns.  We expect that a transfn that deals in expanded
+ * objects and is aware of the memory management conventions for aggregate
+ * transition values will (1) on first call, return a R/W expanded object that
+ * is already in the right context, allowing us to do nothing here, and (2) on
+ * subsequent calls, modify and return that same object, so that control
+ * doesn't even reach here.  However, if we have a generic transfn that
+ * returns a new R/W expanded object (probably in the per-tuple context),
+ * reparenting that result would cause problems.  We'd pass that R/W object to
+ * the next invocation of the transfn, and then it would be at liberty to
+ * change or delete that object, and if it deletes it then our own attempt to
+ * delete the now-old transvalue afterwards would be a double free.  We avoid
+ * this problem by forcing the stored transvalue to always be a flat
+ * non-expanded object unless the transfn is visibly doing aggregate-aware
+ * memory management.  This is somewhat inefficient, but the best answer to
+ * that is to write a smarter transfn.
  */
 Datum
-ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
-					 Datum newValue, bool newValueIsNull,
-					 Datum oldValue, bool oldValueIsNull)
+ExecAggCopyTransValue(AggState *aggstate, AggStatePerTrans pertrans,
+					  Datum newValue, bool newValueIsNull,
+					  Datum oldValue, bool oldValueIsNull)
 {
 	Assert(newValue != oldValue);
 
@@ -4400,6 +4997,99 @@ ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
 	}
 
 	return newValue;
+}
+
+/*
+ * ExecEvalPreOrderedDistinctSingle
+ *		Returns true when the aggregate transition value Datum is distinct
+ *		from the previous input Datum and returns false when the input Datum
+ *		matches the previous input Datum.
+ */
+bool
+ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
+{
+	Datum		value = pertrans->transfn_fcinfo->args[1].value;
+	bool		isnull = pertrans->transfn_fcinfo->args[1].isnull;
+
+	if (!pertrans->haslast ||
+		pertrans->lastisnull != isnull ||
+		(!isnull && !DatumGetBool(FunctionCall2Coll(&pertrans->equalfnOne,
+													pertrans->aggCollation,
+													pertrans->lastdatum, value))))
+	{
+		if (pertrans->haslast && !pertrans->inputtypeByVal &&
+			!pertrans->lastisnull)
+			pfree(DatumGetPointer(pertrans->lastdatum));
+
+		pertrans->haslast = true;
+		if (!isnull)
+		{
+			MemoryContext oldContext;
+
+			oldContext = MemoryContextSwitchTo(aggstate->curaggcontext->ecxt_per_tuple_memory);
+
+			pertrans->lastdatum = datumCopy(value, pertrans->inputtypeByVal,
+											pertrans->inputtypeLen);
+
+			MemoryContextSwitchTo(oldContext);
+		}
+		else
+			pertrans->lastdatum = (Datum) 0;
+		pertrans->lastisnull = isnull;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * ExecEvalPreOrderedDistinctMulti
+ *		Returns true when the aggregate input is distinct from the previous
+ *		input and returns false when the input matches the previous input, or
+ *		when there was no previous input.
+ */
+bool
+ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
+{
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	bool		isdistinct = false; /* for now */
+	TupleTableSlot *save_outer;
+	TupleTableSlot *save_inner;
+
+	for (int i = 0; i < pertrans->numTransInputs; i++)
+	{
+		pertrans->sortslot->tts_values[i] = pertrans->transfn_fcinfo->args[i + 1].value;
+		pertrans->sortslot->tts_isnull[i] = pertrans->transfn_fcinfo->args[i + 1].isnull;
+	}
+
+	ExecClearTuple(pertrans->sortslot);
+	pertrans->sortslot->tts_nvalid = pertrans->numInputs;
+	ExecStoreVirtualTuple(pertrans->sortslot);
+
+	/* save the previous slots before we overwrite them */
+	save_outer = tmpcontext->ecxt_outertuple;
+	save_inner = tmpcontext->ecxt_innertuple;
+
+	tmpcontext->ecxt_outertuple = pertrans->sortslot;
+	tmpcontext->ecxt_innertuple = pertrans->uniqslot;
+
+	if (!pertrans->haslast ||
+		!ExecQual(pertrans->equalfnMulti, tmpcontext))
+	{
+		if (pertrans->haslast)
+			ExecClearTuple(pertrans->uniqslot);
+
+		pertrans->haslast = true;
+		ExecCopySlot(pertrans->uniqslot, pertrans->sortslot);
+
+		isdistinct = true;
+	}
+
+	/* restore the original slots */
+	tmpcontext->ecxt_outertuple = save_outer;
+	tmpcontext->ecxt_innertuple = save_inner;
+
+	return isdistinct;
 }
 
 /*
@@ -4493,12 +5183,10 @@ ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 	/*
 	 * For pass-by-ref datatype, must copy the new value into aggcontext and
 	 * free the prior transValue.  But if transfn returned a pointer to its
-	 * first input, we don't need to do anything.  Also, if transfn returned a
-	 * pointer to a R/W expanded object that is already a child of the
-	 * aggcontext, assume we can adopt that value without copying it.
+	 * first input, we don't need to do anything.
 	 *
 	 * It's safe to compare newVal with pergroup->transValue without regard
-	 * for either being NULL, because ExecAggTransReparent() takes care to set
+	 * for either being NULL, because ExecAggCopyTransValue takes care to set
 	 * transValue to 0 when NULL. Otherwise we could end up accidentally not
 	 * reparenting, when the transValue has the same numerical value as
 	 * newValue, despite being NULL.  This is a somewhat hot path, making it
@@ -4507,639 +5195,13 @@ ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 	 * argument.
 	 */
 	if (DatumGetPointer(newVal) != DatumGetPointer(pergroup->transValue))
-		newVal = ExecAggTransReparent(aggstate, pertrans,
-									  newVal, fcinfo->isnull,
-									  pergroup->transValue,
-									  pergroup->transValueIsNull);
+		newVal = ExecAggCopyTransValue(aggstate, pertrans,
+									   newVal, fcinfo->isnull,
+									   pergroup->transValue,
+									   pergroup->transValueIsNull);
 
 	pergroup->transValue = newVal;
 	pergroup->transValueIsNull = fcinfo->isnull;
 
 	MemoryContextSwitchTo(oldContext);
-}
-
-/*
- * Evaluate a JSON constructor expression.
- */
-void
-ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
-						ExprContext *econtext)
-{
-	Datum		res;
-	JsonConstructorExprState *jcstate = op->d.json_constructor.jcstate;
-	JsonConstructorExpr *ctor = jcstate->constructor;
-	bool		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
-	bool		isnull = false;
-
-	if (ctor->type == JSCTOR_JSON_ARRAY)
-		res = (is_jsonb ?
-			   jsonb_build_array_worker :
-			   json_build_array_worker) (jcstate->nargs,
-										 jcstate->arg_values,
-										 jcstate->arg_nulls,
-										 jcstate->arg_types,
-										 ctor->absent_on_null);
-	else if (ctor->type == JSCTOR_JSON_OBJECT)
-		res = (is_jsonb ?
-			   jsonb_build_object_worker :
-			   json_build_object_worker) (jcstate->nargs,
-										  jcstate->arg_values,
-										  jcstate->arg_nulls,
-										  jcstate->arg_types,
-										  ctor->absent_on_null,
-										  ctor->unique);
-	else if (ctor->type == JSCTOR_JSON_SCALAR)
-	{
-		if (jcstate->arg_nulls[0])
-		{
-			res = (Datum) 0;
-			isnull = true;
-		}
-		else
-		{
-			Datum		value = jcstate->arg_values[0];
-			int			category = jcstate->arg_type_cache[0].category;
-			Oid			outfuncid = jcstate->arg_type_cache[0].outfuncid;
-
-			if (is_jsonb)
-				res = to_jsonb_worker(value, category, outfuncid);
-			else
-				res = to_json_worker(value, category, outfuncid);
-		}
-	}
-	else if (ctor->type == JSCTOR_JSON_PARSE)
-	{
-		if (jcstate->arg_nulls[0])
-		{
-			res = (Datum) 0;
-			isnull = true;
-		}
-		else
-		{
-			Datum		value = jcstate->arg_values[0];
-			text	   *js = DatumGetTextP(value);
-
-			if (is_jsonb)
-				res = jsonb_from_text(js, true);
-			else
-			{
-				(void) json_validate(js, true, true);
-				res = value;
-			}
-		}
-	}
-	else
-	{
-		res = (Datum) 0;
-		elog(ERROR, "invalid JsonConstructorExpr type %d", ctor->type);
-	}
-
-	*op->resvalue = res;
-	*op->resnull = isnull;
-}
-
-/*
- * Evaluate a JSON error/empty behavior result.
- */
-static Datum
-ExecEvalJsonBehavior(ExprContext *econtext, JsonBehavior *behavior,
-					 ExprState *default_estate, bool *is_null)
-{
-	*is_null = false;
-
-	switch (behavior->btype)
-	{
-		case JSON_BEHAVIOR_EMPTY_ARRAY:
-			return JsonbPGetDatum(JsonbMakeEmptyArray());
-
-		case JSON_BEHAVIOR_EMPTY_OBJECT:
-			return JsonbPGetDatum(JsonbMakeEmptyObject());
-
-		case JSON_BEHAVIOR_TRUE:
-			return BoolGetDatum(true);
-
-		case JSON_BEHAVIOR_FALSE:
-			return BoolGetDatum(false);
-
-		case JSON_BEHAVIOR_NULL:
-		case JSON_BEHAVIOR_UNKNOWN:
-		case JSON_BEHAVIOR_EMPTY:
-			*is_null = true;
-			return (Datum) 0;
-
-		case JSON_BEHAVIOR_DEFAULT:
-			return ExecEvalExpr(default_estate, econtext, is_null);
-
-		default:
-			elog(ERROR, "unrecognized SQL/JSON behavior %d", behavior->btype);
-			return (Datum) 0;
-	}
-}
-
-/*
- * Evaluate a coercion of a JSON item to the target type.
- */
-static Datum
-ExecEvalJsonExprCoercion(ExprEvalStep *op, ExprContext *econtext,
-						 Datum res, bool *isNull, void *p, bool *error)
-{
-	ExprState  *estate = p;
-	JsonExprState *jsestate;
-
-	if (estate)					/* coerce using specified expression */
-		return ExecEvalExpr(estate, econtext, isNull);
-
-	jsestate = op->d.jsonexpr.jsestate;
-
-	if (jsestate->jsexpr->op != JSON_EXISTS_OP)
-	{
-		JsonCoercion *coercion = jsestate->jsexpr->result_coercion;
-		JsonExpr   *jexpr = jsestate->jsexpr;
-		Jsonb	   *jb = *isNull ? NULL : DatumGetJsonbP(res);
-
-		if ((coercion && coercion->via_io) ||
-			(jexpr->omit_quotes && !*isNull &&
-			 JB_ROOT_IS_SCALAR(jb)))
-		{
-			/* strip quotes and call typinput function */
-			char	   *str = *isNull ? NULL : JsonbUnquote(jb);
-
-			return InputFunctionCall(&jsestate->input.func, str,
-									 jsestate->input.typioparam,
-									 jexpr->returning->typmod);
-		}
-		else if (coercion && coercion->via_populate)
-			return json_populate_type(res, JSONBOID,
-									  jexpr->returning->typid,
-									  jexpr->returning->typmod,
-									  &jsestate->cache,
-									  econtext->ecxt_per_query_memory,
-									  isNull);
-	}
-
-	if (jsestate->result_expr)
-	{
-		jsestate->res_expr->value = res;
-		jsestate->res_expr->isnull = *isNull;
-
-		res = ExecEvalExpr(jsestate->result_expr, econtext, isNull);
-	}
-
-	return res;
-}
-
-/*
- * Evaluate a JSON path variable caching computed value.
- */
-int
-EvalJsonPathVar(void *cxt, char *varName, int varNameLen,
-				JsonbValue *val, JsonbValue *baseObject)
-{
-	JsonPathVariableEvalContext *var = NULL;
-	List	   *vars = cxt;
-	ListCell   *lc;
-	int			id = 1;
-
-	if (!varName)
-		return list_length(vars);
-
-	foreach(lc, vars)
-	{
-		var = lfirst(lc);
-
-		if (!strncmp(var->name, varName, varNameLen))
-			break;
-
-		var = NULL;
-		id++;
-	}
-
-	if (!var)
-		return -1;
-
-	if (!var->evaluated)
-	{
-		MemoryContext oldcxt = var->mcxt ?
-		MemoryContextSwitchTo(var->mcxt) : NULL;
-
-		var->value = ExecEvalExpr(var->estate, var->econtext, &var->isnull);
-		var->evaluated = true;
-
-		if (oldcxt)
-			MemoryContextSwitchTo(oldcxt);
-	}
-
-	if (var->isnull)
-	{
-		val->type = jbvNull;
-		return 0;
-	}
-
-	JsonItemFromDatum(var->value, var->typid, var->typmod, val);
-
-	*baseObject = *val;
-	return id;
-}
-
-/*
- * Prepare SQL/JSON item coercion to the output type. Returned a datum of the
- * corresponding SQL type and a pointer to the coercion state.
- */
-Datum
-ExecPrepareJsonItemCoercion(JsonbValue *item,
-							JsonReturning *returning,
-							struct JsonCoercionsState *coercions,
-							struct JsonCoercionState **pcoercion)
-{
-	struct JsonCoercionState *coercion;
-	Datum		res;
-	JsonbValue	buf;
-
-	if (item->type == jbvBinary &&
-		JsonContainerIsScalar(item->val.binary.data))
-	{
-		bool		res PG_USED_FOR_ASSERTS_ONLY;
-
-		res = JsonbExtractScalar(item->val.binary.data, &buf);
-		item = &buf;
-		Assert(res);
-	}
-
-	/* get coercion state reference and datum of the corresponding SQL type */
-	switch (item->type)
-	{
-		case jbvNull:
-			coercion = &coercions->null;
-			res = (Datum) 0;
-			break;
-
-		case jbvString:
-			coercion = &coercions->string;
-			res = PointerGetDatum(cstring_to_text_with_len(item->val.string.val,
-														   item->val.string.len));
-			break;
-
-		case jbvNumeric:
-			coercion = &coercions->numeric;
-			res = NumericGetDatum(item->val.numeric);
-			break;
-
-		case jbvBool:
-			coercion = &coercions->boolean;
-			res = BoolGetDatum(item->val.boolean);
-			break;
-
-		case jbvDatetime:
-			res = item->val.datetime.value;
-			switch (item->val.datetime.typid)
-			{
-				case DATEOID:
-					coercion = &coercions->date;
-					break;
-				case TIMEOID:
-					coercion = &coercions->time;
-					break;
-				case TIMETZOID:
-					coercion = &coercions->timetz;
-					break;
-				case TIMESTAMPOID:
-					coercion = &coercions->timestamp;
-					break;
-				case TIMESTAMPTZOID:
-					coercion = &coercions->timestamptz;
-					break;
-				default:
-					elog(ERROR, "unexpected jsonb datetime type oid %u",
-						 item->val.datetime.typid);
-					return (Datum) 0;
-			}
-			break;
-
-		case jbvArray:
-		case jbvObject:
-		case jbvBinary:
-			coercion = &coercions->composite;
-			res = JsonbPGetDatum(JsonbValueToJsonb(item));
-			break;
-
-		default:
-			elog(ERROR, "unexpected jsonb value type %d", item->type);
-			return (Datum) 0;
-	}
-
-	*pcoercion = coercion;
-
-	return res;
-}
-
-typedef Datum (*JsonFunc) (ExprEvalStep *op, ExprContext *econtext,
-						   Datum item, bool *resnull, void *p, bool *error);
-
-static Datum
-ExecEvalJsonExprSubtrans(JsonFunc func, ExprEvalStep *op,
-						 ExprContext *econtext,
-						 Datum res, bool *resnull,
-						 void *p, bool *error, bool subtrans)
-{
-	MemoryContext oldcontext;
-	ResourceOwner oldowner;
-
-	if (!subtrans)
-		/* No need to use subtransactions. */
-		return func(op, econtext, res, resnull, p, error);
-
-	/*
-	 * We should catch exceptions of category ERRCODE_DATA_EXCEPTION and
-	 * execute the corresponding ON ERROR behavior then.
-	 */
-	oldcontext = CurrentMemoryContext;
-	oldowner = CurrentResourceOwner;
-
-	Assert(error);
-
-	BeginInternalSubTransaction(NULL);
-	/* Want to execute expressions inside function's memory context */
-	MemoryContextSwitchTo(oldcontext);
-
-	PG_TRY();
-	{
-		res = func(op, econtext, res, resnull, p, error);
-
-		/* Commit the inner transaction, return to outer xact context */
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-		int			ecategory;
-
-		/* Save error info in oldcontext */
-		MemoryContextSwitchTo(oldcontext);
-		edata = CopyErrorData();
-		FlushErrorState();
-
-		/* Abort the inner transaction */
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
-
-		ecategory = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
-
-		if (ecategory != ERRCODE_DATA_EXCEPTION &&	/* jsonpath and other data
-													 * errors */
-			ecategory != ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION)	/* domain errors */
-			ReThrowError(edata);
-
-		res = (Datum) 0;
-		*error = true;
-	}
-	PG_END_TRY();
-
-	return res;
-}
-
-
-typedef struct
-{
-	JsonPath   *path;
-	bool	   *error;
-	bool		coercionInSubtrans;
-} ExecEvalJsonExprContext;
-
-static Datum
-ExecEvalJsonExpr(ExprEvalStep *op, ExprContext *econtext,
-				 Datum item, bool *resnull, void *pcxt,
-				 bool *error)
-{
-	ExecEvalJsonExprContext *cxt = pcxt;
-	JsonPath   *path = cxt->path;
-	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-	JsonExpr   *jexpr = jsestate->jsexpr;
-	ExprState  *estate = NULL;
-	bool		empty = false;
-	Datum		res = (Datum) 0;
-
-	switch (jexpr->op)
-	{
-		case JSON_QUERY_OP:
-			res = JsonPathQuery(item, path, jexpr->wrapper, &empty, error,
-								jsestate->args);
-			if (error && *error)
-			{
-				*resnull = true;
-				return (Datum) 0;
-			}
-			*resnull = !DatumGetPointer(res);
-			break;
-
-		case JSON_VALUE_OP:
-			{
-				struct JsonCoercionState *jcstate;
-				JsonbValue *jbv = JsonPathValue(item, path, &empty, error,
-												jsestate->args);
-
-				if (error && *error)
-					return (Datum) 0;
-
-				if (!jbv)		/* NULL or empty */
-					break;
-
-				Assert(!empty);
-
-				*resnull = false;
-
-				/* coerce scalar item to the output type */
-				if (jexpr->returning->typid == JSONOID ||
-					jexpr->returning->typid == JSONBOID)
-				{
-					/* Use result coercion from json[b] to the output type */
-					res = JsonbPGetDatum(JsonbValueToJsonb(jbv));
-					break;
-				}
-
-				/* Use coercion from SQL/JSON item type to the output type */
-				res = ExecPrepareJsonItemCoercion(jbv,
-												  jsestate->jsexpr->returning,
-												  &jsestate->coercions,
-												  &jcstate);
-
-				if (jcstate->coercion &&
-					(jcstate->coercion->via_io ||
-					 jcstate->coercion->via_populate))
-				{
-					if (error)
-					{
-						*error = true;
-						return (Datum) 0;
-					}
-
-					/*
-					 * Coercion via I/O means here that the cast to the target
-					 * type simply does not exist.
-					 */
-					ereport(ERROR,
-							(errcode(ERRCODE_SQL_JSON_ITEM_CANNOT_BE_CAST_TO_TARGET_TYPE),
-							 errmsg("SQL/JSON item cannot be cast to target type")));
-				}
-				else if (!jcstate->estate)
-					return res; /* no coercion */
-
-				/* coerce using specific expression */
-				estate = jcstate->estate;
-				jsestate->coercion_expr->value = res;
-				jsestate->coercion_expr->isnull = *resnull;
-				break;
-			}
-
-		case JSON_EXISTS_OP:
-			{
-				bool		exists = JsonPathExists(item, path,
-													jsestate->args,
-													error);
-
-				*resnull = error && *error;
-				res = BoolGetDatum(exists);
-
-				if (!jsestate->result_expr)
-					return res;
-
-				/* coerce using result expression */
-				estate = jsestate->result_expr;
-				jsestate->res_expr->value = res;
-				jsestate->res_expr->isnull = *resnull;
-				break;
-			}
-
-		case JSON_TABLE_OP:
-			*resnull = false;
-			return item;
-
-		default:
-			elog(ERROR, "unrecognized SQL/JSON expression op %d", jexpr->op);
-			return (Datum) 0;
-	}
-
-	if (empty)
-	{
-		Assert(jexpr->on_empty);	/* it is not JSON_EXISTS */
-
-		if (jexpr->on_empty->btype == JSON_BEHAVIOR_ERROR)
-		{
-			if (error)
-			{
-				*error = true;
-				return (Datum) 0;
-			}
-
-			ereport(ERROR,
-					(errcode(ERRCODE_NO_SQL_JSON_ITEM),
-					 errmsg("no SQL/JSON item")));
-		}
-
-		if (jexpr->on_empty->btype == JSON_BEHAVIOR_DEFAULT)
-
-			/*
-			 * Execute DEFAULT expression as a coercion expression, because
-			 * its result is already coerced to the target type.
-			 */
-			estate = jsestate->default_on_empty;
-		else
-			/* Execute ON EMPTY behavior */
-			res = ExecEvalJsonBehavior(econtext, jexpr->on_empty,
-									   jsestate->default_on_empty,
-									   resnull);
-	}
-
-	return ExecEvalJsonExprSubtrans(ExecEvalJsonExprCoercion, op, econtext,
-									res, resnull, estate, error,
-									cxt->coercionInSubtrans);
-}
-
-bool
-ExecEvalJsonNeedsSubTransaction(JsonExpr *jsexpr,
-								struct JsonCoercionsState *coercions)
-{
-	if (jsexpr->on_error->btype == JSON_BEHAVIOR_ERROR)
-		return false;
-
-	if (jsexpr->op == JSON_EXISTS_OP && !jsexpr->result_coercion)
-		return false;
-
-	if (!coercions)
-		return true;
-
-	return false;
-}
-
-/* ----------------------------------------------------------------
- *		ExecEvalJson
- * ----------------------------------------------------------------
- */
-void
-ExecEvalJson(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
-{
-	ExecEvalJsonExprContext cxt;
-	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-	JsonExpr   *jexpr = jsestate->jsexpr;
-	Datum		item;
-	Datum		res = (Datum) 0;
-	JsonPath   *path;
-	ListCell   *lc;
-	bool		error = false;
-	bool		needSubtrans;
-	bool		throwErrors = jexpr->on_error->btype == JSON_BEHAVIOR_ERROR;
-
-	*op->resnull = true;		/* until we get a result */
-	*op->resvalue = (Datum) 0;
-
-	if (jsestate->formatted_expr->isnull || jsestate->pathspec->isnull)
-	{
-		/* execute domain checks for NULLs */
-		(void) ExecEvalJsonExprCoercion(op, econtext, res, op->resnull,
-										NULL, NULL);
-
-		Assert(*op->resnull);
-		return;
-	}
-
-	item = jsestate->formatted_expr->value;
-	path = DatumGetJsonPathP(jsestate->pathspec->value);
-
-	/* reset JSON path variable contexts */
-	foreach(lc, jsestate->args)
-	{
-		JsonPathVariableEvalContext *var = lfirst(lc);
-
-		var->econtext = econtext;
-		var->evaluated = false;
-	}
-
-	needSubtrans = ExecEvalJsonNeedsSubTransaction(jexpr, &jsestate->coercions);
-
-	cxt.path = path;
-	cxt.error = throwErrors ? NULL : &error;
-	cxt.coercionInSubtrans = !needSubtrans && !throwErrors;
-	Assert(!needSubtrans || cxt.error);
-
-	res = ExecEvalJsonExprSubtrans(ExecEvalJsonExpr, op, econtext, item,
-								   op->resnull, &cxt, cxt.error,
-								   needSubtrans);
-
-	if (error)
-	{
-		/* Execute ON ERROR behavior */
-		res = ExecEvalJsonBehavior(econtext, jexpr->on_error,
-								   jsestate->default_on_error,
-								   op->resnull);
-
-		/* result is already coerced in DEFAULT behavior case */
-		if (jexpr->on_error->btype != JSON_BEHAVIOR_DEFAULT)
-			res = ExecEvalJsonExprCoercion(op, econtext, res,
-										   op->resnull,
-										   NULL, NULL);
-	}
-
-	*op->resvalue = res;
 }

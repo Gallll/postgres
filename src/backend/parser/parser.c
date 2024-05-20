@@ -10,7 +10,7 @@
  * analyze.c and related files.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,8 +21,8 @@
 
 #include "postgres.h"
 
+#include "gramparse.h"
 #include "mb/pg_wchar.h"
-#include "parser/gramparse.h"
 #include "parser/parser.h"
 #include "parser/scansup.h"
 
@@ -56,12 +56,12 @@ raw_parser(const char *str, RawParseMode mode)
 	{
 		/* this array is indexed by RawParseMode enum */
 		static const int mode_token[] = {
-			0,					/* RAW_PARSE_DEFAULT */
-			MODE_TYPE_NAME,		/* RAW_PARSE_TYPE_NAME */
-			MODE_PLPGSQL_EXPR,	/* RAW_PARSE_PLPGSQL_EXPR */
-			MODE_PLPGSQL_ASSIGN1,	/* RAW_PARSE_PLPGSQL_ASSIGN1 */
-			MODE_PLPGSQL_ASSIGN2,	/* RAW_PARSE_PLPGSQL_ASSIGN2 */
-			MODE_PLPGSQL_ASSIGN3	/* RAW_PARSE_PLPGSQL_ASSIGN3 */
+			[RAW_PARSE_DEFAULT] = 0,
+			[RAW_PARSE_TYPE_NAME] = MODE_TYPE_NAME,
+			[RAW_PARSE_PLPGSQL_EXPR] = MODE_PLPGSQL_EXPR,
+			[RAW_PARSE_PLPGSQL_ASSIGN1] = MODE_PLPGSQL_ASSIGN1,
+			[RAW_PARSE_PLPGSQL_ASSIGN2] = MODE_PLPGSQL_ASSIGN2,
+			[RAW_PARSE_PLPGSQL_ASSIGN3] = MODE_PLPGSQL_ASSIGN3,
 		};
 
 		yyextra.have_lookahead = true;
@@ -137,6 +137,9 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 	 */
 	switch (cur_token)
 	{
+		case FORMAT:
+			cur_token_length = 6;
+			break;
 		case NOT:
 			cur_token_length = 3;
 			break;
@@ -191,6 +194,16 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 	/* Replace cur_token if needed, based on lookahead */
 	switch (cur_token)
 	{
+		case FORMAT:
+			/* Replace FORMAT by FORMAT_LA if it's followed by JSON */
+			switch (next_token)
+			{
+				case JSON:
+					cur_token = FORMAT_LA;
+					break;
+			}
+			break;
+
 		case NOT:
 			/* Replace NOT by NOT_LA if it's followed by BETWEEN, IN, etc */
 			switch (next_token)
@@ -223,9 +236,6 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 				case TIME:
 				case ORDINALITY:
 					cur_token = WITH_LA;
-					break;
-				case UNIQUE:
-					cur_token = WITH_LA_UNIQUE;
 					break;
 			}
 			break;

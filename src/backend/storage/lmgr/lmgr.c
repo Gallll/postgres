@@ -3,7 +3,7 @@
  * lmgr.c
  *	  POSTGRES lock manager code
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,7 +16,6 @@
 #include "postgres.h"
 
 #include "access/subtrans.h"
-#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "commands/progress.h"
@@ -913,7 +912,7 @@ WaitForLockersMultiple(List *locktags, LOCKMODE lockmode, bool progress)
 	int			done = 0;
 
 	/* Done if no locks to wait for */
-	if (list_length(locktags) == 0)
+	if (locktags == NIL)
 		return;
 
 	/* Collect the transactions we need to wait on */
@@ -947,7 +946,7 @@ WaitForLockersMultiple(List *locktags, LOCKMODE lockmode, bool progress)
 			/* If requested, publish who we're going to wait for. */
 			if (progress)
 			{
-				PGPROC	   *holder = BackendIdGetProc(lockholders->backendId);
+				PGPROC	   *holder = ProcNumberGetProc(lockholders->procNumber);
 
 				if (holder)
 					pgstat_progress_update_param(PROGRESS_WAITFOR_CURRENT_PID,
@@ -1020,6 +1019,44 @@ LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 }
 
 /*
+ *		ConditionalLockDatabaseObject
+ *
+ * As above, but only lock if we can get the lock without blocking.
+ * Returns true iff the lock was acquired.
+ */
+bool
+ConditionalLockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
+							  LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
+	LockAcquireResult res;
+
+	SET_LOCKTAG_OBJECT(tag,
+					   MyDatabaseId,
+					   classid,
+					   objid,
+					   objsubid);
+
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
+
+	if (res == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+
+	/*
+	 * Now that we have the lock, check for invalidation messages; see notes
+	 * in LockRelationOid.
+	 */
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
+		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
+
+	return true;
+}
+
+/*
  *		UnlockDatabaseObject
  */
 void
@@ -1058,6 +1095,44 @@ LockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 
 	/* Make sure syscaches are up-to-date with any changes we waited for */
 	AcceptInvalidationMessages();
+}
+
+/*
+ *		ConditionalLockSharedObject
+ *
+ * As above, but only lock if we can get the lock without blocking.
+ * Returns true iff the lock was acquired.
+ */
+bool
+ConditionalLockSharedObject(Oid classid, Oid objid, uint16 objsubid,
+							LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
+	LockAcquireResult res;
+
+	SET_LOCKTAG_OBJECT(tag,
+					   InvalidOid,
+					   classid,
+					   objid,
+					   objsubid);
+
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
+
+	if (res == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+
+	/*
+	 * Now that we have the lock, check for invalidation messages; see notes
+	 * in LockRelationOid.
+	 */
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
+		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
+
+	return true;
 }
 
 /*
@@ -1117,6 +1192,45 @@ UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 	LockRelease(&tag, lockmode, true);
 }
 
+/*
+ *		LockApplyTransactionForSession
+ *
+ * Obtain a session-level lock on a transaction being applied on a logical
+ * replication subscriber. See LockRelationIdForSession for notes about
+ * session-level locks.
+ */
+void
+LockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
+							   LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_APPLY_TRANSACTION(tag,
+								  MyDatabaseId,
+								  suboid,
+								  xid,
+								  objid);
+
+	(void) LockAcquire(&tag, lockmode, true, false);
+}
+
+/*
+ *		UnlockApplyTransactionForSession
+ */
+void
+UnlockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
+								 LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_APPLY_TRANSACTION(tag,
+								  MyDatabaseId,
+								  suboid,
+								  xid,
+								  objid);
+
+	LockRelease(&tag, lockmode, true);
+}
 
 /*
  * Append a description of a lockable object to buf.
@@ -1201,6 +1315,13 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field3,
 							 tag->locktag_field4);
+			break;
+		case LOCKTAG_APPLY_TRANSACTION:
+			appendStringInfo(buf,
+							 _("remote transaction %u of subscription %u of database %u"),
+							 tag->locktag_field3,
+							 tag->locktag_field2,
+							 tag->locktag_field1);
 			break;
 		default:
 			appendStringInfo(buf,

@@ -137,10 +137,18 @@ alter table tenk2 reset (parallel_workers);
 -- test parallel index scans.
 set enable_seqscan to off;
 set enable_bitmapscan to off;
+set random_page_cost = 2;
 
 explain (costs off)
 	select  count((unique1)) from tenk1 where hundred > 1;
 select  count((unique1)) from tenk1 where hundred > 1;
+
+-- Parallel ScalarArrayOp index scan
+explain (costs off)
+  select count((unique1)) from tenk1
+  where hundred = any ((select array_agg(i) from generate_series(1, 100, 15) i)::int[]);
+select count((unique1)) from tenk1
+where hundred = any ((select array_agg(i) from generate_series(1, 100, 15) i)::int[]);
 
 -- test parallel index-only scans.
 explain (costs off)
@@ -343,8 +351,34 @@ select string4 from tenk1 order by string4 limit 5;
 reset parallel_leader_participation;
 reset max_parallel_workers;
 
+create function parallel_safe_volatile(a int) returns int as
+  $$ begin return a; end; $$ parallel safe volatile language plpgsql;
+
+-- Test gather merge atop of a sort of a partial path
+explain (costs off)
+select * from tenk1 where four = 2
+order by four, hundred, parallel_safe_volatile(thousand);
+
+-- Test gather merge atop of an incremental sort a of partial path
+set min_parallel_index_scan_size = 0;
+set enable_seqscan = off;
+
+explain (costs off)
+select * from tenk1 where four = 2
+order by four, hundred, parallel_safe_volatile(thousand);
+
+reset min_parallel_index_scan_size;
+reset enable_seqscan;
+
+-- Test GROUP BY with a gather merge path atop of a sort of a partial path
+explain (costs off)
+select count(*) from tenk1
+group by twenty, parallel_safe_volatile(two);
+
+drop function parallel_safe_volatile(int);
+
 SAVEPOINT settings;
-SET LOCAL force_parallel_mode = 1;
+SET LOCAL debug_parallel_query = 1;
 explain (costs off)
   select stringu1::int2 from tenk1 where unique1 = 1;
 ROLLBACK TO SAVEPOINT settings;
@@ -364,7 +398,7 @@ BEGIN
 END;
 $$;
 SAVEPOINT settings;
-SET LOCAL force_parallel_mode = 1;
+SET LOCAL debug_parallel_query = 1;
 SELECT make_record(x) FROM (SELECT generate_series(1, 5) x) ss ORDER BY x;
 ROLLBACK TO SAVEPOINT settings;
 DROP function make_record(n int);
@@ -375,9 +409,9 @@ create role regress_parallel_worker;
 set role regress_parallel_worker;
 reset session authorization;
 drop role regress_parallel_worker;
-set force_parallel_mode = 1;
+set debug_parallel_query = 1;
 select count(*) from tenk1;
-reset force_parallel_mode;
+reset debug_parallel_query;
 reset role;
 
 -- Window function calculation can't be pushed to workers.
@@ -393,14 +427,14 @@ explain (costs off)
 
 -- to increase the parallel query test coverage
 SAVEPOINT settings;
-SET LOCAL force_parallel_mode = 1;
+SET LOCAL debug_parallel_query = 1;
 EXPLAIN (analyze, timing off, summary off, costs off) SELECT * FROM tenk1;
 ROLLBACK TO SAVEPOINT settings;
 
 -- provoke error in worker
 -- (make the error message long enough to require multiple bufferloads)
 SAVEPOINT settings;
-SET LOCAL force_parallel_mode = 1;
+SET LOCAL debug_parallel_query = 1;
 select (stringu1 || repeat('abcd', 5000))::int2 from tenk1 where unique1 = 1;
 ROLLBACK TO SAVEPOINT settings;
 
@@ -432,6 +466,12 @@ ORDER BY 1, 2, 3;
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT generate_series(1, two), array(select generate_series(1, two))
   FROM tenk1 ORDER BY tenthous;
+
+-- must disallow pushing sort below gather when pathkey contains an SRF
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT unnest(ARRAY[]::integer[]) + 1 AS pathkey
+  FROM tenk1 t1 JOIN tenk1 t2 ON TRUE
+  ORDER BY pathkey;
 
 -- test passing expanded-value representations to workers
 CREATE FUNCTION make_some_array(int,int) returns int[] as

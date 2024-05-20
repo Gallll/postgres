@@ -66,7 +66,7 @@ select explain_filter('explain (analyze) select * from int8_tbl i8');
 select explain_filter('explain (analyze, verbose) select * from int8_tbl i8');
 select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
 select explain_filter('explain (analyze, buffers, format xml) select * from int8_tbl i8');
-select explain_filter('explain (analyze, buffers, format yaml) select * from int8_tbl i8');
+select explain_filter('explain (analyze, serialize, buffers, format yaml) select * from int8_tbl i8');
 select explain_filter('explain (buffers, format text) select * from int8_tbl i8');
 select explain_filter('explain (buffers, format json) select * from int8_tbl i8');
 
@@ -87,6 +87,40 @@ select true as "OK"
   where ln ~ '^ *Settings: .*plan_cache_mode = ''force_generic_plan''';
 select explain_filter_to_json('explain (settings, format json) select * from int8_tbl i8') #> '{0,Settings,plan_cache_mode}';
 rollback;
+
+-- GENERIC_PLAN option
+
+select explain_filter('explain (generic_plan) select unique1 from tenk1 where thousand = $1');
+-- should fail
+select explain_filter('explain (analyze, generic_plan) select unique1 from tenk1 where thousand = $1');
+
+-- MEMORY option
+select explain_filter('explain (memory) select * from int8_tbl i8');
+select explain_filter('explain (memory, analyze) select * from int8_tbl i8');
+select explain_filter('explain (memory, summary, format yaml) select * from int8_tbl i8');
+select explain_filter('explain (memory, analyze, format json) select * from int8_tbl i8');
+prepare int8_query as select * from int8_tbl i8;
+select explain_filter('explain (memory) execute int8_query');
+
+-- Test EXPLAIN (GENERIC_PLAN) with partition pruning
+-- partitions should be pruned at plan time, based on constants,
+-- but there should be no pruning based on parameter placeholders
+create table gen_part (
+  key1 integer not null,
+  key2 integer not null
+) partition by list (key1);
+create table gen_part_1
+  partition of gen_part for values in (1)
+  partition by range (key2);
+create table gen_part_1_1
+  partition of gen_part_1 for values from (1) to (2);
+create table gen_part_1_2
+  partition of gen_part_1 for values from (2) to (3);
+create table gen_part_2
+  partition of gen_part for values in (2);
+-- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
+select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
+drop table gen_part;
 
 --
 -- Test production of per-worker data
@@ -128,3 +162,10 @@ select explain_filter('explain (verbose) select * from t1 where pg_temp.mysin(f1
 -- Test compute_query_id
 set compute_query_id = on;
 select explain_filter('explain (verbose) select * from int8_tbl i8');
+
+-- Test SERIALIZE option
+select explain_filter('explain (analyze,serialize) select * from int8_tbl i8');
+select explain_filter('explain (analyze,serialize text,buffers,timing off) select * from int8_tbl i8');
+select explain_filter('explain (analyze,serialize binary,buffers,timing) select * from int8_tbl i8');
+-- this tests an edge case where we have no data to return
+select explain_filter('explain (analyze,serialize) create temp table explain_temp as select * from int8_tbl i8');

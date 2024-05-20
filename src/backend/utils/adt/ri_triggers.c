@@ -14,7 +14,7 @@
  *	plan --- consider improving this someday.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/ri_triggers.c
  *
@@ -30,8 +30,6 @@
 #include "access/xact.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_operator.h"
-#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -39,7 +37,6 @@
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
-#include "storage/bufmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -176,8 +173,7 @@ typedef struct RI_CompareHashEntry
 static HTAB *ri_constraint_cache = NULL;
 static HTAB *ri_query_cache = NULL;
 static HTAB *ri_compare_cache = NULL;
-static dlist_head ri_constraint_cache_valid_list;
-static int	ri_constraint_cache_valid_count = 0;
+static dclist_head ri_constraint_cache_valid_list;
 
 
 /*
@@ -196,7 +192,7 @@ static void ri_GenerateQual(StringInfo buf,
 							Oid opoid,
 							const char *rightop, Oid rightoptype);
 static void ri_GenerateQualCollation(StringInfo buf, Oid collation);
-static int	ri_NullCheck(TupleDesc tupdesc, TupleTableSlot *slot,
+static int	ri_NullCheck(TupleDesc tupDesc, TupleTableSlot *slot,
 						 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
 static void ri_BuildQueryKey(RI_QueryKey *key,
 							 const RI_ConstraintInfo *riinfo,
@@ -1264,9 +1260,6 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 {
 	const RI_ConstraintInfo *riinfo;
 	int			ri_nullcheck;
-	Datum		xminDatum;
-	TransactionId xmin;
-	bool		isnull;
 
 	/*
 	 * AfterTriggerSaveEvent() handles things such that this function is never
@@ -1334,10 +1327,7 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 	 * this if we knew the INSERT trigger already fired, but there is no easy
 	 * way to know that.)
 	 */
-	xminDatum = slot_getsysattr(oldslot, MinTransactionIdAttributeNumber, &isnull);
-	Assert(!isnull);
-	xmin = DatumGetTransactionId(xminDatum);
-	if (TransactionIdIsCurrentTransactionId(xmin))
+	if (slot_is_current_xact_tuple(oldslot))
 		return true;
 
 	/* If all old and new key values are equal, no check is needed */
@@ -1374,8 +1364,11 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
 	char		pkattname[MAX_QUOTED_NAME_LEN + 3];
 	char		fkattname[MAX_QUOTED_NAME_LEN + 3];
-	RangeTblEntry *pkrte;
-	RangeTblEntry *fkrte;
+	RangeTblEntry *rte;
+	RTEPermissionInfo *pk_perminfo;
+	RTEPermissionInfo *fk_perminfo;
+	List	   *rtes = NIL;
+	List	   *perminfos = NIL;
 	const char *sep;
 	const char *fk_only;
 	const char *pk_only;
@@ -1393,32 +1386,42 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 *
 	 * XXX are there any other show-stopper conditions to check?
 	 */
-	pkrte = makeNode(RangeTblEntry);
-	pkrte->rtekind = RTE_RELATION;
-	pkrte->relid = RelationGetRelid(pk_rel);
-	pkrte->relkind = pk_rel->rd_rel->relkind;
-	pkrte->rellockmode = AccessShareLock;
-	pkrte->requiredPerms = ACL_SELECT;
+	pk_perminfo = makeNode(RTEPermissionInfo);
+	pk_perminfo->relid = RelationGetRelid(pk_rel);
+	pk_perminfo->requiredPerms = ACL_SELECT;
+	perminfos = lappend(perminfos, pk_perminfo);
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(pk_rel);
+	rte->relkind = pk_rel->rd_rel->relkind;
+	rte->rellockmode = AccessShareLock;
+	rte->perminfoindex = list_length(perminfos);
+	rtes = lappend(rtes, rte);
 
-	fkrte = makeNode(RangeTblEntry);
-	fkrte->rtekind = RTE_RELATION;
-	fkrte->relid = RelationGetRelid(fk_rel);
-	fkrte->relkind = fk_rel->rd_rel->relkind;
-	fkrte->rellockmode = AccessShareLock;
-	fkrte->requiredPerms = ACL_SELECT;
+	fk_perminfo = makeNode(RTEPermissionInfo);
+	fk_perminfo->relid = RelationGetRelid(fk_rel);
+	fk_perminfo->requiredPerms = ACL_SELECT;
+	perminfos = lappend(perminfos, fk_perminfo);
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(fk_rel);
+	rte->relkind = fk_rel->rd_rel->relkind;
+	rte->rellockmode = AccessShareLock;
+	rte->perminfoindex = list_length(perminfos);
+	rtes = lappend(rtes, rte);
 
 	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		int			attno;
 
 		attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
-		pkrte->selectedCols = bms_add_member(pkrte->selectedCols, attno);
+		pk_perminfo->selectedCols = bms_add_member(pk_perminfo->selectedCols, attno);
 
 		attno = riinfo->fk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
-		fkrte->selectedCols = bms_add_member(fkrte->selectedCols, attno);
+		fk_perminfo->selectedCols = bms_add_member(fk_perminfo->selectedCols, attno);
 	}
 
-	if (!ExecCheckRTPerms(list_make2(fkrte, pkrte), false))
+	if (!ExecCheckPermissions(rtes, perminfos, false))
 		return false;
 
 	/*
@@ -1428,9 +1431,11 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 */
 	if (!has_bypassrls_privilege(GetUserId()) &&
 		((pk_rel->rd_rel->relrowsecurity &&
-		  !pg_class_ownercheck(pkrte->relid, GetUserId())) ||
+		  !object_ownercheck(RelationRelationId, RelationGetRelid(pk_rel),
+							 GetUserId())) ||
 		 (fk_rel->rd_rel->relrowsecurity &&
-		  !pg_class_ownercheck(fkrte->relid, GetUserId()))))
+		  !object_ownercheck(RelationRelationId, RelationGetRelid(fk_rel),
+							 GetUserId()))))
 		return false;
 
 	/*----------
@@ -2121,7 +2126,7 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	 * Find or create a hash entry.  If we find a valid one, just return it.
 	 */
 	riinfo = (RI_ConstraintInfo *) hash_search(ri_constraint_cache,
-											   (void *) &constraintOid,
+											   &constraintOid,
 											   HASH_ENTER, &found);
 	if (!found)
 		riinfo->valid = false;
@@ -2172,10 +2177,9 @@ ri_LoadConstraintInfo(Oid constraintOid)
 
 	/*
 	 * For efficient processing of invalidation messages below, we keep a
-	 * doubly-linked list, and a count, of all currently valid entries.
+	 * doubly-linked count list of all currently valid entries.
 	 */
-	dlist_push_tail(&ri_constraint_cache_valid_list, &riinfo->valid_link);
-	ri_constraint_cache_valid_count++;
+	dclist_push_tail(&ri_constraint_cache_valid_list, &riinfo->valid_link);
 
 	riinfo->valid = true;
 
@@ -2233,13 +2237,13 @@ InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 	 * O(N^2) behavior in situations where a session touches many foreign keys
 	 * and also does many ALTER TABLEs, such as a restore from pg_dump.
 	 */
-	if (ri_constraint_cache_valid_count > 1000)
+	if (dclist_count(&ri_constraint_cache_valid_list) > 1000)
 		hashvalue = 0;			/* pretend it's a cache reset */
 
-	dlist_foreach_modify(iter, &ri_constraint_cache_valid_list)
+	dclist_foreach_modify(iter, &ri_constraint_cache_valid_list)
 	{
-		RI_ConstraintInfo *riinfo = dlist_container(RI_ConstraintInfo,
-													valid_link, iter.cur);
+		RI_ConstraintInfo *riinfo = dclist_container(RI_ConstraintInfo,
+													 valid_link, iter.cur);
 
 		/*
 		 * We must invalidate not only entries directly matching the given
@@ -2252,8 +2256,7 @@ InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 		{
 			riinfo->valid = false;
 			/* Remove invalidated entries from the list, too */
-			dlist_delete(iter.cur);
-			ri_constraint_cache_valid_count--;
+			dclist_delete_from(&ri_constraint_cache_valid_list, iter.cur);
 		}
 	}
 }
@@ -2718,7 +2721,7 @@ ri_FetchPreparedPlan(RI_QueryKey *key)
 	 * Lookup for the key
 	 */
 	entry = (RI_QueryHashEntry *) hash_search(ri_query_cache,
-											  (void *) key,
+											  key,
 											  HASH_FIND, NULL);
 	if (entry == NULL)
 		return NULL;
@@ -2771,7 +2774,7 @@ ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan)
 	 * invalid by ri_FetchPreparedPlan.
 	 */
 	entry = (RI_QueryHashEntry *) hash_search(ri_query_cache,
-											  (void *) key,
+											  key,
 											  HASH_ENTER, &found);
 	Assert(!found || entry->plan == NULL);
 	entry->plan = plan;
@@ -2921,7 +2924,7 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 	key.eq_opr = eq_opr;
 	key.typeid = typeid;
 	entry = (RI_CompareHashEntry *) hash_search(ri_compare_cache,
-												(void *) &key,
+												&key,
 												HASH_ENTER, &found);
 	if (!found)
 		entry->valid = false;

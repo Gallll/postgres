@@ -3,7 +3,7 @@
  * pg_rewind.h
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
@@ -13,6 +13,7 @@
 
 #include "access/timeline.h"
 #include "common/logging.h"
+#include "common/file_utils.h"
 #include "datapagemap.h"
 #include "libpq-fe.h"
 #include "storage/block.h"
@@ -24,6 +25,7 @@ extern bool showprogress;
 extern bool dry_run;
 extern bool do_sync;
 extern int	WalSegSz;
+extern DataDirSyncMethod sync_method;
 
 /* Target history */
 extern TimeLineHistoryEntry *targetHistory;
@@ -37,7 +39,7 @@ extern uint64 fetch_done;
 extern void extractPageMap(const char *datadir, XLogRecPtr startpoint,
 						   int tliIndex, XLogRecPtr endpoint,
 						   const char *restoreCommand);
-extern void findLastCheckpoint(const char *datadir, XLogRecPtr searchptr,
+extern void findLastCheckpoint(const char *datadir, XLogRecPtr forkptr,
 							   int tliIndex,
 							   XLogRecPtr *lastchkptrec, TimeLineID *lastchkpttli,
 							   XLogRecPtr *lastchkptredo,

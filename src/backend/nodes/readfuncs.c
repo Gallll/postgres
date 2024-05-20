@@ -3,7 +3,7 @@
  * readfuncs.c
  *	  Reader functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -178,12 +178,26 @@
 
 #define strtobool(x)  ((*(x) == 't') ? true : false)
 
-#define nullable_string(token,length)  \
-	((length) == 0 ? NULL : debackslash(token, length))
+static char *
+nullable_string(const char *token, int length)
+{
+	/* outToken emits <> for NULL, and pg_strtok makes that an empty string */
+	if (length == 0)
+		return NULL;
+	/* outToken emits "" for empty string */
+	if (length == 2 && token[0] == '"' && token[1] == '"')
+		return pstrdup("");
+	/* otherwise, we must remove protective backslashes added by outToken */
+	return debackslash(token, length);
+}
 
 
 /*
  * _readBitmapset
+ *
+ * Note: this code is used in contexts where we know that a Bitmapset
+ * is expected.  There is equivalent code in nodeRead() that can read a
+ * Bitmapset when we come across one in other contexts.
  */
 static Bitmapset *
 _readBitmapset(void)
@@ -224,7 +238,8 @@ _readBitmapset(void)
 }
 
 /*
- * for use by extensions which define extensible nodes
+ * We export this function for use by extensions that define extensible nodes.
+ * That's somewhat historical, though, because calling nodeRead() will work.
  */
 Bitmapset *
 readBitmapset(void)
@@ -270,11 +285,11 @@ _readBoolExpr(void)
 	/* do-it-yourself enum representation */
 	token = pg_strtok(&length); /* skip :boolop */
 	token = pg_strtok(&length); /* get field value */
-	if (strncmp(token, "and", 3) == 0)
+	if (length == 3 && strncmp(token, "and", 3) == 0)
 		local_node->boolop = AND_EXPR;
-	else if (strncmp(token, "or", 2) == 0)
+	else if (length == 2 && strncmp(token, "or", 2) == 0)
 		local_node->boolop = OR_EXPR;
-	else if (strncmp(token, "not", 3) == 0)
+	else if (length == 3 && strncmp(token, "not", 3) == 0)
 		local_node->boolop = NOT_EXPR;
 	else
 		elog(ERROR, "unrecognized boolop \"%.*s\"", length, token);
@@ -285,12 +300,54 @@ _readBoolExpr(void)
 	READ_DONE();
 }
 
+static A_Const *
+_readA_Const(void)
+{
+	READ_LOCALS(A_Const);
+
+	/* We expect either NULL or :val here */
+	token = pg_strtok(&length);
+	if (length == 4 && strncmp(token, "NULL", 4) == 0)
+		local_node->isnull = true;
+	else
+	{
+		union ValUnion *tmp = nodeRead(NULL, 0);
+
+		/* To forestall valgrind complaints, copy only the valid data */
+		switch (nodeTag(tmp))
+		{
+			case T_Integer:
+				memcpy(&local_node->val, tmp, sizeof(Integer));
+				break;
+			case T_Float:
+				memcpy(&local_node->val, tmp, sizeof(Float));
+				break;
+			case T_Boolean:
+				memcpy(&local_node->val, tmp, sizeof(Boolean));
+				break;
+			case T_String:
+				memcpy(&local_node->val, tmp, sizeof(String));
+				break;
+			case T_BitString:
+				memcpy(&local_node->val, tmp, sizeof(BitString));
+				break;
+			default:
+				elog(ERROR, "unrecognized node type: %d",
+					 (int) nodeTag(tmp));
+				break;
+		}
+	}
+
+	READ_LOCATION_FIELD(location);
+
+	READ_DONE();
+}
+
 static RangeTblEntry *
 _readRangeTblEntry(void)
 {
 	READ_LOCALS(RangeTblEntry);
 
-	/* put alias + eref first to make dump more legible */
 	READ_NODE_FIELD(alias);
 	READ_NODE_FIELD(eref);
 	READ_ENUM_FIELD(rtekind, RTEKind);
@@ -299,13 +356,21 @@ _readRangeTblEntry(void)
 	{
 		case RTE_RELATION:
 			READ_OID_FIELD(relid);
+			READ_BOOL_FIELD(inh);
 			READ_CHAR_FIELD(relkind);
 			READ_INT_FIELD(rellockmode);
+			READ_UINT_FIELD(perminfoindex);
 			READ_NODE_FIELD(tablesample);
 			break;
 		case RTE_SUBQUERY:
 			READ_NODE_FIELD(subquery);
 			READ_BOOL_FIELD(security_barrier);
+			/* we re-use these RELATION fields, too: */
+			READ_OID_FIELD(relid);
+			READ_BOOL_FIELD(inh);
+			READ_CHAR_FIELD(relkind);
+			READ_INT_FIELD(rellockmode);
+			READ_UINT_FIELD(perminfoindex);
 			break;
 		case RTE_JOIN:
 			READ_ENUM_FIELD(jointype, JoinType);
@@ -348,10 +413,11 @@ _readRangeTblEntry(void)
 		case RTE_NAMEDTUPLESTORE:
 			READ_STRING_FIELD(enrname);
 			READ_FLOAT_FIELD(enrtuples);
-			READ_OID_FIELD(relid);
 			READ_NODE_FIELD(coltypes);
 			READ_NODE_FIELD(coltypmods);
 			READ_NODE_FIELD(colcollations);
+			/* we re-use these RELATION fields, too: */
+			READ_OID_FIELD(relid);
 			break;
 		case RTE_RESULT:
 			/* no extra fields */
@@ -363,15 +429,95 @@ _readRangeTblEntry(void)
 	}
 
 	READ_BOOL_FIELD(lateral);
-	READ_BOOL_FIELD(inh);
 	READ_BOOL_FIELD(inFromCl);
-	READ_UINT_FIELD(requiredPerms);
-	READ_OID_FIELD(checkAsUser);
-	READ_BITMAPSET_FIELD(selectedCols);
-	READ_BITMAPSET_FIELD(insertedCols);
-	READ_BITMAPSET_FIELD(updatedCols);
-	READ_BITMAPSET_FIELD(extraUpdatedCols);
 	READ_NODE_FIELD(securityQuals);
+
+	READ_DONE();
+}
+
+static A_Expr *
+_readA_Expr(void)
+{
+	READ_LOCALS(A_Expr);
+
+	token = pg_strtok(&length);
+
+	if (length == 3 && strncmp(token, "ANY", 3) == 0)
+	{
+		local_node->kind = AEXPR_OP_ANY;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 3 && strncmp(token, "ALL", 3) == 0)
+	{
+		local_node->kind = AEXPR_OP_ALL;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 8 && strncmp(token, "DISTINCT", 8) == 0)
+	{
+		local_node->kind = AEXPR_DISTINCT;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 12 && strncmp(token, "NOT_DISTINCT", 12) == 0)
+	{
+		local_node->kind = AEXPR_NOT_DISTINCT;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 6 && strncmp(token, "NULLIF", 6) == 0)
+	{
+		local_node->kind = AEXPR_NULLIF;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 2 && strncmp(token, "IN", 2) == 0)
+	{
+		local_node->kind = AEXPR_IN;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 4 && strncmp(token, "LIKE", 4) == 0)
+	{
+		local_node->kind = AEXPR_LIKE;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 5 && strncmp(token, "ILIKE", 5) == 0)
+	{
+		local_node->kind = AEXPR_ILIKE;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 7 && strncmp(token, "SIMILAR", 7) == 0)
+	{
+		local_node->kind = AEXPR_SIMILAR;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 7 && strncmp(token, "BETWEEN", 7) == 0)
+	{
+		local_node->kind = AEXPR_BETWEEN;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 11 && strncmp(token, "NOT_BETWEEN", 11) == 0)
+	{
+		local_node->kind = AEXPR_NOT_BETWEEN;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 11 && strncmp(token, "BETWEEN_SYM", 11) == 0)
+	{
+		local_node->kind = AEXPR_BETWEEN_SYM;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 15 && strncmp(token, "NOT_BETWEEN_SYM", 15) == 0)
+	{
+		local_node->kind = AEXPR_NOT_BETWEEN_SYM;
+		READ_NODE_FIELD(name);
+	}
+	else if (length == 5 && strncmp(token, ":name", 5) == 0)
+	{
+		local_node->kind = AEXPR_OP;
+		local_node->name = nodeRead(NULL, 0);
+	}
+	else
+		elog(ERROR, "unrecognized A_Expr kind: \"%.*s\"", length, token);
+
+	READ_NODE_FIELD(lexpr);
+	READ_NODE_FIELD(rexpr);
+	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
 }
@@ -415,8 +561,6 @@ _readExtensibleNode(void)
 Node *
 parseNodeString(void)
 {
-	void	   *return_value;
-
 	READ_TEMP_LOCALS();
 
 	/* Guard against stack overflow due to overly complex expressions */
@@ -427,16 +571,10 @@ parseNodeString(void)
 #define MATCH(tokname, namelen) \
 	(length == namelen && memcmp(token, tokname, namelen) == 0)
 
-	if (false)
-		;
 #include "readfuncs.switch.c"
-	else
-	{
-		elog(ERROR, "badly formatted node string \"%.32s\"...", token);
-		return_value = NULL;	/* keep compiler quiet */
-	}
 
-	return (Node *) return_value;
+	elog(ERROR, "badly formatted node string \"%.32s\"...", token);
+	return NULL;				/* keep compiler quiet */
 }
 
 

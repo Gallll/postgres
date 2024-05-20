@@ -3,7 +3,7 @@
  * partdesc.c
  *		Support routines for manipulating partition descriptors
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,16 +21,14 @@
 #include "catalog/pg_inherits.h"
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
-#include "storage/bufmgr.h"
-#include "storage/sinval.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
-#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 typedef struct PartitionDirectoryData
@@ -55,7 +53,7 @@ static PartitionDesc RelationBuildPartitionDesc(Relation rel,
  * RelationGetPartitionDesc -- get partition descriptor, if relation is partitioned
  *
  * We keep two partdescs in relcache: rd_partdesc includes all partitions
- * (even those being concurrently marked detached), while rd_partdesc_nodetach
+ * (even those being concurrently marked detached), while rd_partdesc_nodetached
  * omits (some of) those.  We store the pg_inherits.xmin value for the latter,
  * to determine whether it can be validly reused in each case, since that
  * depends on the active snapshot.
@@ -183,7 +181,7 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 		PartitionBoundSpec *boundspec = NULL;
 
 		/* Try fetching the tuple from the catcache, for speed. */
-		tuple = SearchSysCache1(RELOID, inhrelid);
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(inhrelid));
 		if (HeapTupleIsValid(tuple))
 		{
 			Datum		datum;
@@ -290,6 +288,12 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 	{
 		oldcxt = MemoryContextSwitchTo(new_pdcxt);
 		partdesc->boundinfo = partition_bounds_copy(boundinfo, key);
+
+		/* Initialize caching fields for speeding up ExecFindPartition */
+		partdesc->last_found_datum_index = -1;
+		partdesc->last_found_part_index = -1;
+		partdesc->last_found_count = 0;
+
 		partdesc->oids = (Oid *) palloc(nparts * sizeof(Oid));
 		partdesc->is_leaf = (bool *) palloc(nparts * sizeof(bool));
 

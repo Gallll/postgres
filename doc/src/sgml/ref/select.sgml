@@ -45,7 +45,7 @@ SELECT [ ALL | DISTINCT [ ON ( <replaceable class="parameter">expression</replac
     [ LIMIT { <replaceable class="parameter">count</replaceable> | ALL } ]
     [ OFFSET <replaceable class="parameter">start</replaceable> [ ROW | ROWS ] ]
     [ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } { ONLY | WITH TIES } ]
-    [ FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } [ OF <replaceable class="parameter">table_name</replaceable> [, ...] ] [ NOWAIT | SKIP LOCKED ] [...] ]
+    [ FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } [ OF <replaceable class="parameter">from_reference</replaceable> [, ...] ] [ NOWAIT | SKIP LOCKED ] [...] ]
 
 <phrase>where <replaceable class="parameter">from_item</replaceable> can be one of:</phrase>
 
@@ -59,7 +59,9 @@ SELECT [ ALL | DISTINCT [ ON ( <replaceable class="parameter">expression</replac
     [ LATERAL ] <replaceable class="parameter">function_name</replaceable> ( [ <replaceable class="parameter">argument</replaceable> [, ...] ] ) AS ( <replaceable class="parameter">column_definition</replaceable> [, ...] )
     [ LATERAL ] ROWS FROM( <replaceable class="parameter">function_name</replaceable> ( [ <replaceable class="parameter">argument</replaceable> [, ...] ] ) [ AS ( <replaceable class="parameter">column_definition</replaceable> [, ...] ) ] [, ...] )
                 [ WITH ORDINALITY ] [ [ AS ] <replaceable class="parameter">alias</replaceable> [ ( <replaceable class="parameter">column_alias</replaceable> [, ...] ) ] ]
-    <replaceable class="parameter">from_item</replaceable> [ NATURAL ] <replaceable class="parameter">join_type</replaceable> <replaceable class="parameter">from_item</replaceable> [ ON <replaceable class="parameter">join_condition</replaceable> | USING ( <replaceable class="parameter">join_column</replaceable> [, ...] ) [ AS <replaceable class="parameter">join_using_alias</replaceable> ] ]
+    <replaceable class="parameter">from_item</replaceable> <replaceable class="parameter">join_type</replaceable> <replaceable class="parameter">from_item</replaceable> { ON <replaceable class="parameter">join_condition</replaceable> | USING ( <replaceable class="parameter">join_column</replaceable> [, ...] ) [ AS <replaceable class="parameter">join_using_alias</replaceable> ] }
+    <replaceable class="parameter">from_item</replaceable> NATURAL <replaceable class="parameter">join_type</replaceable> <replaceable class="parameter">from_item</replaceable>
+    <replaceable class="parameter">from_item</replaceable> CROSS JOIN <replaceable class="parameter">from_item</replaceable>
 
 <phrase>and <replaceable class="parameter">grouping_element</replaceable> can be one of:</phrase>
 
@@ -72,7 +74,7 @@ SELECT [ ALL | DISTINCT [ ON ( <replaceable class="parameter">expression</replac
 
 <phrase>and <replaceable class="parameter">with_query</replaceable> is:</phrase>
 
-    <replaceable class="parameter">with_query_name</replaceable> [ ( <replaceable class="parameter">column_name</replaceable> [, ...] ) ] AS [ [ NOT ] MATERIALIZED ] ( <replaceable class="parameter">select</replaceable> | <replaceable class="parameter">values</replaceable> | <replaceable class="parameter">insert</replaceable> | <replaceable class="parameter">update</replaceable> | <replaceable class="parameter">delete</replaceable> )
+    <replaceable class="parameter">with_query_name</replaceable> [ ( <replaceable class="parameter">column_name</replaceable> [, ...] ) ] AS [ [ NOT ] MATERIALIZED ] ( <replaceable class="parameter">select</replaceable> | <replaceable class="parameter">values</replaceable> | <replaceable class="parameter">insert</replaceable> | <replaceable class="parameter">update</replaceable> | <replaceable class="parameter">delete</replaceable> | <replaceable class="parameter">merge</replaceable> )
         [ SEARCH { BREADTH | DEPTH } FIRST BY <replaceable>column_name</replaceable> [, ...] SET <replaceable>search_seq_col_name</replaceable> ]
         [ CYCLE <replaceable>column_name</replaceable> [, ...] SET <replaceable>cycle_mark_col_name</replaceable> [ TO <replaceable>cycle_mark_value</replaceable> DEFAULT <replaceable>cycle_mark_default</replaceable> ] USING <replaceable>cycle_path_col_name</replaceable> ]
 
@@ -129,6 +131,9 @@ TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ]
       eliminates groups that do not satisfy the given condition.  (See
       <xref linkend="sql-groupby"/> and
       <xref linkend="sql-having"/> below.)
+      Although query output columns are nominally computed in the next
+      step, they can also be referenced (by name or ordinal number)
+      in the <literal>GROUP BY</literal> clause.
      </para>
     </listitem>
 
@@ -225,10 +230,10 @@ TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ]
     The subqueries effectively act as temporary tables or views
     for the duration of the primary query.
     Each subquery can be a <command>SELECT</command>, <command>TABLE</command>, <command>VALUES</command>,
-    <command>INSERT</command>, <command>UPDATE</command> or
-    <command>DELETE</command> statement.
+    <command>INSERT</command>, <command>UPDATE</command>,
+    <command>DELETE</command>, or <command>MERGE</command> statement.
     When writing a data-modifying statement (<command>INSERT</command>,
-    <command>UPDATE</command> or <command>DELETE</command>) in
+    <command>UPDATE</command>, <command>DELETE</command>, or <command>MERGE</command>) in
     <literal>WITH</literal>, it is usual to include a <literal>RETURNING</literal> clause.
     It is the output of <literal>RETURNING</literal>, <emphasis>not</emphasis> the underlying
     table that the statement modifies, that forms the temporary table that is
@@ -600,19 +605,15 @@ TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ]
          <listitem>
           <para><literal>FULL [ OUTER ] JOIN</literal></para>
          </listitem>
-         <listitem>
-          <para><literal>CROSS JOIN</literal></para>
-         </listitem>
         </itemizedlist>
 
         For the <literal>INNER</literal> and <literal>OUTER</literal> join types, a
         join condition must be specified, namely exactly one of
-        <literal>NATURAL</literal>, <literal>ON <replaceable
-        class="parameter">join_condition</replaceable></literal>, or
+        <literal>ON <replaceable
+        class="parameter">join_condition</replaceable></literal>,
         <literal>USING (<replaceable
-        class="parameter">join_column</replaceable> [, ...])</literal>.
-        See below for the meaning.  For <literal>CROSS JOIN</literal>,
-        none of these clauses can appear.
+        class="parameter">join_column</replaceable> [, ...])</literal>,
+        or <literal>NATURAL</literal>.  See below for the meaning.
        </para>
 
        <para>
@@ -623,17 +624,9 @@ TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ]
         In the absence of parentheses, <literal>JOIN</literal>s nest
         left-to-right.  In any case <literal>JOIN</literal> binds more
         tightly than the commas separating <literal>FROM</literal>-list items.
-       </para>
-
-       <para><literal>CROSS JOIN</literal> and <literal>INNER JOIN</literal>
-        produce a simple Cartesian product, the same result as you get from
-        listing the two tables at the top level of <literal>FROM</literal>,
-        but restricted by the join condition (if any).
-        <literal>CROSS JOIN</literal> is equivalent to <literal>INNER JOIN ON
-        (TRUE)</literal>, that is, no rows are removed by qualification.
-        These join types are just a notational convenience, since they
-        do nothing you couldn't do with plain <literal>FROM</literal> and
-        <literal>WHERE</literal>.
+        All the <literal>JOIN</literal> options are just a notational
+        convenience, since they do nothing you couldn't do with plain
+        <literal>FROM</literal> and <literal>WHERE</literal>.
        </para>
 
        <para><literal>LEFT OUTER JOIN</literal> returns all rows in the qualified
@@ -710,6 +703,19 @@ TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ]
         tables that have matching names.  If there are no common
         column names, <literal>NATURAL</literal> is equivalent
         to <literal>ON TRUE</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>CROSS JOIN</literal></term>
+      <listitem>
+       <para>
+        <literal>CROSS JOIN</literal> is equivalent to <literal>INNER JOIN ON
+        (TRUE)</literal>, that is, no rows are removed by qualification.
+        They produce a simple Cartesian product, the same result as you get from
+        listing the two tables at the top level of <literal>FROM</literal>,
+        but restricted by the join condition (if any).
        </para>
       </listitem>
      </varlistentry>
@@ -1571,7 +1577,7 @@ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { 
     The locking clause has the general form
 
 <synopsis>
-FOR <replaceable>lock_strength</replaceable> [ OF <replaceable class="parameter">table_name</replaceable> [, ...] ] [ NOWAIT | SKIP LOCKED ]
+FOR <replaceable>lock_strength</replaceable> [ OF <replaceable class="parameter">from_reference</replaceable> [, ...] ] [ NOWAIT | SKIP LOCKED ]
 </synopsis>
 
     where <replaceable>lock_strength</replaceable> can be one of
@@ -1585,8 +1591,11 @@ KEY SHARE
    </para>
 
    <para>
-    For more information on each row-level lock mode, refer to
-    <xref linkend="locking-rows"/>.
+    <replaceable class="parameter">from_reference</replaceable> must be a
+    table <replaceable class="parameter">alias</replaceable> or non-hidden
+    <replaceable class="parameter">table_name</replaceable> referenced
+    in the <literal>FROM</literal> clause.  For more information on each
+    row-level lock mode, refer to <xref linkend="locking-rows"/>.
    </para>
 
    <para>
@@ -1754,8 +1763,7 @@ SELECT * FROM <replaceable class="parameter">name</replaceable>
 
 <programlisting>
 SELECT f.title, f.did, d.name, f.date_prod, f.kind
-    FROM distributors d, films f
-    WHERE f.did = d.did
+    FROM distributors d JOIN films f USING (did);
 
        title       | did |     name     | date_prod  |   kind
 -------------------+-----+--------------+------------+----------
@@ -1913,8 +1921,7 @@ WITH t AS (
   )
 SELECT * FROM t
 UNION ALL
-SELECT * FROM t
-
+SELECT * FROM t;
          x
 --------------------
   0.534150459803641
@@ -2042,7 +2049,7 @@ SELECT 2+2;
   </refsect2>
 
   <refsect2>
-   <title>Omitting sub-<command>SELECT</command> aliases in <literal>FROM</literal></title>
+   <title>Omitting Sub-<command>SELECT</command> Aliases in <literal>FROM</literal></title>
 
    <para>
     According to the SQL standard, a sub-<command>SELECT</command> in the
@@ -2177,7 +2184,8 @@ SELECT 2+2;
 
    <para>
     <productname>PostgreSQL</productname> allows <command>INSERT</command>,
-    <command>UPDATE</command>, and <command>DELETE</command> to be used as <literal>WITH</literal>
+    <command>UPDATE</command>, <command>DELETE</command>, and
+    <command>MERGE</command> to be used as <literal>WITH</literal>
     queries.  This is not found in the SQL standard.
    </para>
   </refsect2>

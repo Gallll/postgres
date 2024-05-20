@@ -1,19 +1,12 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Test generic xlog record work for bloom index replication.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-
-if (PostgreSQL::Test::Utils::has_wal_read_bug)
-{
-	# We'd prefer to use Test::More->builder->todo_start, but the bug causes
-	# this test file to die(), not merely to fail.
-	plan skip_all => 'filesystem bug';
-}
 
 my $node_primary;
 my $node_standby;
@@ -66,7 +59,7 @@ $node_standby->start;
 $node_primary->safe_psql("postgres", "CREATE EXTENSION bloom;");
 $node_primary->safe_psql("postgres", "CREATE TABLE tst (i int4, t text);");
 $node_primary->safe_psql("postgres",
-	"INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,100000) i;"
+	"INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,10000) i;"
 );
 $node_primary->safe_psql("postgres",
 	"CREATE INDEX bloomidx ON tst USING bloom (i, t) WITH (col1 = 3);");
@@ -83,7 +76,7 @@ for my $i (1 .. 10)
 	test_index_replay("vacuum $i");
 	my ($start, $end) = (100001 + ($i - 1) * 10000, 100000 + $i * 10000);
 	$node_primary->safe_psql("postgres",
-		"INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series($start,$end) i;"
+		"INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series($start,$end) i;"
 	);
 	test_index_replay("insert $i");
 }

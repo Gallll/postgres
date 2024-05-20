@@ -49,7 +49,7 @@
  * we calculate operands first.  Then we check that results are numeric
  * singleton lists, calculate the result and pass it to the next path item.
  *
- * Copyright (c) 2019-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_exec.c
@@ -63,23 +63,19 @@
 #include "catalog/pg_type.h"
 #include "executor/execExpr.h"
 #include "funcapi.h"
-#include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "regex/regex.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
-#include "utils/datum.h"
 #include "utils/float.h"
 #include "utils/formatting.h"
-#include "utils/guc.h"
-#include "utils/json.h"
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
-#include "utils/varlena.h"
 
 /*
  * Represents "base object" and it's "id" for .keyvalue() evaluation.
@@ -90,8 +86,10 @@ typedef struct JsonBaseObjectInfo
 	int			id;
 } JsonBaseObjectInfo;
 
-typedef int (*JsonPathVarCallback) (void *vars, char *varName, int varNameLen,
-									JsonbValue *val, JsonbValue *baseObject);
+/* Callbacks for executeJsonPath() */
+typedef JsonbValue *(*JsonPathGetVarCallback) (void *vars, char *varName, int varNameLen,
+											   JsonbValue *baseObject, int *baseObjectId);
+typedef int (*JsonPathCountVarsCallback) (void *vars);
 
 /*
  * Context of jsonpath execution.
@@ -99,7 +97,8 @@ typedef int (*JsonPathVarCallback) (void *vars, char *varName, int varNameLen,
 typedef struct JsonPathExecContext
 {
 	void	   *vars;			/* variables to substitute into jsonpath */
-	JsonPathVarCallback getVar;
+	JsonPathGetVarCallback getVar;	/* callback to extract a given variable
+									 * from 'vars' */
 	JsonbValue *root;			/* for $ evaluation */
 	JsonbValue *current;		/* for @ evaluation */
 	JsonBaseObjectInfo baseObject;	/* "base object" for .keyvalue()
@@ -160,60 +159,82 @@ typedef struct JsonValueListIterator
 } JsonValueListIterator;
 
 /* Structures for JSON_TABLE execution  */
-typedef struct JsonTableScanState JsonTableScanState;
-typedef struct JsonTableJoinState JsonTableJoinState;
 
-struct JsonTableScanState
+/*
+ * Struct holding the result of jsonpath evaluation, to be used as source row
+ * for JsonTableGetValue() which in turn computes the values of individual
+ * JSON_TABLE columns.
+ */
+typedef struct JsonTablePlanRowSource
 {
-	JsonTableScanState *parent;
-	JsonTableJoinState *nested;
-	MemoryContext mcxt;
+	Datum		value;
+	bool		isnull;
+} JsonTablePlanRowSource;
+
+/*
+ * State of evaluation of row pattern derived by applying jsonpath given in
+ * a JsonTablePlan to an input document given in the parent TableFunc.
+ */
+typedef struct JsonTablePlanState
+{
+	/* Original plan */
+	JsonTablePlan *plan;
+
+	/* The following fields are only valid for JsonTablePathScan plans */
+
+	/* jsonpath to evaluate against the input doc to get the row pattern */
 	JsonPath   *path;
+
+	/*
+	 * Memory context to use when evaluating the row pattern from the jsonpath
+	 */
+	MemoryContext mcxt;
+
+	/* PASSING arguments passed to jsonpath executor */
 	List	   *args;
+
+	/* List and iterator of jsonpath result values */
 	JsonValueList found;
 	JsonValueListIterator iter;
-	Datum		current;
+
+	/* Currently selected row for JsonTableGetValue() to use */
+	JsonTablePlanRowSource current;
+
+	/* Counter for ORDINAL columns */
 	int			ordinal;
-	bool		currentIsNull;
-	bool		outerJoin;
-	bool		errorOnError;
-	bool		advanceNested;
-	bool		reset;
-};
 
-struct JsonTableJoinState
-{
-	union
-	{
-		struct
-		{
-			JsonTableJoinState *left;
-			JsonTableJoinState *right;
-			bool		cross;
-			bool		advanceRight;
-		}			join;
-		JsonTableScanState scan;
-	}			u;
-	bool		is_join;
-};
+	/* Nested plan, if any */
+	struct JsonTablePlanState *nested;
 
-/* random number to identify JsonTableContext */
-#define JSON_TABLE_CONTEXT_MAGIC	418352867
+	/* Left sibling, if any */
+	struct JsonTablePlanState *left;
 
-typedef struct JsonTableContext
+	/* Right sibling, if any */
+	struct JsonTablePlanState *right;
+
+	/* Parent plan, if this is a nested plan */
+	struct JsonTablePlanState *parent;
+} JsonTablePlanState;
+
+/* Random number to identify JsonTableExecContext for sanity checking */
+#define JSON_TABLE_EXEC_CONTEXT_MAGIC		418352867
+
+typedef struct JsonTableExecContext
 {
 	int			magic;
-	struct
-	{
-		ExprState  *expr;
-		JsonTableScanState *scan;
-	}		   *colexprs;
-	JsonTableScanState root;
-	bool		empty;
-} JsonTableContext;
+
+	/* State of the plan providing a row evaluated from "root" jsonpath */
+	JsonTablePlanState *rootplanstate;
+
+	/*
+	 * Per-column JsonTablePlanStates for all columns including the nested
+	 * ones.
+	 */
+	JsonTablePlanState **colplanstates;
+} JsonTableExecContext;
 
 /* strict/lax flags is decomposed into four [un]wrap/error flags */
-#define jspStrictAbsenseOfErrors(cxt)	(!(cxt)->laxMode)
+#define jspStrictAbsenceOfErrors(cxt)	(!(cxt)->laxMode)
 #define jspAutoUnwrap(cxt)				((cxt)->laxMode)
 #define jspAutoWrap(cxt)				((cxt)->laxMode)
 #define jspIgnoreStructuralErrors(cxt)	((cxt)->ignoreStructuralErrors)
@@ -235,7 +256,8 @@ typedef JsonPathBool (*JsonPathPredicateCallback) (JsonPathItem *jsp,
 typedef Numeric (*BinaryArithmFunc) (Numeric num1, Numeric num2, bool *error);
 
 static JsonPathExecResult executeJsonPath(JsonPath *path, void *vars,
-										  JsonPathVarCallback getVar,
+										  JsonPathGetVarCallback getVar,
+										  JsonPathCountVarsCallback countVars,
 										  Jsonb *json, bool throwErrors,
 										  JsonValueList *result, bool useTz);
 static JsonPathExecResult executeItem(JsonPathExecContext *cxt,
@@ -286,11 +308,19 @@ static JsonPathExecResult appendBoolResult(JsonPathExecContext *cxt,
 										   JsonPathItem *jsp, JsonValueList *found, JsonPathBool res);
 static void getJsonPathItem(JsonPathExecContext *cxt, JsonPathItem *item,
 							JsonbValue *value);
+static JsonbValue *GetJsonPathVar(void *cxt, char *varName, int varNameLen,
+								  JsonbValue *baseObject, int *baseObjectId);
+static int	CountJsonPathVars(void *cxt);
+static void JsonItemFromDatum(Datum val, Oid typid, int32 typmod,
+							  JsonbValue *res);
+static void JsonbValueInitNumericDatum(JsonbValue *jbv, Datum num);
 static void getJsonPathVariable(JsonPathExecContext *cxt,
 								JsonPathItem *variable, JsonbValue *value);
-static int	getJsonPathVariableFromJsonb(void *varsJsonb, char *varName,
-										 int varNameLen, JsonbValue *val,
-										 JsonbValue *baseObject);
+static int	countVariablesFromJsonb(void *varsJsonb);
+static JsonbValue *getJsonPathVariableFromJsonb(void *varsJsonb, char *varName,
+												int varNameLen,
+												JsonbValue *baseObject,
+												int *baseObjectId);
 static int	JsonbArraySize(JsonbValue *jb);
 static JsonPathBool executeComparison(JsonPathItem *cmp, JsonbValue *lv,
 									  JsonbValue *rv, void *p);
@@ -318,13 +348,38 @@ static int	JsonbType(JsonbValue *jb);
 static JsonbValue *getScalar(JsonbValue *scalar, enum jbvType type);
 static JsonbValue *wrapItemsInArray(const JsonValueList *items);
 static int	compareDatetime(Datum val1, Oid typid1, Datum val2, Oid typid2,
-							bool useTz, bool *have_error);
+							bool useTz, bool *cast_error);
+static void checkTimezoneIsUsedForCast(bool useTz, const char *type1,
+									   const char *type2);
 
+static void JsonTableInitOpaque(TableFuncScanState *state, int natts);
+static JsonTablePlanState *JsonTableInitPlan(JsonTableExecContext *cxt,
+											 JsonTablePlan *plan,
+											 JsonTablePlanState *parentstate,
+											 List *args,
+											 MemoryContext mcxt);
+static void JsonTableSetDocument(TableFuncScanState *state, Datum value);
+static void JsonTableResetRowPattern(JsonTablePlanState *plan, Datum item);
+static bool JsonTableFetchRow(TableFuncScanState *state);
+static Datum JsonTableGetValue(TableFuncScanState *state, int colnum,
+							   Oid typid, int32 typmod, bool *isnull);
+static void JsonTableDestroyOpaque(TableFuncScanState *state);
+static bool JsonTablePlanScanNextRow(JsonTablePlanState *planstate);
+static void JsonTableResetNestedPlan(JsonTablePlanState *planstate);
+static bool JsonTablePlanJoinNextRow(JsonTablePlanState *planstate);
+static bool JsonTablePlanNextRow(JsonTablePlanState *planstate);
 
-static JsonTableJoinState *JsonTableInitPlanState(JsonTableContext *cxt,
-												  Node *plan, JsonTableScanState *parent);
-static bool JsonTableNextRow(JsonTableScanState *scan);
-
+const TableFuncRoutine JsonbTableRoutine =
+{
+	.InitOpaque = JsonTableInitOpaque,
+	.SetDocument = JsonTableSetDocument,
+	.SetNamespace = NULL,
+	.SetRowFilter = NULL,
+	.SetColumnFilter = NULL,
+	.FetchRow = JsonTableFetchRow,
+	.GetValue = JsonTableGetValue,
+	.DestroyOpaque = JsonTableDestroyOpaque
+};
 
 /****************** User interface to JsonPath executor ********************/
 
@@ -356,6 +411,7 @@ jsonb_path_exists_internal(FunctionCallInfo fcinfo, bool tz)
 	}
 
 	res = executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
+						  countVariablesFromJsonb,
 						  jb, !silent, NULL, tz);
 
 	PG_FREE_IF_COPY(jb, 0);
@@ -412,6 +468,7 @@ jsonb_path_match_internal(FunctionCallInfo fcinfo, bool tz)
 	}
 
 	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
+						   countVariablesFromJsonb,
 						   jb, !silent, &found, tz);
 
 	PG_FREE_IF_COPY(jb, 0);
@@ -491,6 +548,7 @@ jsonb_path_query_internal(FunctionCallInfo fcinfo, bool tz)
 		silent = PG_GETARG_BOOL(3);
 
 		(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
+							   countVariablesFromJsonb,
 							   jb, !silent, &found, tz);
 
 		funcctx->user_fctx = JsonValueListGetList(&found);
@@ -539,6 +597,7 @@ jsonb_path_query_array_internal(FunctionCallInfo fcinfo, bool tz)
 	bool		silent = PG_GETARG_BOOL(3);
 
 	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
+						   countVariablesFromJsonb,
 						   jb, !silent, &found, tz);
 
 	PG_RETURN_JSONB_P(JsonbValueToJsonb(wrapItemsInArray(&found)));
@@ -571,6 +630,7 @@ jsonb_path_query_first_internal(FunctionCallInfo fcinfo, bool tz)
 	bool		silent = PG_GETARG_BOOL(3);
 
 	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
+						   countVariablesFromJsonb,
 						   jb, !silent, &found, tz);
 
 	if (JsonValueListLength(&found) >= 1)
@@ -598,6 +658,9 @@ jsonb_path_query_first_tz(PG_FUNCTION_ARGS)
  *
  * 'path' - jsonpath to be executed
  * 'vars' - variables to be substituted to jsonpath
+ * 'getVar' - callback used by getJsonPathVariable() to extract variables from
+ *		'vars'
+ * 'countVars' - callback to count the number of jsonpath variables in 'vars'
  * 'json' - target document for jsonpath evaluation
  * 'throwErrors' - whether we should throw suppressible errors
  * 'result' - list to store result items into
@@ -613,7 +676,8 @@ jsonb_path_query_first_tz(PG_FUNCTION_ARGS)
  * In other case it tries to find all the satisfied result items.
  */
 static JsonPathExecResult
-executeJsonPath(JsonPath *path, void *vars, JsonPathVarCallback getVar,
+executeJsonPath(JsonPath *path, void *vars, JsonPathGetVarCallback getVar,
+				JsonPathCountVarsCallback countVars,
 				Jsonb *json, bool throwErrors, JsonValueList *result,
 				bool useTz)
 {
@@ -636,12 +700,12 @@ executeJsonPath(JsonPath *path, void *vars, JsonPathVarCallback getVar,
 	cxt.baseObject.jbc = NULL;
 	cxt.baseObject.id = 0;
 	/* 1 + number of base objects in vars */
-	cxt.lastGeneratedObjectId = 1 + getVar(vars, NULL, 0, NULL, NULL);
+	cxt.lastGeneratedObjectId = 1 + countVars(vars);
 	cxt.innermostArraySize = -1;
 	cxt.throwErrors = throwErrors;
 	cxt.useTz = useTz;
 
-	if (jspStrictAbsenseOfErrors(&cxt) && !result)
+	if (jspStrictAbsenceOfErrors(&cxt) && !result)
 	{
 		/*
 		 * In strict mode we must get a complete list of values to check that
@@ -692,6 +756,37 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 
 	switch (jsp->type)
 	{
+		case jpiNull:
+		case jpiBool:
+		case jpiNumeric:
+		case jpiString:
+		case jpiVariable:
+			{
+				JsonbValue	vbuf;
+				JsonbValue *v;
+				bool		hasNext = jspGetNext(jsp, &elem);
+
+				if (!hasNext && !found && jsp->type != jpiVariable)
+				{
+					/*
+					 * Skip evaluation, but not for variables.  We must
+					 * trigger an error for the missing variable.
+					 */
+					res = jperOk;
+					break;
+				}
+
+				v = hasNext ? &vbuf : palloc(sizeof(*v));
+
+				baseObject = cxt->baseObject;
+				getJsonPathItem(cxt, jsp, v);
+
+				res = executeNextItem(cxt, jsp, &elem,
+									  v, found, hasNext);
+				cxt->baseObject = baseObject;
+			}
+			break;
+
 			/* all boolean item types: */
 		case jpiAnd:
 		case jpiOr:
@@ -713,63 +808,32 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 				break;
 			}
 
-		case jpiKey:
-			if (JsonbType(jb) == jbvObject)
-			{
-				JsonbValue *v;
-				JsonbValue	key;
+		case jpiAdd:
+			return executeBinaryArithmExpr(cxt, jsp, jb,
+										   numeric_add_opt_error, found);
 
-				key.type = jbvString;
-				key.val.string.val = jspGetString(jsp, &key.val.string.len);
+		case jpiSub:
+			return executeBinaryArithmExpr(cxt, jsp, jb,
+										   numeric_sub_opt_error, found);
 
-				v = findJsonbValueFromContainer(jb->val.binary.data,
-												JB_FOBJECT, &key);
+		case jpiMul:
+			return executeBinaryArithmExpr(cxt, jsp, jb,
+										   numeric_mul_opt_error, found);
 
-				if (v != NULL)
-				{
-					res = executeNextItem(cxt, jsp, NULL,
-										  v, found, false);
+		case jpiDiv:
+			return executeBinaryArithmExpr(cxt, jsp, jb,
+										   numeric_div_opt_error, found);
 
-					/* free value if it was not added to found list */
-					if (jspHasNext(jsp) || !found)
-						pfree(v);
-				}
-				else if (!jspIgnoreStructuralErrors(cxt))
-				{
-					Assert(found);
+		case jpiMod:
+			return executeBinaryArithmExpr(cxt, jsp, jb,
+										   numeric_mod_opt_error, found);
 
-					if (!jspThrowErrors(cxt))
-						return jperError;
+		case jpiPlus:
+			return executeUnaryArithmExpr(cxt, jsp, jb, NULL, found);
 
-					ereport(ERROR,
-							(errcode(ERRCODE_SQL_JSON_MEMBER_NOT_FOUND), \
-							 errmsg("JSON object does not contain key \"%s\"",
-									pnstrdup(key.val.string.val,
-											 key.val.string.len))));
-				}
-			}
-			else if (unwrap && JsonbType(jb) == jbvArray)
-				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
-			else if (!jspIgnoreStructuralErrors(cxt))
-			{
-				Assert(found);
-				RETURN_ERROR(ereport(ERROR,
-									 (errcode(ERRCODE_SQL_JSON_MEMBER_NOT_FOUND),
-									  errmsg("jsonpath member accessor can only be applied to an object"))));
-			}
-			break;
-
-		case jpiRoot:
-			jb = cxt->root;
-			baseObject = setBaseObject(cxt, jb, 0);
-			res = executeNextItem(cxt, jsp, NULL, jb, found, true);
-			cxt->baseObject = baseObject;
-			break;
-
-		case jpiCurrent:
-			res = executeNextItem(cxt, jsp, NULL, cxt->current,
-								  found, true);
-			break;
+		case jpiMinus:
+			return executeUnaryArithmExpr(cxt, jsp, jb, numeric_uminus,
+										  found);
 
 		case jpiAnyArray:
 			if (JsonbType(jb) == jbvArray)
@@ -785,6 +849,30 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 				RETURN_ERROR(ereport(ERROR,
 									 (errcode(ERRCODE_SQL_JSON_ARRAY_NOT_FOUND),
 									  errmsg("jsonpath wildcard array accessor can only be applied to an array"))));
+			break;
+
+		case jpiAnyKey:
+			if (JsonbType(jb) == jbvObject)
+			{
+				bool		hasNext = jspGetNext(jsp, &elem);
+
+				if (jb->type != jbvBinary)
+					elog(ERROR, "invalid jsonb object type: %d", jb->type);
+
+				return executeAnyItem
+					(cxt, hasNext ? &elem : NULL,
+					 jb->val.binary.data, found, 1, 1, 1,
+					 false, jspAutoUnwrap(cxt));
+			}
+			else if (unwrap && JsonbType(jb) == jbvArray)
+				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
+			else if (!jspIgnoreStructuralErrors(cxt))
+			{
+				Assert(found);
+				RETURN_ERROR(ereport(ERROR,
+									 (errcode(ERRCODE_SQL_JSON_OBJECT_NOT_FOUND),
+									  errmsg("jsonpath wildcard member accessor can only be applied to an object"))));
+			}
 			break;
 
 		case jpiIndexArray:
@@ -893,103 +981,6 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 			}
 			break;
 
-		case jpiLast:
-			{
-				JsonbValue	tmpjbv;
-				JsonbValue *lastjbv;
-				int			last;
-				bool		hasNext = jspGetNext(jsp, &elem);
-
-				if (cxt->innermostArraySize < 0)
-					elog(ERROR, "evaluating jsonpath LAST outside of array subscript");
-
-				if (!hasNext && !found)
-				{
-					res = jperOk;
-					break;
-				}
-
-				last = cxt->innermostArraySize - 1;
-
-				lastjbv = hasNext ? &tmpjbv : palloc(sizeof(*lastjbv));
-
-				lastjbv->type = jbvNumeric;
-				lastjbv->val.numeric = int64_to_numeric(last);
-
-				res = executeNextItem(cxt, jsp, &elem,
-									  lastjbv, found, hasNext);
-			}
-			break;
-
-		case jpiAnyKey:
-			if (JsonbType(jb) == jbvObject)
-			{
-				bool		hasNext = jspGetNext(jsp, &elem);
-
-				if (jb->type != jbvBinary)
-					elog(ERROR, "invalid jsonb object type: %d", jb->type);
-
-				return executeAnyItem
-					(cxt, hasNext ? &elem : NULL,
-					 jb->val.binary.data, found, 1, 1, 1,
-					 false, jspAutoUnwrap(cxt));
-			}
-			else if (unwrap && JsonbType(jb) == jbvArray)
-				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
-			else if (!jspIgnoreStructuralErrors(cxt))
-			{
-				Assert(found);
-				RETURN_ERROR(ereport(ERROR,
-									 (errcode(ERRCODE_SQL_JSON_OBJECT_NOT_FOUND),
-									  errmsg("jsonpath wildcard member accessor can only be applied to an object"))));
-			}
-			break;
-
-		case jpiAdd:
-			return executeBinaryArithmExpr(cxt, jsp, jb,
-										   numeric_add_opt_error, found);
-
-		case jpiSub:
-			return executeBinaryArithmExpr(cxt, jsp, jb,
-										   numeric_sub_opt_error, found);
-
-		case jpiMul:
-			return executeBinaryArithmExpr(cxt, jsp, jb,
-										   numeric_mul_opt_error, found);
-
-		case jpiDiv:
-			return executeBinaryArithmExpr(cxt, jsp, jb,
-										   numeric_div_opt_error, found);
-
-		case jpiMod:
-			return executeBinaryArithmExpr(cxt, jsp, jb,
-										   numeric_mod_opt_error, found);
-
-		case jpiPlus:
-			return executeUnaryArithmExpr(cxt, jsp, jb, NULL, found);
-
-		case jpiMinus:
-			return executeUnaryArithmExpr(cxt, jsp, jb, numeric_uminus,
-										  found);
-
-		case jpiFilter:
-			{
-				JsonPathBool st;
-
-				if (unwrap && JsonbType(jb) == jbvArray)
-					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
-														false);
-
-				jspGetArg(jsp, &elem);
-				st = executeNestedBoolItem(cxt, &elem, jb);
-				if (st != jpbTrue)
-					res = jperNotFound;
-				else
-					res = executeNextItem(cxt, jsp, NULL,
-										  jb, found, true);
-				break;
-			}
-
 		case jpiAny:
 			{
 				bool		hasNext = jspGetNext(jsp, &elem);
@@ -1020,32 +1011,81 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 				break;
 			}
 
-		case jpiNull:
-		case jpiBool:
-		case jpiNumeric:
-		case jpiString:
-		case jpiVariable:
+		case jpiKey:
+			if (JsonbType(jb) == jbvObject)
 			{
-				JsonbValue	vbuf;
 				JsonbValue *v;
-				bool		hasNext = jspGetNext(jsp, &elem);
+				JsonbValue	key;
 
-				if (!hasNext && !found)
+				key.type = jbvString;
+				key.val.string.val = jspGetString(jsp, &key.val.string.len);
+
+				v = findJsonbValueFromContainer(jb->val.binary.data,
+												JB_FOBJECT, &key);
+
+				if (v != NULL)
 				{
-					res = jperOk;	/* skip evaluation */
-					break;
+					res = executeNextItem(cxt, jsp, NULL,
+										  v, found, false);
+
+					/* free value if it was not added to found list */
+					if (jspHasNext(jsp) || !found)
+						pfree(v);
 				}
+				else if (!jspIgnoreStructuralErrors(cxt))
+				{
+					Assert(found);
 
-				v = hasNext ? &vbuf : palloc(sizeof(*v));
+					if (!jspThrowErrors(cxt))
+						return jperError;
 
-				baseObject = cxt->baseObject;
-				getJsonPathItem(cxt, jsp, v);
-
-				res = executeNextItem(cxt, jsp, &elem,
-									  v, found, hasNext);
-				cxt->baseObject = baseObject;
+					ereport(ERROR,
+							(errcode(ERRCODE_SQL_JSON_MEMBER_NOT_FOUND), \
+							 errmsg("JSON object does not contain key \"%s\"",
+									pnstrdup(key.val.string.val,
+											 key.val.string.len))));
+				}
+			}
+			else if (unwrap && JsonbType(jb) == jbvArray)
+				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
+			else if (!jspIgnoreStructuralErrors(cxt))
+			{
+				Assert(found);
+				RETURN_ERROR(ereport(ERROR,
+									 (errcode(ERRCODE_SQL_JSON_MEMBER_NOT_FOUND),
+									  errmsg("jsonpath member accessor can only be applied to an object"))));
 			}
 			break;
+
+		case jpiCurrent:
+			res = executeNextItem(cxt, jsp, NULL, cxt->current,
+								  found, true);
+			break;
+
+		case jpiRoot:
+			jb = cxt->root;
+			baseObject = setBaseObject(cxt, jb, 0);
+			res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			cxt->baseObject = baseObject;
+			break;
+
+		case jpiFilter:
+			{
+				JsonPathBool st;
+
+				if (unwrap && JsonbType(jb) == jbvArray)
+					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
+														false);
+
+				jspGetArg(jsp, &elem);
+				st = executeNestedBoolItem(cxt, &elem, jb);
+				if (st != jpbTrue)
+					res = jperNotFound;
+				else
+					res = executeNextItem(cxt, jsp, NULL,
+										  jb, found, true);
+				break;
+			}
 
 		case jpiType:
 			{
@@ -1113,18 +1153,23 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 					char	   *tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
 																		  NumericGetDatum(jb->val.numeric)));
 					double		val;
-					bool		have_error = false;
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
 
-					val = float8in_internal_opt_error(tmp,
-													  NULL,
-													  "double precision",
-													  tmp,
-													  &have_error);
+					val = float8in_internal(tmp,
+											NULL,
+											"double precision",
+											tmp,
+											(Node *) &escontext);
 
-					if (have_error || isinf(val) || isnan(val))
+					if (escontext.error_occurred)
 						RETURN_ERROR(ereport(ERROR,
 											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
-											  errmsg("numeric argument of jsonpath item method .%s() is out of range for type double precision",
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type double precision",
+													 tmp, jspOperationName(jsp->type)))));
+					if (isinf(val) || isnan(val))
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("NaN or Infinity is not allowed for jsonpath item method .%s()",
 													 jspOperationName(jsp->type)))));
 					res = jperOk;
 				}
@@ -1134,18 +1179,23 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 					double		val;
 					char	   *tmp = pnstrdup(jb->val.string.val,
 											   jb->val.string.len);
-					bool		have_error = false;
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
 
-					val = float8in_internal_opt_error(tmp,
-													  NULL,
-													  "double precision",
-													  tmp,
-													  &have_error);
+					val = float8in_internal(tmp,
+											NULL,
+											"double precision",
+											tmp,
+											(Node *) &escontext);
 
-					if (have_error || isinf(val) || isnan(val))
+					if (escontext.error_occurred)
 						RETURN_ERROR(ereport(ERROR,
 											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
-											  errmsg("string argument of jsonpath item method .%s() is not a valid representation of a double precision number",
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type double precision",
+													 tmp, jspOperationName(jsp->type)))));
+					if (isinf(val) || isnan(val))
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("NaN or Infinity is not allowed for jsonpath item method .%s()",
 													 jspOperationName(jsp->type)))));
 
 					jb = &jbv;
@@ -1166,6 +1216,11 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 			break;
 
 		case jpiDatetime:
+		case jpiDate:
+		case jpiTime:
+		case jpiTimeTz:
+		case jpiTimestamp:
+		case jpiTimestampTz:
 			if (unwrap && JsonbType(jb) == jbvArray)
 				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
 
@@ -1176,6 +1231,450 @@ executeItemOptUnwrapTarget(JsonPathExecContext *cxt, JsonPathItem *jsp,
 				return executeItemUnwrapTargetArray(cxt, jsp, jb, found, false);
 
 			return executeKeyValueMethod(cxt, jsp, jb, found);
+
+		case jpiLast:
+			{
+				JsonbValue	tmpjbv;
+				JsonbValue *lastjbv;
+				int			last;
+				bool		hasNext = jspGetNext(jsp, &elem);
+
+				if (cxt->innermostArraySize < 0)
+					elog(ERROR, "evaluating jsonpath LAST outside of array subscript");
+
+				if (!hasNext && !found)
+				{
+					res = jperOk;
+					break;
+				}
+
+				last = cxt->innermostArraySize - 1;
+
+				lastjbv = hasNext ? &tmpjbv : palloc(sizeof(*lastjbv));
+
+				lastjbv->type = jbvNumeric;
+				lastjbv->val.numeric = int64_to_numeric(last);
+
+				res = executeNextItem(cxt, jsp, &elem,
+									  lastjbv, found, hasNext);
+			}
+			break;
+
+		case jpiBigint:
+			{
+				JsonbValue	jbv;
+				Datum		datum;
+
+				if (unwrap && JsonbType(jb) == jbvArray)
+					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
+														false);
+
+				if (jb->type == jbvNumeric)
+				{
+					bool		have_error;
+					int64		val;
+
+					val = numeric_int8_opt_error(jb->val.numeric, &have_error);
+					if (have_error)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type bigint",
+													 DatumGetCString(DirectFunctionCall1(numeric_out,
+																						 NumericGetDatum(jb->val.numeric))),
+													 jspOperationName(jsp->type)))));
+
+					datum = Int64GetDatum(val);
+					res = jperOk;
+				}
+				else if (jb->type == jbvString)
+				{
+					/* cast string as bigint */
+					char	   *tmp = pnstrdup(jb->val.string.val,
+											   jb->val.string.len);
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+					bool		noerr;
+
+					noerr = DirectInputFunctionCallSafe(int8in, tmp,
+														InvalidOid, -1,
+														(Node *) &escontext,
+														&datum);
+
+					if (!noerr || escontext.error_occurred)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type bigint",
+													 tmp, jspOperationName(jsp->type)))));
+					res = jperOk;
+				}
+
+				if (res == jperNotFound)
+					RETURN_ERROR(ereport(ERROR,
+										 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+										  errmsg("jsonpath item method .%s() can only be applied to a string or numeric value",
+												 jspOperationName(jsp->type)))));
+
+				jb = &jbv;
+				jb->type = jbvNumeric;
+				jb->val.numeric = DatumGetNumeric(DirectFunctionCall1(int8_numeric,
+																	  datum));
+
+				res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			}
+			break;
+
+		case jpiBoolean:
+			{
+				JsonbValue	jbv;
+				bool		bval;
+
+				if (unwrap && JsonbType(jb) == jbvArray)
+					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
+														false);
+
+				if (jb->type == jbvBool)
+				{
+					bval = jb->val.boolean;
+
+					res = jperOk;
+				}
+				else if (jb->type == jbvNumeric)
+				{
+					int			ival;
+					Datum		datum;
+					bool		noerr;
+					char	   *tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
+																		  NumericGetDatum(jb->val.numeric)));
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+					noerr = DirectInputFunctionCallSafe(int4in, tmp,
+														InvalidOid, -1,
+														(Node *) &escontext,
+														&datum);
+
+					if (!noerr || escontext.error_occurred)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type boolean",
+													 tmp, jspOperationName(jsp->type)))));
+
+					ival = DatumGetInt32(datum);
+					if (ival == 0)
+						bval = false;
+					else
+						bval = true;
+
+					res = jperOk;
+				}
+				else if (jb->type == jbvString)
+				{
+					/* cast string as boolean */
+					char	   *tmp = pnstrdup(jb->val.string.val,
+											   jb->val.string.len);
+
+					if (!parse_bool(tmp, &bval))
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type boolean",
+													 tmp, jspOperationName(jsp->type)))));
+
+					res = jperOk;
+				}
+
+				if (res == jperNotFound)
+					RETURN_ERROR(ereport(ERROR,
+										 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+										  errmsg("jsonpath item method .%s() can only be applied to a bool, string, or numeric value",
+												 jspOperationName(jsp->type)))));
+
+				jb = &jbv;
+				jb->type = jbvBool;
+				jb->val.boolean = bval;
+
+				res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			}
+			break;
+
+		case jpiDecimal:
+		case jpiNumber:
+			{
+				JsonbValue	jbv;
+				Numeric		num;
+				char	   *numstr = NULL;
+
+				if (unwrap && JsonbType(jb) == jbvArray)
+					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
+														false);
+
+				if (jb->type == jbvNumeric)
+				{
+					num = jb->val.numeric;
+					if (numeric_is_nan(num) || numeric_is_inf(num))
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("NaN or Infinity is not allowed for jsonpath item method .%s()",
+													 jspOperationName(jsp->type)))));
+
+					if (jsp->type == jpiDecimal)
+						numstr = DatumGetCString(DirectFunctionCall1(numeric_out,
+																	 NumericGetDatum(num)));
+					res = jperOk;
+				}
+				else if (jb->type == jbvString)
+				{
+					/* cast string as number */
+					Datum		datum;
+					bool		noerr;
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+					numstr = pnstrdup(jb->val.string.val, jb->val.string.len);
+
+					noerr = DirectInputFunctionCallSafe(numeric_in, numstr,
+														InvalidOid, -1,
+														(Node *) &escontext,
+														&datum);
+
+					if (!noerr || escontext.error_occurred)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type numeric",
+													 numstr, jspOperationName(jsp->type)))));
+
+					num = DatumGetNumeric(datum);
+					if (numeric_is_nan(num) || numeric_is_inf(num))
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("NaN or Infinity is not allowed for jsonpath item method .%s()",
+													 jspOperationName(jsp->type)))));
+
+					res = jperOk;
+				}
+
+				if (res == jperNotFound)
+					RETURN_ERROR(ereport(ERROR,
+										 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+										  errmsg("jsonpath item method .%s() can only be applied to a string or numeric value",
+												 jspOperationName(jsp->type)))));
+
+				/*
+				 * If we have arguments, then they must be the precision and
+				 * optional scale used in .decimal().  Convert them to the
+				 * typmod equivalent and then truncate the numeric value per
+				 * this typmod details.
+				 */
+				if (jsp->type == jpiDecimal && jsp->content.args.left)
+				{
+					Datum		numdatum;
+					Datum		dtypmod;
+					int32		precision;
+					int32		scale = 0;
+					bool		have_error;
+					bool		noerr;
+					ArrayType  *arrtypmod;
+					Datum		datums[2];
+					char		pstr[12];	/* sign, 10 digits and '\0' */
+					char		sstr[12];	/* sign, 10 digits and '\0' */
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+					jspGetLeftArg(jsp, &elem);
+					if (elem.type != jpiNumeric)
+						elog(ERROR, "invalid jsonpath item type for .decimal() precision");
+
+					precision = numeric_int4_opt_error(jspGetNumeric(&elem),
+													   &have_error);
+					if (have_error)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("precision of jsonpath item method .%s() is out of range for type integer",
+													 jspOperationName(jsp->type)))));
+
+					if (jsp->content.args.right)
+					{
+						jspGetRightArg(jsp, &elem);
+						if (elem.type != jpiNumeric)
+							elog(ERROR, "invalid jsonpath item type for .decimal() scale");
+
+						scale = numeric_int4_opt_error(jspGetNumeric(&elem),
+													   &have_error);
+						if (have_error)
+							RETURN_ERROR(ereport(ERROR,
+												 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+												  errmsg("scale of jsonpath item method .%s() is out of range for type integer",
+														 jspOperationName(jsp->type)))));
+					}
+
+					/*
+					 * numerictypmodin() takes the precision and scale in the
+					 * form of CString arrays.
+					 */
+					pg_ltoa(precision, pstr);
+					datums[0] = CStringGetDatum(pstr);
+					pg_ltoa(scale, sstr);
+					datums[1] = CStringGetDatum(sstr);
+					arrtypmod = construct_array_builtin(datums, 2, CSTRINGOID);
+
+					dtypmod = DirectFunctionCall1(numerictypmodin,
+												  PointerGetDatum(arrtypmod));
+
+					/* Convert numstr to Numeric with typmod */
+					Assert(numstr != NULL);
+					noerr = DirectInputFunctionCallSafe(numeric_in, numstr,
+														InvalidOid, dtypmod,
+														(Node *) &escontext,
+														&numdatum);
+
+					if (!noerr || escontext.error_occurred)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type numeric",
+													 numstr, jspOperationName(jsp->type)))));
+
+					num = DatumGetNumeric(numdatum);
+					pfree(arrtypmod);
+				}
+
+				jb = &jbv;
+				jb->type = jbvNumeric;
+				jb->val.numeric = num;
+
+				res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			}
+			break;
+
+		case jpiInteger:
+			{
+				JsonbValue	jbv;
+				Datum		datum;
+
+				if (unwrap && JsonbType(jb) == jbvArray)
+					return executeItemUnwrapTargetArray(cxt, jsp, jb, found,
+														false);
+
+				if (jb->type == jbvNumeric)
+				{
+					bool		have_error;
+					int32		val;
+
+					val = numeric_int4_opt_error(jb->val.numeric, &have_error);
+					if (have_error)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type integer",
+													 DatumGetCString(DirectFunctionCall1(numeric_out,
+																						 NumericGetDatum(jb->val.numeric))),
+													 jspOperationName(jsp->type)))));
+
+					datum = Int32GetDatum(val);
+					res = jperOk;
+				}
+				else if (jb->type == jbvString)
+				{
+					/* cast string as integer */
+					char	   *tmp = pnstrdup(jb->val.string.val,
+											   jb->val.string.len);
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+					bool		noerr;
+
+					noerr = DirectInputFunctionCallSafe(int4in, tmp,
+														InvalidOid, -1,
+														(Node *) &escontext,
+														&datum);
+
+					if (!noerr || escontext.error_occurred)
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("argument \"%s\" of jsonpath item method .%s() is invalid for type integer",
+													 tmp, jspOperationName(jsp->type)))));
+					res = jperOk;
+				}
+
+				if (res == jperNotFound)
+					RETURN_ERROR(ereport(ERROR,
+										 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+										  errmsg("jsonpath item method .%s() can only be applied to a string or numeric value",
+												 jspOperationName(jsp->type)))));
+
+				jb = &jbv;
+				jb->type = jbvNumeric;
+				jb->val.numeric = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
+																	  datum));
+
+				res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			}
+			break;
+
+		case jpiStringFunc:
+			{
+				JsonbValue	jbv;
+				char	   *tmp = NULL;
+
+				switch (JsonbType(jb))
+				{
+					case jbvString:
+
+						/*
+						 * Value is not necessarily null-terminated, so we do
+						 * pnstrdup() here.
+						 */
+						tmp = pnstrdup(jb->val.string.val,
+									   jb->val.string.len);
+						break;
+					case jbvNumeric:
+						tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
+																  NumericGetDatum(jb->val.numeric)));
+						break;
+					case jbvBool:
+						tmp = (jb->val.boolean) ? "true" : "false";
+						break;
+					case jbvDatetime:
+						{
+							switch (jb->val.datetime.typid)
+							{
+								case DATEOID:
+									tmp = DatumGetCString(DirectFunctionCall1(date_out,
+																			  jb->val.datetime.value));
+									break;
+								case TIMEOID:
+									tmp = DatumGetCString(DirectFunctionCall1(time_out,
+																			  jb->val.datetime.value));
+									break;
+								case TIMETZOID:
+									tmp = DatumGetCString(DirectFunctionCall1(timetz_out,
+																			  jb->val.datetime.value));
+									break;
+								case TIMESTAMPOID:
+									tmp = DatumGetCString(DirectFunctionCall1(timestamp_out,
+																			  jb->val.datetime.value));
+									break;
+								case TIMESTAMPTZOID:
+									tmp = DatumGetCString(DirectFunctionCall1(timestamptz_out,
+																			  jb->val.datetime.value));
+									break;
+								default:
+									elog(ERROR, "unrecognized SQL/JSON datetime type oid: %u",
+										 jb->val.datetime.typid);
+							}
+						}
+						break;
+					case jbvNull:
+					case jbvArray:
+					case jbvObject:
+					case jbvBinary:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_NON_NUMERIC_SQL_JSON_ITEM),
+											  errmsg("jsonpath item method .%s() can only be applied to a bool, string, numeric, or datetime value",
+													 jspOperationName(jsp->type)))));
+						break;
+				}
+
+				jb = &jbv;
+				Assert(tmp != NULL);	/* We must have set tmp above */
+				jb->val.string.val = tmp;
+				jb->val.string.len = strlen(jb->val.string.val);
+				jb->type = jbvString;
+
+				res = executeNextItem(cxt, jsp, NULL, jb, found, true);
+			}
+			break;
 
 		default:
 			elog(ERROR, "unrecognized jsonpath item type: %d", jsp->type);
@@ -1299,6 +1798,9 @@ executeBoolItem(JsonPathExecContext *cxt, JsonPathItem *jsp,
 	JsonPathBool res;
 	JsonPathBool res2;
 
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
 	if (!canHaveNext && jspHasNext(jsp))
 		elog(ERROR, "boolean jsonpath item cannot have next item");
 
@@ -1385,7 +1887,7 @@ executeBoolItem(JsonPathExecContext *cxt, JsonPathItem *jsp,
 		case jpiExists:
 			jspGetArg(jsp, &larg);
 
-			if (jspStrictAbsenseOfErrors(cxt))
+			if (jspStrictAbsenceOfErrors(cxt))
 			{
 				/*
 				 * In strict mode we must get a complete list of values to
@@ -1393,8 +1895,8 @@ executeBoolItem(JsonPathExecContext *cxt, JsonPathItem *jsp,
 				 */
 				JsonValueList vals = {0};
 				JsonPathExecResult res =
-				executeItemOptUnwrapResultNoThrow(cxt, &larg, jb,
-												  false, &vals);
+					executeItemOptUnwrapResultNoThrow(cxt, &larg, jb,
+													  false, &vals);
 
 				if (jperIsError(res))
 					return jpbUnknown;
@@ -1404,8 +1906,8 @@ executeBoolItem(JsonPathExecContext *cxt, JsonPathItem *jsp,
 			else
 			{
 				JsonPathExecResult res =
-				executeItemOptUnwrapResultNoThrow(cxt, &larg, jb,
-												  false, NULL);
+					executeItemOptUnwrapResultNoThrow(cxt, &larg, jb,
+													  false, NULL);
 
 				if (jperIsError(res))
 					return jpbUnknown;
@@ -1583,14 +2085,14 @@ executePredicate(JsonPathExecContext *cxt, JsonPathItem *pred,
 
 			if (res == jpbUnknown)
 			{
-				if (jspStrictAbsenseOfErrors(cxt))
+				if (jspStrictAbsenceOfErrors(cxt))
 					return jpbUnknown;
 
 				error = true;
 			}
 			else if (res == jpbTrue)
 			{
-				if (!jspStrictAbsenseOfErrors(cxt))
+				if (!jspStrictAbsenceOfErrors(cxt))
 					return jpbTrue;
 
 				found = true;
@@ -1792,7 +2294,8 @@ executeLikeRegex(JsonPathItem *jsp, JsonbValue *str, JsonbValue *rarg,
 		cxt->regex =
 			cstring_to_text_with_len(jsp->content.like_regex.pattern,
 									 jsp->content.like_regex.patternlen);
-		cxt->cflags = jspConvertRegexFlags(jsp->content.like_regex.flags);
+		(void) jspConvertRegexFlags(jsp->content.like_regex.flags,
+									&(cxt->cflags), NULL);
 	}
 
 	if (RE_compile_and_execute(cxt->regex, str->val.string.val,
@@ -1837,11 +2340,16 @@ executeNumericItemMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 }
 
 /*
- * Implementation of the .datetime() method.
+ * Implementation of the .datetime() and related methods.
  *
- * Converts a string into a date/time value. The actual type is determined at run time.
+ * Converts a string into a date/time value. The actual type is determined at
+ * run time.
  * If an argument is provided, this argument is used as a template string.
  * Otherwise, the first fitting ISO format is selected.
+ *
+ * .date(), .time(), .time_tz(), .timestamp(), .timestamp_tz() methods don't
+ * have a format, so ISO format is used.  However, except for .date(), they all
+ * take an optional time precision.
  */
 static JsonPathExecResult
 executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
@@ -1857,6 +2365,7 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 	bool		hasNext;
 	JsonPathExecResult res = jperNotFound;
 	JsonPathItem elem;
+	int32		time_precision = -1;
 
 	if (!(jb = getScalar(jb, jbvString)))
 		RETURN_ERROR(ereport(ERROR,
@@ -1874,12 +2383,16 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 	 */
 	collid = DEFAULT_COLLATION_OID;
 
-	if (jsp->content.arg)
+	/*
+	 * .datetime(template) has an argument, the rest of the methods don't have
+	 * an argument.  So we handle that separately.
+	 */
+	if (jsp->type == jpiDatetime && jsp->content.arg)
 	{
 		text	   *template;
 		char	   *template_str;
 		int			template_len;
-		bool		have_error = false;
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
 
 		jspGetArg(jsp, &elem);
 
@@ -1893,9 +2406,9 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 
 		value = parse_datetime(datetime, template, collid, true,
 							   &typid, &typmod, &tz,
-							   jspThrowErrors(cxt) ? NULL : &have_error);
+							   jspThrowErrors(cxt) ? NULL : (Node *) &escontext);
 
-		if (have_error)
+		if (escontext.error_occurred)
 			res = jperError;
 		else
 			res = jperOk;
@@ -1906,20 +2419,23 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 		 * According to SQL/JSON standard enumerate ISO formats for: date,
 		 * timetz, time, timestamptz, timestamp.
 		 *
-		 * We also support ISO 8601 for timestamps, because to_json[b]()
-		 * functions use this format.
+		 * We also support ISO 8601 format (with "T") for timestamps, because
+		 * to_json[b]() functions use this format.
 		 */
 		static const char *fmt_str[] =
 		{
-			"yyyy-mm-dd",
-			"HH24:MI:SSTZH:TZM",
-			"HH24:MI:SSTZH",
+			"yyyy-mm-dd",		/* date */
+			"HH24:MI:SS.USTZ",	/* timetz */
+			"HH24:MI:SSTZ",
+			"HH24:MI:SS.US",	/* time without tz */
 			"HH24:MI:SS",
-			"yyyy-mm-dd HH24:MI:SSTZH:TZM",
-			"yyyy-mm-dd HH24:MI:SSTZH",
+			"yyyy-mm-dd HH24:MI:SS.USTZ",	/* timestamptz */
+			"yyyy-mm-dd HH24:MI:SSTZ",
+			"yyyy-mm-dd\"T\"HH24:MI:SS.USTZ",
+			"yyyy-mm-dd\"T\"HH24:MI:SSTZ",
+			"yyyy-mm-dd HH24:MI:SS.US", /* timestamp without tz */
 			"yyyy-mm-dd HH24:MI:SS",
-			"yyyy-mm-dd\"T\"HH24:MI:SSTZH:TZM",
-			"yyyy-mm-dd\"T\"HH24:MI:SSTZH",
+			"yyyy-mm-dd\"T\"HH24:MI:SS.US",
 			"yyyy-mm-dd\"T\"HH24:MI:SS"
 		};
 
@@ -1927,15 +2443,39 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 		static text *fmt_txt[lengthof(fmt_str)] = {0};
 		int			i;
 
+		/*
+		 * Check for optional precision for methods other than .datetime() and
+		 * .date()
+		 */
+		if (jsp->type != jpiDatetime && jsp->type != jpiDate &&
+			jsp->content.arg)
+		{
+			bool		have_error;
+
+			jspGetArg(jsp, &elem);
+
+			if (elem.type != jpiNumeric)
+				elog(ERROR, "invalid jsonpath item type for %s argument",
+					 jspOperationName(jsp->type));
+
+			time_precision = numeric_int4_opt_error(jspGetNumeric(&elem),
+													&have_error);
+			if (have_error)
+				RETURN_ERROR(ereport(ERROR,
+									 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+									  errmsg("time precision of jsonpath item method .%s() is out of range for type integer",
+											 jspOperationName(jsp->type)))));
+		}
+
 		/* loop until datetime format fits */
 		for (i = 0; i < lengthof(fmt_str); i++)
 		{
-			bool		have_error = false;
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
 
 			if (!fmt_txt[i])
 			{
 				MemoryContext oldcxt =
-				MemoryContextSwitchTo(TopMemoryContext);
+					MemoryContextSwitchTo(TopMemoryContext);
 
 				fmt_txt[i] = cstring_to_text(fmt_str[i]);
 				MemoryContextSwitchTo(oldcxt);
@@ -1943,9 +2483,9 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 
 			value = parse_datetime(datetime, fmt_txt[i], collid, true,
 								   &typid, &typmod, &tz,
-								   &have_error);
+								   (Node *) &escontext);
 
-			if (!have_error)
+			if (!escontext.error_occurred)
 			{
 				res = jperOk;
 				break;
@@ -1953,11 +2493,274 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 		}
 
 		if (res == jperNotFound)
-			RETURN_ERROR(ereport(ERROR,
-								 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
-								  errmsg("datetime format is not recognized: \"%s\"",
-										 text_to_cstring(datetime)),
-								  errhint("Use a datetime template argument to specify the input data format."))));
+		{
+			if (jsp->type == jpiDatetime)
+				RETURN_ERROR(ereport(ERROR,
+									 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+									  errmsg("%s format is not recognized: \"%s\"",
+											 "datetime", text_to_cstring(datetime)),
+									  errhint("Use a datetime template argument to specify the input data format."))));
+			else
+				RETURN_ERROR(ereport(ERROR,
+									 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+									  errmsg("%s format is not recognized: \"%s\"",
+											 jspOperationName(jsp->type), text_to_cstring(datetime)))));
+
+		}
+	}
+
+	/*
+	 * parse_datetime() processes the entire input string per the template or
+	 * ISO format and returns the Datum in best fitted datetime type.  So, if
+	 * this call is for a specific datatype, then we do the conversion here.
+	 * Throw an error for incompatible types.
+	 */
+	switch (jsp->type)
+	{
+		case jpiDatetime:		/* Nothing to do for DATETIME */
+			break;
+		case jpiDate:
+			{
+				/* Convert result type to date */
+				switch (typid)
+				{
+					case DATEOID:	/* Nothing to do for DATE */
+						break;
+					case TIMEOID:
+					case TIMETZOID:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("%s format is not recognized: \"%s\"",
+													 "date", text_to_cstring(datetime)))));
+						break;
+					case TIMESTAMPOID:
+						value = DirectFunctionCall1(timestamp_date,
+													value);
+						break;
+					case TIMESTAMPTZOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "timestamptz", "date");
+						value = DirectFunctionCall1(timestamptz_date,
+													value);
+						break;
+					default:
+						elog(ERROR, "type with oid %u not supported", typid);
+				}
+
+				typid = DATEOID;
+			}
+			break;
+		case jpiTime:
+			{
+				/* Convert result type to time without time zone */
+				switch (typid)
+				{
+					case DATEOID:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("%s format is not recognized: \"%s\"",
+													 "time", text_to_cstring(datetime)))));
+						break;
+					case TIMEOID:	/* Nothing to do for TIME */
+						break;
+					case TIMETZOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "timetz", "time");
+						value = DirectFunctionCall1(timetz_time,
+													value);
+						break;
+					case TIMESTAMPOID:
+						value = DirectFunctionCall1(timestamp_time,
+													value);
+						break;
+					case TIMESTAMPTZOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "timestamptz", "time");
+						value = DirectFunctionCall1(timestamptz_time,
+													value);
+						break;
+					default:
+						elog(ERROR, "type with oid %u not supported", typid);
+				}
+
+				/* Force the user-given time precision, if any */
+				if (time_precision != -1)
+				{
+					TimeADT		result;
+
+					/* Get a warning when precision is reduced */
+					time_precision = anytime_typmod_check(false,
+														  time_precision);
+					result = DatumGetTimeADT(value);
+					AdjustTimeForTypmod(&result, time_precision);
+					value = TimeADTGetDatum(result);
+
+					/* Update the typmod value with the user-given precision */
+					typmod = time_precision;
+				}
+
+				typid = TIMEOID;
+			}
+			break;
+		case jpiTimeTz:
+			{
+				/* Convert result type to time with time zone */
+				switch (typid)
+				{
+					case DATEOID:
+					case TIMESTAMPOID:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("%s format is not recognized: \"%s\"",
+													 "time_tz", text_to_cstring(datetime)))));
+						break;
+					case TIMEOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "time", "timetz");
+						value = DirectFunctionCall1(time_timetz,
+													value);
+						break;
+					case TIMETZOID: /* Nothing to do for TIMETZ */
+						break;
+					case TIMESTAMPTZOID:
+						value = DirectFunctionCall1(timestamptz_timetz,
+													value);
+						break;
+					default:
+						elog(ERROR, "type with oid %u not supported", typid);
+				}
+
+				/* Force the user-given time precision, if any */
+				if (time_precision != -1)
+				{
+					TimeTzADT  *result;
+
+					/* Get a warning when precision is reduced */
+					time_precision = anytime_typmod_check(true,
+														  time_precision);
+					result = DatumGetTimeTzADTP(value);
+					AdjustTimeForTypmod(&result->time, time_precision);
+					value = TimeTzADTPGetDatum(result);
+
+					/* Update the typmod value with the user-given precision */
+					typmod = time_precision;
+				}
+
+				typid = TIMETZOID;
+			}
+			break;
+		case jpiTimestamp:
+			{
+				/* Convert result type to timestamp without time zone */
+				switch (typid)
+				{
+					case DATEOID:
+						value = DirectFunctionCall1(date_timestamp,
+													value);
+						break;
+					case TIMEOID:
+					case TIMETZOID:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("%s format is not recognized: \"%s\"",
+													 "timestamp", text_to_cstring(datetime)))));
+						break;
+					case TIMESTAMPOID:	/* Nothing to do for TIMESTAMP */
+						break;
+					case TIMESTAMPTZOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "timestamptz", "timestamp");
+						value = DirectFunctionCall1(timestamptz_timestamp,
+													value);
+						break;
+					default:
+						elog(ERROR, "type with oid %u not supported", typid);
+				}
+
+				/* Force the user-given time precision, if any */
+				if (time_precision != -1)
+				{
+					Timestamp	result;
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+					/* Get a warning when precision is reduced */
+					time_precision = anytimestamp_typmod_check(false,
+															   time_precision);
+					result = DatumGetTimestamp(value);
+					AdjustTimestampForTypmod(&result, time_precision,
+											 (Node *) &escontext);
+					if (escontext.error_occurred)	/* should not happen */
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("time precision of jsonpath item method .%s() is invalid",
+													 jspOperationName(jsp->type)))));
+					value = TimestampGetDatum(result);
+
+					/* Update the typmod value with the user-given precision */
+					typmod = time_precision;
+				}
+
+				typid = TIMESTAMPOID;
+			}
+			break;
+		case jpiTimestampTz:
+			{
+				/* Convert result type to timestamp with time zone */
+				switch (typid)
+				{
+					case DATEOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "date", "timestamptz");
+						value = DirectFunctionCall1(date_timestamptz,
+													value);
+						break;
+					case TIMEOID:
+					case TIMETZOID:
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("%s format is not recognized: \"%s\"",
+													 "timestamp_tz", text_to_cstring(datetime)))));
+						break;
+					case TIMESTAMPOID:
+						checkTimezoneIsUsedForCast(cxt->useTz,
+												   "timestamp", "timestamptz");
+						value = DirectFunctionCall1(timestamp_timestamptz,
+													value);
+						break;
+					case TIMESTAMPTZOID:	/* Nothing to do for TIMESTAMPTZ */
+						break;
+					default:
+						elog(ERROR, "type with oid %u not supported", typid);
+				}
+
+				/* Force the user-given time precision, if any */
+				if (time_precision != -1)
+				{
+					Timestamp	result;
+					ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+					/* Get a warning when precision is reduced */
+					time_precision = anytimestamp_typmod_check(true,
+															   time_precision);
+					result = DatumGetTimestampTz(value);
+					AdjustTimestampForTypmod(&result, time_precision,
+											 (Node *) &escontext);
+					if (escontext.error_occurred)	/* should not happen */
+						RETURN_ERROR(ereport(ERROR,
+											 (errcode(ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION),
+											  errmsg("time precision of jsonpath item method .%s() is invalid",
+													 jspOperationName(jsp->type)))));
+					value = TimestampTzGetDatum(result);
+
+					/* Update the typmod value with the user-given precision */
+					typmod = time_precision;
+				}
+
+				typid = TIMESTAMPTZOID;
+			}
+			break;
+		default:
+			elog(ERROR, "unrecognized jsonpath item type: %d", jsp->type);
 	}
 
 	pfree(datetime);
@@ -2173,6 +2976,155 @@ getJsonPathItem(JsonPathExecContext *cxt, JsonPathItem *item,
 }
 
 /*
+ * Returns the computed value of a JSON path variable with given name.
+ */
+static JsonbValue *
+GetJsonPathVar(void *cxt, char *varName, int varNameLen,
+			   JsonbValue *baseObject, int *baseObjectId)
+{
+	JsonPathVariable *var = NULL;
+	List	   *vars = cxt;
+	ListCell   *lc;
+	JsonbValue *result;
+	int			id = 1;
+
+	foreach(lc, vars)
+	{
+		JsonPathVariable *curvar = lfirst(lc);
+
+		if (!strncmp(curvar->name, varName, varNameLen))
+		{
+			var = curvar;
+			break;
+		}
+
+		id++;
+	}
+
+	if (var == NULL)
+	{
+		*baseObjectId = -1;
+		return NULL;
+	}
+
+	result = palloc(sizeof(JsonbValue));
+	if (var->isnull)
+	{
+		*baseObjectId = 0;
+		result->type = jbvNull;
+	}
+	else
+		JsonItemFromDatum(var->value, var->typid, var->typmod, result);
+
+	*baseObject = *result;
+	*baseObjectId = id;
+
+	return result;
+}
+
+static int
+CountJsonPathVars(void *cxt)
+{
+	List	   *vars = (List *) cxt;
+
+	return list_length(vars);
+}
+
+
+/*
+ * Initialize JsonbValue to pass to jsonpath executor from given
+ * datum value of the specified type.
+ */
+static void
+JsonItemFromDatum(Datum val, Oid typid, int32 typmod, JsonbValue *res)
+{
+	switch (typid)
+	{
+		case BOOLOID:
+			res->type = jbvBool;
+			res->val.boolean = DatumGetBool(val);
+			break;
+		case NUMERICOID:
+			JsonbValueInitNumericDatum(res, val);
+			break;
+		case INT2OID:
+			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int2_numeric, val));
+			break;
+		case INT4OID:
+			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int4_numeric, val));
+			break;
+		case INT8OID:
+			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int8_numeric, val));
+			break;
+		case FLOAT4OID:
+			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float4_numeric, val));
+			break;
+		case FLOAT8OID:
+			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float8_numeric, val));
+			break;
+		case TEXTOID:
+		case VARCHAROID:
+			res->type = jbvString;
+			res->val.string.val = VARDATA_ANY(val);
+			res->val.string.len = VARSIZE_ANY_EXHDR(val);
+			break;
+		case DATEOID:
+		case TIMEOID:
+		case TIMETZOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			res->type = jbvDatetime;
+			res->val.datetime.value = val;
+			res->val.datetime.typid = typid;
+			res->val.datetime.typmod = typmod;
+			res->val.datetime.tz = 0;
+			break;
+		case JSONBOID:
+			{
+				JsonbValue *jbv = res;
+				Jsonb	   *jb = DatumGetJsonbP(val);
+
+				if (JsonContainerIsScalar(&jb->root))
+				{
+					bool		result PG_USED_FOR_ASSERTS_ONLY;
+
+					result = JsonbExtractScalar(&jb->root, jbv);
+					Assert(result);
+				}
+				else
+					JsonbInitBinary(jbv, jb);
+				break;
+			}
+		case JSONOID:
+			{
+				text	   *txt = DatumGetTextP(val);
+				char	   *str = text_to_cstring(txt);
+				Jsonb	   *jb;
+
+				jb = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
+														CStringGetDatum(str)));
+				pfree(str);
+
+				JsonItemFromDatum(JsonbPGetDatum(jb), JSONBOID, -1, res);
+				break;
+			}
+		default:
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					errmsg("could not convert value of type %s to jsonpath",
+						   format_type_be(typid)));
+	}
+}
+
+/* Initialize numeric value from the given datum */
+static void
+JsonbValueInitNumericDatum(JsonbValue *jbv, Datum num)
+{
+	jbv->type = jbvNumeric;
+	jbv->val.numeric = DatumGetNumeric(num);
+}
+
+/*
  * Get the value of variable passed to jsonpath executor
  */
 static void
@@ -2183,57 +3135,75 @@ getJsonPathVariable(JsonPathExecContext *cxt, JsonPathItem *variable,
 	int			varNameLength;
 	JsonbValue	baseObject;
 	int			baseObjectId;
+	JsonbValue *v;
 
 	Assert(variable->type == jpiVariable);
 	varName = jspGetString(variable, &varNameLength);
 
-	if (!cxt->vars ||
-		(baseObjectId = cxt->getVar(cxt->vars, varName, varNameLength, value,
-									&baseObject)) < 0)
+	if (cxt->vars == NULL ||
+		(v = cxt->getVar(cxt->vars, varName, varNameLength,
+						 &baseObject, &baseObjectId)) == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("could not find jsonpath variable \"%s\"",
 						pnstrdup(varName, varNameLength))));
 
 	if (baseObjectId > 0)
+	{
+		*value = *v;
 		setBaseObject(cxt, &baseObject, baseObjectId);
+	}
 }
 
-static int
+/*
+ * Definition of JsonPathGetVarCallback for when JsonPathExecContext.vars
+ * is specified as a jsonb value.
+ */
+static JsonbValue *
 getJsonPathVariableFromJsonb(void *varsJsonb, char *varName, int varNameLength,
-							 JsonbValue *value, JsonbValue *baseObject)
+							 JsonbValue *baseObject, int *baseObjectId)
 {
 	Jsonb	   *vars = varsJsonb;
 	JsonbValue	tmp;
-	JsonbValue *v;
-
-	if (!varName)
-	{
-		if (vars && !JsonContainerIsObject(&vars->root))
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("\"vars\" argument is not an object"),
-					 errdetail("Jsonpath parameters should be encoded as key-value pairs of \"vars\" object.")));
-		}
-
-		return vars ? 1 : 0;	/* count of base objects */
-	}
+	JsonbValue *result;
 
 	tmp.type = jbvString;
 	tmp.val.string.val = varName;
 	tmp.val.string.len = varNameLength;
 
-	v = findJsonbValueFromContainer(&vars->root, JB_FOBJECT, &tmp);
+	result = findJsonbValueFromContainer(&vars->root, JB_FOBJECT, &tmp);
 
-	if (!v)
-		return -1;
+	if (result == NULL)
+	{
+		*baseObjectId = -1;
+		return NULL;
+	}
 
-	*value = *v;
-	pfree(v);
-
+	*baseObjectId = 1;
 	JsonbInitBinary(baseObject, vars);
-	return 1;
+
+	return result;
+}
+
+/*
+ * Definition of JsonPathCountVarsCallback for when JsonPathExecContext.vars
+ * is specified as a jsonb value.
+ */
+static int
+countVariablesFromJsonb(void *varsJsonb)
+{
+	Jsonb	   *vars = varsJsonb;
+
+	if (vars && !JsonContainerIsObject(&vars->root))
+	{
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("\"vars\" argument is not an object"),
+				errdetail("Jsonpath parameters should be encoded as key-value pairs of \"vars\" object."));
+	}
+
+	/* count of base objects */
+	return vars != NULL ? 1 : 0;
 }
 
 /**************** Support functions for JsonPath execution *****************/
@@ -2526,7 +3496,7 @@ static void
 JsonValueListClear(JsonValueList *jvl)
 {
 	jvl->singleton = NULL;
-	jvl->list = NULL;
+	jvl->list = NIL;
 }
 
 static void
@@ -2552,7 +3522,7 @@ JsonValueListLength(const JsonValueList *jvl)
 static bool
 JsonValueListIsEmpty(JsonValueList *jvl)
 {
-	return !jvl->singleton && list_length(jvl->list) <= 0;
+	return !jvl->singleton && (jvl->list == NIL);
 }
 
 static JsonbValue *
@@ -2898,14 +3868,20 @@ compareDatetime(Datum val1, Oid typid1, Datum val2, Oid typid2,
 	return DatumGetInt32(DirectFunctionCall2(cmpfunc, val1, val2));
 }
 
-/********************Interface to pgsql's executor***************************/
-
+/*
+ * Executor-callable JSON_EXISTS implementation
+ *
+ * Returns NULL instead of throwing errors if 'error' is not NULL, setting
+ * *error to true.
+ */
 bool
-JsonPathExists(Datum jb, JsonPath *jp, List *vars, bool *error)
+JsonPathExists(Datum jb, JsonPath *jp, bool *error, List *vars)
 {
-	JsonPathExecResult res = executeJsonPath(jp, vars, EvalJsonPathVar,
-											 DatumGetJsonbP(jb), !error, NULL,
-											 true);
+	JsonPathExecResult res;
+
+	res = executeJsonPath(jp, vars,
+						  GetJsonPathVar, CountJsonPathVars,
+						  DatumGetJsonbP(jb), !error, NULL, true);
 
 	Assert(error || !jperIsError(res));
 
@@ -2915,21 +3891,27 @@ JsonPathExists(Datum jb, JsonPath *jp, List *vars, bool *error)
 	return res == jperOk;
 }
 
+/*
+ * Executor-callable JSON_QUERY implementation
+ *
+ * Returns NULL instead of throwing errors if 'error' is not NULL, setting
+ * *error to true.  *empty is set to true if no match is found.
+ */
 Datum
 JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper, bool *empty,
-			  bool *error, List *vars)
+			  bool *error, List *vars,
+			  const char *column_name)
 {
-	JsonbValue *first;
+	JsonbValue *singleton;
 	bool		wrap;
 	JsonValueList found = {0};
-	JsonPathExecResult res PG_USED_FOR_ASSERTS_ONLY;
+	JsonPathExecResult res;
 	int			count;
 
-	res = executeJsonPath(jp, vars, EvalJsonPathVar, DatumGetJsonbP(jb), !error,
-						  &found, true);
-
+	res = executeJsonPath(jp, vars,
+						  GetJsonPathVar, CountJsonPathVars,
+						  DatumGetJsonbP(jb), !error, &found, true);
 	Assert(error || !jperIsError(res));
-
 	if (error && jperIsError(res))
 	{
 		*error = true;
@@ -2937,30 +3919,30 @@ JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper, bool *empty,
 		return (Datum) 0;
 	}
 
+	/* WRAP or not? */
 	count = JsonValueListLength(&found);
-
-	first = count ? JsonValueListHead(&found) : NULL;
-
-	if (!first)
+	singleton = count > 0 ? JsonValueListHead(&found) : NULL;
+	if (singleton == NULL)
 		wrap = false;
-	else if (wrapper == JSW_NONE)
+	else if (wrapper == JSW_NONE || wrapper == JSW_UNSPEC)
 		wrap = false;
 	else if (wrapper == JSW_UNCONDITIONAL)
 		wrap = true;
 	else if (wrapper == JSW_CONDITIONAL)
 		wrap = count > 1 ||
-			IsAJsonbScalar(first) ||
-			(first->type == jbvBinary &&
-			 JsonContainerIsScalar(first->val.binary.data));
+			IsAJsonbScalar(singleton) ||
+			(singleton->type == jbvBinary &&
+			 JsonContainerIsScalar(singleton->val.binary.data));
 	else
 	{
-		elog(ERROR, "unrecognized json wrapper %d", wrapper);
+		elog(ERROR, "unrecognized json wrapper %d", (int) wrapper);
 		wrap = false;
 	}
 
 	if (wrap)
 		return JsonbPGetDatum(JsonbValueToJsonb(wrapItemsInArray(&found)));
 
+	/* No wrapping means only one item is expected. */
 	if (count > 1)
 	{
 		if (error)
@@ -2969,31 +3951,44 @@ JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper, bool *empty,
 			return (Datum) 0;
 		}
 
-		ereport(ERROR,
-				(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
-				 errmsg("JSON path expression in JSON_QUERY should return "
-						"singleton item without wrapper"),
-				 errhint("Use WITH WRAPPER clause to wrap SQL/JSON item "
-						 "sequence into array.")));
+		if (column_name)
+			ereport(ERROR,
+					(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
+					 errmsg("JSON path expression for column \"%s\" should return single item without wrapper",
+							column_name),
+					 errhint("Use WITH WRAPPER clause to wrap SQL/JSON items into array.")));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
+					 errmsg("JSON path expression in JSON_QUERY should return single item without wrapper"),
+					 errhint("Use WITH WRAPPER clause to wrap SQL/JSON items into array.")));
 	}
 
-	if (first)
-		return JsonbPGetDatum(JsonbValueToJsonb(first));
+	if (singleton)
+		return JsonbPGetDatum(JsonbValueToJsonb(singleton));
 
 	*empty = true;
 	return PointerGetDatum(NULL);
 }
 
+/*
+ * Executor-callable JSON_VALUE implementation
+ *
+ * Returns NULL instead of throwing errors if 'error' is not NULL, setting
+ * *error to true.  *empty is set to true if no match is found.
+ */
 JsonbValue *
-JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
+JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars,
+			  const char *column_name)
 {
 	JsonbValue *res;
 	JsonValueList found = {0};
 	JsonPathExecResult jper PG_USED_FOR_ASSERTS_ONLY;
 	int			count;
 
-	jper = executeJsonPath(jp, vars, EvalJsonPathVar, DatumGetJsonbP(jb), !error,
-						   &found, true);
+	jper = executeJsonPath(jp, vars, GetJsonPathVar, CountJsonPathVars,
+						   DatumGetJsonbP(jb),
+						   !error, &found, true);
 
 	Assert(error || !jperIsError(jper));
 
@@ -3006,11 +4001,12 @@ JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
 
 	count = JsonValueListLength(&found);
 
-	*empty = !count;
+	*empty = (count == 0);
 
 	if (*empty)
 		return NULL;
 
+	/* JSON_VALUE expects to get only singletons. */
 	if (count > 1)
 	{
 		if (error)
@@ -3019,18 +4015,22 @@ JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
 			return NULL;
 		}
 
-		ereport(ERROR,
-				(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
-				 errmsg("JSON path expression in JSON_VALUE should return "
-						"singleton scalar item")));
+		if (column_name)
+			ereport(ERROR,
+					(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
+					 errmsg("JSON path expression for column \"%s\" should return single scalar item",
+							column_name)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
+					 errmsg("JSON path expression in JSON_VALUE should return single scalar item")));
 	}
 
 	res = JsonValueListHead(&found);
-
-	if (res->type == jbvBinary &&
-		JsonContainerIsScalar(res->val.binary.data))
+	if (res->type == jbvBinary && JsonContainerIsScalar(res->val.binary.data))
 		JsonbExtractScalar(res->val.binary.data, res);
 
+	/* JSON_VALUE expects to get only scalars. */
 	if (!IsAJsonbScalar(res))
 	{
 		if (error)
@@ -3039,10 +4039,15 @@ JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
 			return NULL;
 		}
 
-		ereport(ERROR,
-				(errcode(ERRCODE_SQL_JSON_SCALAR_REQUIRED),
-				 errmsg("JSON path expression in JSON_VALUE should return "
-						"singleton scalar item")));
+		if (column_name)
+			ereport(ERROR,
+					(errcode(ERRCODE_SQL_JSON_SCALAR_REQUIRED),
+					 errmsg("JSON path expression for column \"%s\" should return single scalar item",
+							column_name)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SQL_JSON_SCALAR_REQUIRED),
+					 errmsg("JSON path expression in JSON_VALUE should return single scalar item")));
 	}
 
 	if (res->type == jbvNull)
@@ -3051,435 +4056,348 @@ JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
 	return res;
 }
 
-static void
-JsonbValueInitNumericDatum(JsonbValue *jbv, Datum num)
-{
-	jbv->type = jbvNumeric;
-	jbv->val.numeric = DatumGetNumeric(num);
-}
-
-void
-JsonItemFromDatum(Datum val, Oid typid, int32 typmod, JsonbValue *res)
-{
-	switch (typid)
-	{
-		case BOOLOID:
-			res->type = jbvBool;
-			res->val.boolean = DatumGetBool(val);
-			break;
-		case NUMERICOID:
-			JsonbValueInitNumericDatum(res, val);
-			break;
-		case INT2OID:
-			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int2_numeric, val));
-			break;
-		case INT4OID:
-			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int4_numeric, val));
-			break;
-		case INT8OID:
-			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int8_numeric, val));
-			break;
-		case FLOAT4OID:
-			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float4_numeric, val));
-			break;
-		case FLOAT8OID:
-			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float8_numeric, val));
-			break;
-		case TEXTOID:
-		case VARCHAROID:
-			res->type = jbvString;
-			res->val.string.val = VARDATA_ANY(val);
-			res->val.string.len = VARSIZE_ANY_EXHDR(val);
-			break;
-		case DATEOID:
-		case TIMEOID:
-		case TIMETZOID:
-		case TIMESTAMPOID:
-		case TIMESTAMPTZOID:
-			res->type = jbvDatetime;
-			res->val.datetime.value = val;
-			res->val.datetime.typid = typid;
-			res->val.datetime.typmod = typmod;
-			res->val.datetime.tz = 0;
-			break;
-		case JSONBOID:
-			{
-				JsonbValue *jbv = res;
-				Jsonb	   *jb = DatumGetJsonbP(val);
-
-				if (JsonContainerIsScalar(&jb->root))
-				{
-					bool		res PG_USED_FOR_ASSERTS_ONLY;
-
-					res = JsonbExtractScalar(&jb->root, jbv);
-					Assert(res);
-				}
-				else
-					JsonbInitBinary(jbv, jb);
-				break;
-			}
-		case JSONOID:
-			{
-				text	   *txt = DatumGetTextP(val);
-				char	   *str = text_to_cstring(txt);
-				Jsonb	   *jb =
-				DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
-												   CStringGetDatum(str)));
-
-				pfree(str);
-
-				JsonItemFromDatum(JsonbPGetDatum(jb), JSONBOID, -1, res);
-				break;
-			}
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("only bool, numeric, and text types could be "
-							"casted to supported jsonpath types.")));
-	}
-}
-
 /************************ JSON_TABLE functions ***************************/
 
 /*
- * Returns private data from executor state. Ensure validity by check with
- * MAGIC number.
+ * Sanity-checks and returns the opaque JsonTableExecContext from the
+ * given executor state struct.
  */
-static inline JsonTableContext *
-GetJsonTableContext(TableFuncScanState *state, const char *fname)
+static inline JsonTableExecContext *
+GetJsonTableExecContext(TableFuncScanState *state, const char *fname)
 {
-	JsonTableContext *result;
+	JsonTableExecContext *result;
 
 	if (!IsA(state, TableFuncScanState))
 		elog(ERROR, "%s called with invalid TableFuncScanState", fname);
-	result = (JsonTableContext *) state->opaque;
-	if (result->magic != JSON_TABLE_CONTEXT_MAGIC)
+	result = (JsonTableExecContext *) state->opaque;
+	if (result->magic != JSON_TABLE_EXEC_CONTEXT_MAGIC)
 		elog(ERROR, "%s called with invalid TableFuncScanState", fname);
 
 	return result;
 }
 
-/* Recursively initialize JSON_TABLE scan state */
-static void
-JsonTableInitScanState(JsonTableContext *cxt, JsonTableScanState *scan,
-					   JsonTableParent *node, JsonTableScanState *parent,
-					   List *args, MemoryContext mcxt)
-{
-	int			i;
-
-	scan->parent = parent;
-	scan->outerJoin = node->outerJoin;
-	scan->errorOnError = node->errorOnError;
-	scan->path = DatumGetJsonPathP(node->path->constvalue);
-	scan->args = args;
-	scan->mcxt = AllocSetContextCreate(mcxt, "JsonTableContext",
-									   ALLOCSET_DEFAULT_SIZES);
-	scan->nested = node->child ?
-		JsonTableInitPlanState(cxt, node->child, scan) : NULL;
-	scan->current = PointerGetDatum(NULL);
-	scan->currentIsNull = true;
-
-	for (i = node->colMin; i <= node->colMax; i++)
-		cxt->colexprs[i].scan = scan;
-}
-
-/* Recursively initialize JSON_TABLE scan state */
-static JsonTableJoinState *
-JsonTableInitPlanState(JsonTableContext *cxt, Node *plan,
-					   JsonTableScanState *parent)
-{
-	JsonTableJoinState *state = palloc0(sizeof(*state));
-
-	if (IsA(plan, JsonTableSibling))
-	{
-		JsonTableSibling *join = castNode(JsonTableSibling, plan);
-
-		state->is_join = true;
-		state->u.join.cross = join->cross;
-		state->u.join.left = JsonTableInitPlanState(cxt, join->larg, parent);
-		state->u.join.right = JsonTableInitPlanState(cxt, join->rarg, parent);
-	}
-	else
-	{
-		JsonTableParent *node = castNode(JsonTableParent, plan);
-
-		state->is_join = false;
-
-		JsonTableInitScanState(cxt, &state->u.scan, node, parent,
-							   parent->args, parent->mcxt);
-	}
-
-	return state;
-}
-
 /*
  * JsonTableInitOpaque
- *		Fill in TableFuncScanState->opaque for JsonTable processor
+ *		Fill in TableFuncScanState->opaque for processing JSON_TABLE
+ *
+ * This initializes the PASSING arguments and the JsonTablePlanState for
+ * JsonTablePlan given in TableFunc.
  */
 static void
 JsonTableInitOpaque(TableFuncScanState *state, int natts)
 {
-	JsonTableContext *cxt;
+	JsonTableExecContext *cxt;
 	PlanState  *ps = &state->ss.ps;
 	TableFuncScan *tfs = castNode(TableFuncScan, ps->plan);
 	TableFunc  *tf = tfs->tablefunc;
-	JsonExpr   *ci = castNode(JsonExpr, tf->docexpr);
-	JsonTableParent *root = castNode(JsonTableParent, tf->plan);
+	JsonTablePlan *rootplan = (JsonTablePlan *) tf->plan;
+	JsonExpr   *je = castNode(JsonExpr, tf->docexpr);
 	List	   *args = NIL;
-	ListCell   *lc;
-	int			i;
 
-	cxt = palloc0(sizeof(JsonTableContext));
-	cxt->magic = JSON_TABLE_CONTEXT_MAGIC;
+	cxt = palloc0(sizeof(JsonTableExecContext));
+	cxt->magic = JSON_TABLE_EXEC_CONTEXT_MAGIC;
 
-	if (ci->passing_values)
+	/*
+	 * Evaluate JSON_TABLE() PASSING arguments to be passed to the jsonpath
+	 * executor via JsonPathVariables.
+	 */
+	if (state->passingvalexprs)
 	{
 		ListCell   *exprlc;
 		ListCell   *namelc;
 
-		forboth(exprlc, ci->passing_values,
-				namelc, ci->passing_names)
+		Assert(list_length(state->passingvalexprs) ==
+			   list_length(je->passing_names));
+		forboth(exprlc, state->passingvalexprs,
+				namelc, je->passing_names)
 		{
-			Expr	   *expr = (Expr *) lfirst(exprlc);
+			ExprState  *state = lfirst_node(ExprState, exprlc);
 			String	   *name = lfirst_node(String, namelc);
-			JsonPathVariableEvalContext *var = palloc(sizeof(*var));
+			JsonPathVariable *var = palloc(sizeof(*var));
 
 			var->name = pstrdup(name->sval);
-			var->typid = exprType((Node *) expr);
-			var->typmod = exprTypmod((Node *) expr);
-			var->estate = ExecInitExpr(expr, ps);
-			var->econtext = ps->ps_ExprContext;
-			var->mcxt = CurrentMemoryContext;
-			var->evaluated = false;
-			var->value = (Datum) 0;
-			var->isnull = true;
+			var->typid = exprType((Node *) state->expr);
+			var->typmod = exprTypmod((Node *) state->expr);
+
+			/*
+			 * Evaluate the expression and save the value to be returned by
+			 * GetJsonPathVar().
+			 */
+			var->value = ExecEvalExpr(state, ps->ps_ExprContext,
+									  &var->isnull);
 
 			args = lappend(args, var);
 		}
 	}
 
-	cxt->colexprs = palloc(sizeof(*cxt->colexprs) *
-						   list_length(tf->colvalexprs));
+	cxt->colplanstates = palloc(sizeof(JsonTablePlanState *) *
+								list_length(tf->colvalexprs));
 
-	JsonTableInitScanState(cxt, &cxt->root, root, NULL, args,
-						   CurrentMemoryContext);
-
-	i = 0;
-
-	foreach(lc, tf->colvalexprs)
-	{
-		Expr	   *expr = lfirst(lc);
-
-		cxt->colexprs[i].expr =
-			ExecInitExprWithCaseValue(expr, ps,
-									  &cxt->colexprs[i].scan->current,
-									  &cxt->colexprs[i].scan->currentIsNull);
-
-		i++;
-	}
+	/*
+	 * Initialize plan for the root path and, recursively, also any child
+	 * plans that compute the NESTED paths.
+	 */
+	cxt->rootplanstate = JsonTableInitPlan(cxt, rootplan, NULL, args,
+										   CurrentMemoryContext);
 
 	state->opaque = cxt;
 }
 
-/* Reset scan iterator to the beginning of the item list */
+/*
+ * JsonTableDestroyOpaque
+ *		Resets state->opaque
+ */
 static void
-JsonTableRescan(JsonTableScanState *scan)
+JsonTableDestroyOpaque(TableFuncScanState *state)
 {
-	JsonValueListInitIterator(&scan->found, &scan->iter);
-	scan->current = PointerGetDatum(NULL);
-	scan->currentIsNull = true;
-	scan->advanceNested = false;
-	scan->ordinal = 0;
+	JsonTableExecContext *cxt =
+		GetJsonTableExecContext(state, "JsonTableDestroyOpaque");
+
+	/* not valid anymore */
+	cxt->magic = 0;
+
+	state->opaque = NULL;
 }
 
-/* Reset context item of a scan, execute JSON path and reset a scan */
-static void
-JsonTableResetContextItem(JsonTableScanState *scan, Datum item)
+/*
+ * JsonTableInitPlan
+ *		Initialize information for evaluating jsonpath in the given
+ *		JsonTablePlan and, recursively, in any child plans
+ */
+static JsonTablePlanState *
+JsonTableInitPlan(JsonTableExecContext *cxt, JsonTablePlan *plan,
+				  JsonTablePlanState *parentstate,
+				  List *args, MemoryContext mcxt)
 {
+	JsonTablePlanState *planstate = palloc0(sizeof(*planstate));
+
+	planstate->plan = plan;
+	planstate->parent = parentstate;
+
+	if (IsA(plan, JsonTablePathScan))
+	{
+		JsonTablePathScan *scan = (JsonTablePathScan *) plan;
+		int			i;
+
+		planstate->path = DatumGetJsonPathP(scan->path->value->constvalue);
+		planstate->args = args;
+		planstate->mcxt = AllocSetContextCreate(mcxt, "JsonTableExecContext",
+												ALLOCSET_DEFAULT_SIZES);
+
+		/* No row pattern evaluated yet. */
+		planstate->current.value = PointerGetDatum(NULL);
+		planstate->current.isnull = true;
+
+		for (i = scan->colMin; i >= 0 && i <= scan->colMax; i++)
+			cxt->colplanstates[i] = planstate;
+
+		planstate->nested = scan->child ?
+			JsonTableInitPlan(cxt, scan->child, planstate, args, mcxt) : NULL;
+	}
+	else if (IsA(plan, JsonTableSiblingJoin))
+	{
+		JsonTableSiblingJoin *join = (JsonTableSiblingJoin *) plan;
+
+		planstate->left = JsonTableInitPlan(cxt, join->lplan, parentstate,
+											args, mcxt);
+		planstate->right = JsonTableInitPlan(cxt, join->rplan, parentstate,
+											 args, mcxt);
+	}
+
+	return planstate;
+}
+
+/*
+ * JsonTableSetDocument
+ *		Install the input document and evaluate the row pattern
+ */
+static void
+JsonTableSetDocument(TableFuncScanState *state, Datum value)
+{
+	JsonTableExecContext *cxt =
+		GetJsonTableExecContext(state, "JsonTableSetDocument");
+
+	JsonTableResetRowPattern(cxt->rootplanstate, value);
+}
+
+/*
+ * Evaluate a JsonTablePlan's jsonpath to get a new row pattern from
+ * the given context item
+ */
+static void
+JsonTableResetRowPattern(JsonTablePlanState *planstate, Datum item)
+{
+	JsonTablePathScan *scan = castNode(JsonTablePathScan, planstate->plan);
 	MemoryContext oldcxt;
 	JsonPathExecResult res;
 	Jsonb	   *js = (Jsonb *) DatumGetJsonbP(item);
 
-	JsonValueListClear(&scan->found);
+	JsonValueListClear(&planstate->found);
 
-	MemoryContextResetOnly(scan->mcxt);
+	MemoryContextResetOnly(planstate->mcxt);
 
-	oldcxt = MemoryContextSwitchTo(scan->mcxt);
+	oldcxt = MemoryContextSwitchTo(planstate->mcxt);
 
-	res = executeJsonPath(scan->path, scan->args, EvalJsonPathVar, js,
-						  scan->errorOnError, &scan->found, false /* FIXME */ );
+	res = executeJsonPath(planstate->path, planstate->args,
+						  GetJsonPathVar, CountJsonPathVars,
+						  js, scan->errorOnError,
+						  &planstate->found,
+						  true);
 
 	MemoryContextSwitchTo(oldcxt);
 
 	if (jperIsError(res))
 	{
 		Assert(!scan->errorOnError);
-		JsonValueListClear(&scan->found);	/* EMPTY ON ERROR case */
+		JsonValueListClear(&planstate->found);
 	}
 
-	JsonTableRescan(scan);
+	/* Reset plan iterator to the beginning of the item list */
+	JsonValueListInitIterator(&planstate->found, &planstate->iter);
+	planstate->current.value = PointerGetDatum(NULL);
+	planstate->current.isnull = true;
+	planstate->ordinal = 0;
 }
 
 /*
- * JsonTableSetDocument
- *		Install the input document
- */
-static void
-JsonTableSetDocument(TableFuncScanState *state, Datum value)
-{
-	JsonTableContext *cxt = GetJsonTableContext(state, "JsonTableSetDocument");
-
-	JsonTableResetContextItem(&cxt->root, value);
-}
-
-/* Recursively reset scan and its child nodes */
-static void
-JsonTableRescanRecursive(JsonTableJoinState *state)
-{
-	if (state->is_join)
-	{
-		JsonTableRescanRecursive(state->u.join.left);
-		JsonTableRescanRecursive(state->u.join.right);
-		state->u.join.advanceRight = false;
-	}
-	else
-	{
-		JsonTableRescan(&state->u.scan);
-		if (state->u.scan.nested)
-			JsonTableRescanRecursive(state->u.scan.nested);
-	}
-}
-
-/*
- * Fetch next row from a cross/union joined scan.
+ * Fetch next row from a JsonTablePlan.
  *
- * Returns false at the end of a scan, true otherwise.
+ * Returns false if the plan has run out of rows, true otherwise.
  */
 static bool
-JsonTableNextJoinRow(JsonTableJoinState *state)
+JsonTablePlanNextRow(JsonTablePlanState *planstate)
 {
-	if (!state->is_join)
-		return JsonTableNextRow(&state->u.scan);
+	if (IsA(planstate->plan, JsonTablePathScan))
+		return JsonTablePlanScanNextRow(planstate);
+	else if (IsA(planstate->plan, JsonTableSiblingJoin))
+		return JsonTablePlanJoinNextRow(planstate);
+	else
+		elog(ERROR, "invalid JsonTablePlan %d", (int) planstate->plan->type);
 
-	if (state->u.join.advanceRight)
+	Assert(false);
+	/* Appease compiler */
+	return false;
+}
+
+/*
+ * Fetch next row from a JsonTablePlan's path evaluation result and from
+ * any child nested path(s).
+ *
+ * Returns true if any of the paths (this or the nested) has more rows to
+ * return.
+ *
+ * By fetching the nested path(s)'s rows based on the parent row at each
+ * level, this essentially joins the rows of different levels.  If a nested
+ * path at a given level has no matching rows, the columns of that level will
+ * compute to NULL, making it an OUTER join.
+ */
+static bool
+JsonTablePlanScanNextRow(JsonTablePlanState *planstate)
+{
+	JsonbValue *jbv;
+	MemoryContext oldcxt;
+
+	/*
+	 * If planstate already has an active row and there is a nested plan,
+	 * check if it has an active row to join with the former.
+	 */
+	if (!planstate->current.isnull)
 	{
-		/* fetch next inner row */
-		if (JsonTableNextJoinRow(state->u.join.right))
+		if (planstate->nested && JsonTablePlanNextRow(planstate->nested))
 			return true;
-
-		/* inner rows are exhausted */
-		if (state->u.join.cross)
-			state->u.join.advanceRight = false; /* next outer row */
-		else
-			return false;		/* end of scan */
 	}
 
-	while (!state->u.join.advanceRight)
+	/* Fetch new row from the list of found values to set as active. */
+	jbv = JsonValueListNext(&planstate->found, &planstate->iter);
+
+	/* End of list? */
+	if (jbv == NULL)
 	{
-		/* fetch next outer row */
-		bool		left = JsonTableNextJoinRow(state->u.join.left);
-
-		if (state->u.join.cross)
-		{
-			if (!left)
-				return false;	/* end of scan */
-
-			JsonTableRescanRecursive(state->u.join.right);
-
-			if (!JsonTableNextJoinRow(state->u.join.right))
-				continue;		/* next outer row */
-
-			state->u.join.advanceRight = true;	/* next inner row */
-		}
-		else if (!left)
-		{
-			if (!JsonTableNextJoinRow(state->u.join.right))
-				return false;	/* end of scan */
-
-			state->u.join.advanceRight = true;	/* next inner row */
-		}
-
-		break;
+		planstate->current.value = PointerGetDatum(NULL);
+		planstate->current.isnull = true;
+		return false;
 	}
 
+	/*
+	 * Set current row item for subsequent JsonTableGetValue() calls for
+	 * evaluating individual columns.
+	 */
+	oldcxt = MemoryContextSwitchTo(planstate->mcxt);
+	planstate->current.value = JsonbPGetDatum(JsonbValueToJsonb(jbv));
+	planstate->current.isnull = false;
+	MemoryContextSwitchTo(oldcxt);
+
+	/* Next row! */
+	planstate->ordinal++;
+
+	/* Process nested plan(s), if any. */
+	if (planstate->nested)
+	{
+		/* Re-evaluate the nested path using the above parent row. */
+		JsonTableResetNestedPlan(planstate->nested);
+
+		/*
+		 * Now fetch the nested plan's current row to be joined against the
+		 * parent row.  Any further nested plans' paths will be re-evaluated
+		 * recursively, level at a time, after setting each nested plan's
+		 * current row.
+		 */
+		(void) JsonTablePlanNextRow(planstate->nested);
+	}
+
+	/* There are more rows. */
 	return true;
 }
 
-/* Recursively set 'reset' flag of scan and its child nodes */
+/*
+ * Re-evaluate the row pattern of a nested plan using the new parent row
+ * pattern.
+ */
 static void
-JsonTableJoinReset(JsonTableJoinState *state)
+JsonTableResetNestedPlan(JsonTablePlanState *planstate)
 {
-	if (state->is_join)
+	/* This better be a child plan. */
+	Assert(planstate->parent != NULL);
+	if (IsA(planstate->plan, JsonTablePathScan))
 	{
-		JsonTableJoinReset(state->u.join.left);
-		JsonTableJoinReset(state->u.join.right);
-		state->u.join.advanceRight = false;
-	}
-	else
-	{
-		state->u.scan.reset = true;
-		state->u.scan.advanceNested = false;
+		JsonTablePlanState *parent = planstate->parent;
 
-		if (state->u.scan.nested)
-			JsonTableJoinReset(state->u.scan.nested);
+		if (!parent->current.isnull)
+			JsonTableResetRowPattern(planstate, parent->current.value);
+
+		/*
+		 * If this plan itself has a child nested plan, it will be reset when
+		 * the caller calls JsonTablePlanNextRow() on this plan.
+		 */
+	}
+	else if (IsA(planstate->plan, JsonTableSiblingJoin))
+	{
+		JsonTableResetNestedPlan(planstate->left);
+		JsonTableResetNestedPlan(planstate->right);
 	}
 }
 
 /*
- * Fetch next row from a simple scan with outer/inner joined nested subscans.
+ * Fetch the next row from a JsonTableSiblingJoin.
  *
- * Returns false at the end of a scan, true otherwise.
+ * This is essentially a UNION between the rows from left and right siblings.
  */
 static bool
-JsonTableNextRow(JsonTableScanState *scan)
+JsonTablePlanJoinNextRow(JsonTablePlanState *planstate)
 {
-	/* reset context item if requested */
-	if (scan->reset)
+
+	/* Fetch row from left sibling. */
+	if (!JsonTablePlanNextRow(planstate->left))
 	{
-		Assert(!scan->parent->currentIsNull);
-		JsonTableResetContextItem(scan, scan->parent->current);
-		scan->reset = false;
-	}
-
-	if (scan->advanceNested)
-	{
-		/* fetch next nested row */
-		scan->advanceNested = JsonTableNextJoinRow(scan->nested);
-
-		if (scan->advanceNested)
-			return true;
-	}
-
-	for (;;)
-	{
-		/* fetch next row */
-		JsonbValue *jbv = JsonValueListNext(&scan->found, &scan->iter);
-		MemoryContext oldcxt;
-
-		if (!jbv)
+		/*
+		 * Left sibling ran out of rows, so start fetching from the right
+		 * sibling.
+		 */
+		if (!JsonTablePlanNextRow(planstate->right))
 		{
-			scan->current = PointerGetDatum(NULL);
-			scan->currentIsNull = true;
-			return false;		/* end of scan */
+			/* Right sibling ran out of row, so there are more rows. */
+			return false;
 		}
-
-		/* set current row item */
-		oldcxt = MemoryContextSwitchTo(scan->mcxt);
-		scan->current = JsonbPGetDatum(JsonbValueToJsonb(jbv));
-		scan->currentIsNull = false;
-		MemoryContextSwitchTo(oldcxt);
-
-		scan->ordinal++;
-
-		if (!scan->nested)
-			break;
-
-		JsonTableJoinReset(scan->nested);
-
-		scan->advanceNested = JsonTableNextJoinRow(scan->nested);
-
-		if (scan->advanceNested || scan->outerJoin)
-			break;
 	}
 
 	return true;
@@ -3487,18 +4405,17 @@ JsonTableNextRow(JsonTableScanState *scan)
 
 /*
  * JsonTableFetchRow
- *		Prepare the next "current" tuple for upcoming GetValue calls.
- *		Returns FALSE if the row-filter expression returned no more rows.
+ *		Prepare the next "current" row for upcoming GetValue calls.
+ *
+ * Returns false if no more rows can be returned.
  */
 static bool
 JsonTableFetchRow(TableFuncScanState *state)
 {
-	JsonTableContext *cxt = GetJsonTableContext(state, "JsonTableFetchRow");
+	JsonTableExecContext *cxt =
+		GetJsonTableExecContext(state, "JsonTableFetchRow");
 
-	if (cxt->empty)
-		return false;
-
-	return JsonTableNextRow(&cxt->root);
+	return JsonTablePlanNextRow(cxt->rootplanstate);
 }
 
 /*
@@ -3512,52 +4429,41 @@ static Datum
 JsonTableGetValue(TableFuncScanState *state, int colnum,
 				  Oid typid, int32 typmod, bool *isnull)
 {
-	JsonTableContext *cxt = GetJsonTableContext(state, "JsonTableGetValue");
+	JsonTableExecContext *cxt =
+		GetJsonTableExecContext(state, "JsonTableGetValue");
 	ExprContext *econtext = state->ss.ps.ps_ExprContext;
-	ExprState  *estate = cxt->colexprs[colnum].expr;
-	JsonTableScanState *scan = cxt->colexprs[colnum].scan;
+	ExprState  *estate = list_nth(state->colvalexprs, colnum);
+	JsonTablePlanState *planstate = cxt->colplanstates[colnum];
+	JsonTablePlanRowSource *current = &planstate->current;
 	Datum		result;
 
-	if (scan->currentIsNull)	/* NULL from outer/union join */
+	/* Row pattern value is NULL */
+	if (current->isnull)
 	{
 		result = (Datum) 0;
 		*isnull = true;
 	}
-	else if (estate)			/* regular column */
+	/* Evaluate JsonExpr. */
+	else if (estate)
 	{
+		Datum		saved_caseValue = econtext->caseValue_datum;
+		bool		saved_caseIsNull = econtext->caseValue_isNull;
+
+		/* Pass the row pattern value via CaseTestExpr. */
+		econtext->caseValue_datum = current->value;
+		econtext->caseValue_isNull = false;
+
 		result = ExecEvalExpr(estate, econtext, isnull);
+
+		econtext->caseValue_datum = saved_caseValue;
+		econtext->caseValue_isNull = saved_caseIsNull;
 	}
+	/* ORDINAL column */
 	else
 	{
-		result = Int32GetDatum(scan->ordinal);	/* ordinality column */
+		result = Int32GetDatum(planstate->ordinal);
 		*isnull = false;
 	}
 
 	return result;
 }
-
-/*
- * JsonTableDestroyOpaque
- */
-static void
-JsonTableDestroyOpaque(TableFuncScanState *state)
-{
-	JsonTableContext *cxt = GetJsonTableContext(state, "JsonTableDestroyOpaque");
-
-	/* not valid anymore */
-	cxt->magic = 0;
-
-	state->opaque = NULL;
-}
-
-const TableFuncRoutine JsonbTableRoutine =
-{
-	JsonTableInitOpaque,
-	JsonTableSetDocument,
-	NULL,
-	NULL,
-	NULL,
-	JsonTableFetchRow,
-	JsonTableGetValue,
-	JsonTableDestroyOpaque
-};

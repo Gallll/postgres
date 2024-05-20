@@ -3,7 +3,7 @@
  * pgoutput.h
  *		Logical Replication output plugin
  *
- * Copyright (c) 2015-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/include/replication/pgoutput.h
@@ -21,15 +21,18 @@ typedef struct PGOutputData
 								 * allocations */
 	MemoryContext cachectx;		/* private memory context for cache data */
 
+	bool		in_streaming;	/* true if we are streaming a chunk of
+								 * transaction */
+
 	/* client-supplied info: */
 	uint32		protocol_version;
 	List	   *publication_names;
 	List	   *publications;
 	bool		binary;
-	bool		streaming;
+	char		streaming;
 	bool		messages;
 	bool		two_phase;
-	char	   *origin;
+	bool		publish_no_origin;
 } PGOutputData;
 
 #endif							/* PGOUTPUT_H */

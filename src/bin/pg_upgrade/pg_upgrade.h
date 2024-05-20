@@ -1,7 +1,7 @@
 /*
  *	pg_upgrade.h
  *
- *	Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.h
  */
 
@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "common/relpath.h"
 #include "libpq-fe.h"
 
 /* For now, pg_upgrade does not use common/logging.c; use our own pg_fatal */
@@ -21,7 +22,7 @@
 #define MAX_STRING			1024
 #define QUERY_ALLOC			8192
 
-#define MESSAGE_WIDTH		60
+#define MESSAGE_WIDTH		62
 
 #define GET_MAJOR_VERSION(v)	((v) / 100)
 
@@ -150,6 +151,26 @@ typedef struct
 } RelInfoArr;
 
 /*
+ * Structure to store logical replication slot information.
+ */
+typedef struct
+{
+	char	   *slotname;		/* slot name */
+	char	   *plugin;			/* plugin */
+	bool		two_phase;		/* can the slot decode 2PC? */
+	bool		caught_up;		/* has the slot caught up to latest changes? */
+	bool		invalid;		/* if true, the slot is unusable */
+	bool		failover;		/* is the slot designated to be synced to the
+								 * physical standby? */
+} LogicalSlotInfo;
+
+typedef struct
+{
+	int			nslots;			/* number of logical slot infos */
+	LogicalSlotInfo *slots;		/* array of logical slot infos */
+} LogicalSlotInfoArr;
+
+/*
  * The following structure represents a relation mapping.
  */
 typedef struct
@@ -174,13 +195,22 @@ typedef struct
 	char	   *db_name;		/* database name */
 	char		db_tablespace[MAXPGPATH];	/* database default tablespace
 											 * path */
+	RelInfoArr	rel_arr;		/* array of all user relinfos */
+	LogicalSlotInfoArr slot_arr;	/* array of all LogicalSlotInfo */
+	int			nsubs;			/* number of subscriptions */
+} DbInfo;
+
+/*
+ * Locale information about a database.
+ */
+typedef struct
+{
 	char	   *db_collate;
 	char	   *db_ctype;
 	char		db_collprovider;
-	char	   *db_iculocale;
+	char	   *db_locale;
 	int			db_encoding;
-	RelInfoArr	rel_arr;		/* array of all user relinfos */
-} DbInfo;
+} DbLocaleInfo;
 
 typedef struct
 {
@@ -216,7 +246,7 @@ typedef struct
 	uint32		large_object;
 	bool		date_is_int;
 	bool		float8_pass_by_value;
-	bool		data_checksum_version;
+	uint32		data_checksum_version;
 } ControlData;
 
 /*
@@ -226,7 +256,8 @@ typedef enum
 {
 	TRANSFER_MODE_CLONE,
 	TRANSFER_MODE_COPY,
-	TRANSFER_MODE_LINK
+	TRANSFER_MODE_COPY_FILE_RANGE,
+	TRANSFER_MODE_LINK,
 } transferMode;
 
 /*
@@ -239,11 +270,8 @@ typedef enum
 	PG_REPORT_NONL,				/* these too */
 	PG_REPORT,
 	PG_WARNING,
-	PG_FATAL
+	PG_FATAL,
 } eLogType;
-
-
-typedef long pgpid_t;
 
 
 /*
@@ -254,6 +282,7 @@ typedef long pgpid_t;
 typedef struct
 {
 	ControlData controldata;	/* pg_control information */
+	DbLocaleInfo *template0;	/* template0 locale info */
 	DbInfoArr	dbarr;			/* dbinfos array */
 	char	   *pgdata;			/* pathname for cluster's $PGDATA directory */
 	char	   *pgconfig;		/* pathname for cluster's config file
@@ -298,6 +327,7 @@ typedef struct
 	transferMode transfer_mode; /* copy files or link them? */
 	int			jobs;			/* number of processes/threads to use */
 	char	   *socketdir;		/* directory to use for Unix sockets */
+	char	   *sync_method;
 } UserOpts;
 
 typedef struct
@@ -321,6 +351,9 @@ typedef struct
 	ClusterInfo *running_cluster;
 } OSInfo;
 
+
+/* Function signature for data type check version hook */
+typedef bool (*DataTypesUsageVersionCheck) (ClusterInfo *cluster);
 
 /*
  * Global variables
@@ -361,7 +394,7 @@ void		generate_old_dump(void);
 
 #define EXEC_PSQL_ARGS "--echo-queries --set ON_ERROR_STOP=on --no-psqlrc --dbname=template1"
 
-bool		exec_prog(const char *log_file, const char *opt_log_file,
+bool		exec_prog(const char *log_filename, const char *opt_log_file,
 					  bool report_error, bool exit_on_error, const char *fmt,...) pg_attribute_printf(5, 6);
 void		verify_directories(void);
 bool		pid_lock_file_exists(const char *datadir);
@@ -373,11 +406,14 @@ void		cloneFile(const char *src, const char *dst,
 					  const char *schemaName, const char *relName);
 void		copyFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
+void		copyFileByRange(const char *src, const char *dst,
+							const char *schemaName, const char *relName);
 void		linkFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
 void		rewriteVisibilityMap(const char *fromfile, const char *tofile,
 								 const char *schemaName, const char *relName);
 void		check_file_clone(void);
+void		check_copy_file_range(void);
 void		check_hard_link(void);
 
 /* fopen_priv() is no longer different from fopen() */
@@ -393,7 +429,9 @@ void		check_loadable_libraries(void);
 FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
-void		get_db_and_rel_infos(ClusterInfo *cluster);
+void		get_db_rel_and_slot_infos(ClusterInfo *cluster, bool live_check);
+int			count_old_cluster_logical_slots(void);
+int			count_old_cluster_subscriptions(void);
 
 /* option.c */
 
@@ -444,18 +482,10 @@ unsigned int str2uint(const char *str);
 
 /* version.c */
 
-bool		check_for_data_types_usage(ClusterInfo *cluster,
-									   const char *base_query,
-									   const char *output_path);
-bool		check_for_data_type_usage(ClusterInfo *cluster,
-									  const char *type_name,
-									  const char *output_path);
-void		old_9_3_check_for_line_data_type_usage(ClusterInfo *cluster);
-void		old_9_6_check_for_unknown_data_type_usage(ClusterInfo *cluster);
+bool		jsonb_9_4_check_applicable(ClusterInfo *cluster);
 void		old_9_6_invalidate_hash_indexes(ClusterInfo *cluster,
 											bool check_mode);
 
-void		old_11_check_for_sql_identifier_data_type_usage(ClusterInfo *cluster);
 void		report_extension_updates(ClusterInfo *cluster);
 
 /* parallel.c */

@@ -74,9 +74,6 @@ pgxml_parser_init(PgXmlStrictness strictness)
 	/* Initialize libxml */
 	xmlInitParser();
 
-	xmlSubstituteEntitiesDefault(1);
-	xmlLoadExtDtdDefaultValue = 1;
-
 	return xmlerrcxt;
 }
 
@@ -380,8 +377,9 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 
 	PG_TRY();
 	{
-		workspace->doctree = xmlParseMemory((char *) VARDATA_ANY(document),
-											docsize);
+		workspace->doctree = xmlReadMemory((char *) VARDATA_ANY(document),
+										   docsize, NULL, NULL,
+										   XML_PARSE_NOENT);
 		if (workspace->doctree != NULL)
 		{
 			workspace->ctxt = xmlXPathNewContext(workspace->doctree);
@@ -511,7 +509,7 @@ xpath_table(PG_FUNCTION_ARGS)
 	PgXmlErrorContext *xmlerrcxt;
 	volatile xmlDocPtr doctree = NULL;
 
-	SetSingleFuncCall(fcinfo, SRF_SINGLE_USE_EXPECTED);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 
 	/* must have at least one output column (for the pkey) */
 	if (rsinfo->setDesc->natts < 1)
@@ -624,7 +622,9 @@ xpath_table(PG_FUNCTION_ARGS)
 
 			/* Parse the document */
 			if (xmldoc)
-				doctree = xmlParseMemory(xmldoc, strlen(xmldoc));
+				doctree = xmlReadMemory(xmldoc, strlen(xmldoc),
+										NULL, NULL,
+										XML_PARSE_NOENT);
 			else				/* treat NULL as not well-formed */
 				doctree = NULL;
 

@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2024, PostgreSQL Global Development Group
  *
  * src/bin/psql/help.c
  */
@@ -50,21 +50,9 @@
 void
 usage(unsigned short int pager)
 {
-	const char *env;
-	const char *user;
-	char	   *errstr;
 	PQExpBufferData buf;
 	int			nlcount;
 	FILE	   *output;
-
-	/* Find default user, in case we need it. */
-	user = getenv("PGUSER");
-	if (!user)
-	{
-		user = get_user_name(&errstr);
-		if (!user)
-			pg_fatal("%s", errstr);
-	}
 
 	/*
 	 * To avoid counting the output lines manually, build the output in "buf"
@@ -77,13 +65,8 @@ usage(unsigned short int pager)
 	HELP0("  psql [OPTION]... [DBNAME [USERNAME]]\n\n");
 
 	HELP0("General options:\n");
-	/* Display default database */
-	env = getenv("PGDATABASE");
-	if (!env)
-		env = user;
 	HELP0("  -c, --command=COMMAND    run only single command (SQL or internal) and exit\n");
-	HELPN("  -d, --dbname=DBNAME      database name to connect to (default: \"%s\")\n",
-		  env);
+	HELP0("  -d, --dbname=DBNAME      database name to connect to\n");
 	HELP0("  -f, --file=FILENAME      execute commands from file, then exit\n");
 	HELP0("  -l, --list               list available databases, then exit\n");
 	HELP0("  -v, --set=, --variable=NAME=VALUE\n"
@@ -128,17 +111,9 @@ usage(unsigned short int pager)
 		  "                           set record separator for unaligned output to zero byte\n");
 
 	HELP0("\nConnection options:\n");
-	/* Display default host */
-	env = getenv("PGHOST");
-	HELPN("  -h, --host=HOSTNAME      database server host or socket directory (default: \"%s\")\n",
-		  env ? env : _("local socket"));
-	/* Display default port */
-	env = getenv("PGPORT");
-	HELPN("  -p, --port=PORT          database server port (default: \"%s\")\n",
-		  env ? env : DEF_PGPORT_STR);
-	/* Display default user */
-	HELPN("  -U, --username=USERNAME  database user name (default: \"%s\")\n",
-		  user);
+	HELP0("  -h, --host=HOSTNAME      database server host or socket directory\n");
+	HELP0("  -p, --port=PORT          database server port\n");
+	HELP0("  -U, --username=USERNAME  database user name\n");
 	HELP0("  -w, --no-password        never prompt for password\n");
 	HELP0("  -W, --password           force password prompt (should happen automatically)\n");
 
@@ -189,6 +164,7 @@ slashUsage(unsigned short int pager)
 	initPQExpBuffer(&buf);
 
 	HELP0("General\n");
+	HELP0("  \\bind [PARAM]...       set query parameters\n");
 	HELP0("  \\copyright             show PostgreSQL usage and distribution terms\n");
 	HELP0("  \\crosstabview [COLUMNS] execute query and display result in crosstab\n");
 	HELP0("  \\errverbose            show most recent error message at maximum verbosity\n");
@@ -199,7 +175,9 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\gset [PREFIX]         execute query and store result in psql variables\n");
 	HELP0("  \\gx [(OPTIONS)] [FILE] as \\g, but forces expanded output mode\n");
 	HELP0("  \\q                     quit psql\n");
-	HELP0("  \\watch [SEC]           execute query every SEC seconds\n");
+	HELP0("  \\watch [[i=]SEC] [c=N] [m=MIN]\n"
+		  "                         execute query every SEC seconds, up to N times,\n"
+		  "                         stop if less than MIN rows are returned\n");
 	HELP0("\n");
 
 	HELP0("Help\n");
@@ -276,9 +254,10 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\do[S+] [OPPTRN [TYPEPTRN [TYPEPTRN]]]\n"
 		  "                         list operators\n");
 	HELP0("  \\dO[S+] [PATTERN]      list collations\n");
-	HELP0("  \\dp     [PATTERN]      list table, view, and sequence access privileges\n");
+	HELP0("  \\dp[S]  [PATTERN]      list table, view, and sequence access privileges\n");
 	HELP0("  \\dP[itn+] [PATTERN]    list [only index/table] partitioned relations [n=nested]\n");
 	HELP0("  \\drds [ROLEPTRN [DBPTRN]] list per-database role settings\n");
+	HELP0("  \\drg[S] [PATTERN]      list role grants\n");
 	HELP0("  \\dRp[+] [PATTERN]      list replication publications\n");
 	HELP0("  \\dRs[+] [PATTERN]      list replication subscriptions\n");
 	HELP0("  \\ds[S+] [PATTERN]      list sequences\n");
@@ -292,7 +271,7 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\l[+]   [PATTERN]      list databases\n");
 	HELP0("  \\sf[+]  FUNCNAME       show a function's definition\n");
 	HELP0("  \\sv[+]  VIEWNAME       show a view's definition\n");
-	HELP0("  \\z      [PATTERN]      same as \\dp\n");
+	HELP0("  \\z[S]   [PATTERN]      same as \\dp\n");
 	HELP0("\n");
 
 	HELP0("Large Objects\n");
@@ -409,7 +388,7 @@ helpVariables(unsigned short int pager)
 	HELP0("  ENCODING\n"
 		  "    current client character set encoding\n");
 	HELP0("  ERROR\n"
-		  "    true if last query failed, else false\n");
+		  "    \"true\" if last query failed, else \"false\"\n");
 	HELP0("  FETCH_COUNT\n"
 		  "    the number of result rows to fetch and display at a time (0 = unlimited)\n");
 	HELP0("  HIDE_TABLEAM\n"
@@ -450,6 +429,10 @@ helpVariables(unsigned short int pager)
 	HELP0("  SERVER_VERSION_NAME\n"
 		  "  SERVER_VERSION_NUM\n"
 		  "    server's version (in short string or numeric format)\n");
+	HELP0("  SHELL_ERROR\n"
+		  "    \"true\" if the last shell command failed, \"false\" if it succeeded\n");
+	HELP0("  SHELL_EXIT_CODE\n"
+		  "    exit status of the last shell command\n");
 	HELP0("  SHOW_ALL_RESULTS\n"
 		  "    show all results of a combined query (\\;) instead of only the last\n");
 	HELP0("  SHOW_CONTEXT\n"
@@ -747,7 +730,7 @@ print_copyright(void)
 {
 	puts("PostgreSQL Database Management System\n"
 		 "(formerly known as Postgres, then as Postgres95)\n\n"
-		 "Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group\n\n"
+		 "Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group\n\n"
 		 "Portions Copyright (c) 1994, The Regents of the University of California\n\n"
 		 "Permission to use, copy, modify, and distribute this software and its\n"
 		 "documentation for any purpose, without fee, and without a written agreement\n"

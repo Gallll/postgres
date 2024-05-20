@@ -3,7 +3,7 @@
  * nodeTableFuncscan.c
  *	  Support routines for scanning RangeTableFunc (XMLTABLE like functions).
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -184,6 +184,10 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 		ExecInitExprList(tf->colexprs, (PlanState *) scanstate);
 	scanstate->coldefexprs =
 		ExecInitExprList(tf->coldefexprs, (PlanState *) scanstate);
+	scanstate->colvalexprs =
+		ExecInitExprList(tf->colvalexprs, (PlanState *) scanstate);
+	scanstate->passingvalexprs =
+		ExecInitExprList(tf->passingvalexprs, (PlanState *) scanstate);
 
 	scanstate->notnulls = tf->notnulls;
 
@@ -215,18 +219,6 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 void
 ExecEndTableFuncScan(TableFuncScanState *node)
 {
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
 	/*
 	 * Release tuplestore resources
 	 */
@@ -288,11 +280,12 @@ tfuncFetchRows(TableFuncScanState *tstate, ExprContext *econtext)
 
 	/*
 	 * Each call to fetch a new set of rows - of which there may be very many
-	 * if XMLTABLE is being used in a lateral join - will allocate a possibly
-	 * substantial amount of memory, so we cannot use the per-query context
-	 * here. perTableCxt now serves the same function as "argcontext" does in
-	 * FunctionScan - a place to store per-one-call (i.e. one result table)
-	 * lifetime data (as opposed to per-query or per-result-tuple).
+	 * if XMLTABLE or JSON_TABLE is being used in a lateral join - will
+	 * allocate a possibly substantial amount of memory, so we cannot use the
+	 * per-query context here. perTableCxt now serves the same function as
+	 * "argcontext" does in FunctionScan - a place to store per-one-call (i.e.
+	 * one result table) lifetime data (as opposed to per-query or
+	 * per-result-tuple).
 	 */
 	MemoryContextSwitchTo(tstate->perTableCxt);
 
@@ -354,7 +347,7 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
 	int			colno;
 	Datum		value;
 	int			ordinalitycol =
-	((TableFuncScan *) (tstate->ss.ps.plan))->tablefunc->ordinalitycol;
+		((TableFuncScan *) (tstate->ss.ps.plan))->tablefunc->ordinalitycol;
 
 	/*
 	 * Install the document as a possibly-toasted Datum into the tablefunc
@@ -383,9 +376,12 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
 		routine->SetNamespace(tstate, ns_name, ns_uri);
 	}
 
+	/*
+	 * Install the row filter expression, if any, into the table builder
+	 * context.
+	 */
 	if (routine->SetRowFilter)
 	{
-		/* Install the row filter expression into the table builder context */
 		value = ExecEvalExpr(tstate->rowexpr, econtext, &isnull);
 		if (isnull)
 			ereport(ERROR,

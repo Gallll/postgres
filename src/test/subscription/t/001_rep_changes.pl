@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Basic logical replication test
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -15,7 +15,7 @@ $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -57,6 +57,11 @@ $node_publisher->safe_psql('postgres',
 	"CREATE INDEX idx_no_replidentity_index ON tab_no_replidentity_index(c1)"
 );
 
+# Replicate the changes without columns
+$node_publisher->safe_psql('postgres', "CREATE TABLE tab_no_col()");
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_no_col default VALUES");
+
 # Setup structure on subscriber
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_notrep (a int)");
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_ins (a int)");
@@ -87,13 +92,16 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE INDEX idx_no_replidentity_index ON tab_no_replidentity_index(c1)"
 );
 
+# replication of the table without columns
+$node_subscriber->safe_psql('postgres', "CREATE TABLE tab_no_col()");
+
 # Setup logical replication
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
 $node_publisher->safe_psql('postgres', "CREATE PUBLICATION tap_pub");
 $node_publisher->safe_psql('postgres',
 	"CREATE PUBLICATION tap_pub_ins_only WITH (publish = insert)");
 $node_publisher->safe_psql('postgres',
-	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include, tab_nothing, tab_full_pk, tab_no_replidentity_index"
+	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include, tab_nothing, tab_full_pk, tab_no_replidentity_index, tab_no_col"
 );
 $node_publisher->safe_psql('postgres',
 	"ALTER PUBLICATION tap_pub_ins_only ADD TABLE tab_ins");
@@ -102,13 +110,8 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr' PUBLICATION tap_pub, tap_pub_ins_only"
 );
 
-$node_publisher->wait_for_catchup('tap_sub');
-
-# Also wait for initial table sync to finish
-my $synced_query =
-  "SELECT count(1) = 0 FROM pg_subscription_rel WHERE srsubstate NOT IN ('r', 's');";
-$node_subscriber->poll_query_until('postgres', $synced_query)
-  or die "Timed out while waiting for subscriber to synchronize data";
+# Wait for initial table sync to finish
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub');
 
 my $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_notrep");
@@ -146,6 +149,9 @@ $node_publisher->safe_psql('postgres', "UPDATE tab_include SET a = -a");
 $node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_no_replidentity_index VALUES(1)");
 
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_no_col default VALUES");
+
 $node_publisher->wait_for_catchup('tap_sub');
 
 $result = $node_subscriber->safe_psql('postgres',
@@ -174,6 +180,10 @@ is( $node_subscriber->safe_psql(
 	1,
 	"value replicated to subscriber without replica identity index");
 
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_no_col");
+is($result, qq(2), 'check replicated changes for table having no columns');
+
 # insert some duplicate rows
 $node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_full SELECT generate_series(1,10)");
@@ -182,7 +192,7 @@ $node_publisher->safe_psql('postgres',
 #
 # When a publisher drops a table from publication, it should also stop sending
 # its changes to subscribers. We look at the subscriber whether it receives
-# the row that is inserted to the table in the publisher after it is dropped
+# the row that is inserted to the table on the publisher after it is dropped
 # from the publication.
 $result = $node_subscriber->safe_psql('postgres',
 	"SELECT count(*), min(a), max(a) FROM tab_ins");
@@ -237,13 +247,9 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE SUBSCRIPTION tap_sub_temp1 CONNECTION '$publisher_connstr' PUBLICATION tap_pub_temp1, tap_pub_temp2"
 );
 
-$node_publisher->wait_for_catchup('tap_sub_temp1');
-
-# Also wait for initial table sync to finish
-$synced_query =
-  "SELECT count(1) = 0 FROM pg_subscription_rel WHERE srsubstate NOT IN ('r', 's');";
-$node_subscriber->poll_query_until('postgres', $synced_query)
-  or die "Timed out while waiting for subscriber to synchronize data";
+# Wait for initial table sync to finish
+$node_subscriber->wait_for_subscription_sync($node_publisher,
+	'tap_sub_temp1');
 
 # Subscriber table will have no rows initially
 $result =
@@ -567,7 +573,7 @@ CREATE PUBLICATION tap_pub2 FOR TABLE skip_wal;
 ROLLBACK;
 });
 ok( $reterr =~
-	  m/WARNING:  wal_level is insufficient to publish logical changes/,
-	'CREATE PUBLICATION while wal_level=minimal');
+	  m/WARNING:  "wal_level" is insufficient to publish logical changes/,
+	'CREATE PUBLICATION while "wal_level=minimal"');
 
 done_testing();

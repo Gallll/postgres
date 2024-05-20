@@ -4,7 +4,7 @@
  *	  POSTGRES lock manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lmgr.h
@@ -31,7 +31,7 @@ typedef enum XLTW_Oper
 	XLTW_InsertIndex,
 	XLTW_InsertIndexUnique,
 	XLTW_FetchUpdated,
-	XLTW_RecheckExclusionConstr
+	XLTW_RecheckExclusionConstr,
 } XLTW_Oper;
 
 extern void RelationInitLockInfo(Relation relation);
@@ -93,12 +93,16 @@ extern void SpeculativeInsertionWait(TransactionId xid, uint32 token);
 /* Lock a general object (other than a relation) of the current database */
 extern void LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 							   LOCKMODE lockmode);
+extern bool ConditionalLockDatabaseObject(Oid classid, Oid objid,
+										  uint16 objsubid, LOCKMODE lockmode);
 extern void UnlockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 								 LOCKMODE lockmode);
 
 /* Lock a shared-across-databases object (other than a relation) */
 extern void LockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 							 LOCKMODE lockmode);
+extern bool ConditionalLockSharedObject(Oid classid, Oid objid, uint16 objsubid,
+										LOCKMODE lockmode);
 extern void UnlockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 							   LOCKMODE lockmode);
 
@@ -106,6 +110,11 @@ extern void LockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 									   LOCKMODE lockmode);
 extern void UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 										 LOCKMODE lockmode);
+
+extern void LockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
+										   LOCKMODE lockmode);
+extern void UnlockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
+											 LOCKMODE lockmode);
 
 /* Describe a locktag for error messages */
 extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);

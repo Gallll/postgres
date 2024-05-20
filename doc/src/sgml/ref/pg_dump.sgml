@@ -132,7 +132,8 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-b</option></term>
-      <term><option>--blobs</option></term>
+      <term><option>--large-objects</option></term>
+      <term><option>--blobs</option> (deprecated)</term>
       <listitem>
        <para>
         Include large objects in the dump.  This is the default behavior
@@ -140,7 +141,7 @@ PostgreSQL documentation
         <option>--schema-only</option> is specified.  The <option>-b</option>
         switch is therefore only useful to add large objects to dumps
         where a specific schema or table has been requested.  Note that
-        blobs are considered data and therefore will be included when
+        large objects are considered data and therefore will be included when
         <option>--data-only</option> is used, but not
         when <option>--schema-only</option> is.
        </para>
@@ -149,7 +150,8 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-B</option></term>
-      <term><option>--no-blobs</option></term>
+      <term><option>--no-large-objects</option></term>
+      <term><option>--no-blobs</option> (deprecated)</term>
       <listitem>
        <para>
         Exclude large objects in the dump.
@@ -168,11 +170,12 @@ PostgreSQL documentation
       <term><option>--clean</option></term>
       <listitem>
        <para>
-        Output commands to clean (drop)
+        Output commands to <command>DROP</command> all the dumped
         database objects prior to outputting the commands for creating them.
-        (Unless <option>--if-exists</option> is also specified,
-        restore might generate some harmless error messages, if any objects
-        were not present in the destination database.)
+        This option is useful when the restore is to overwrite an existing
+        database.  If any of the objects do not exist in the destination
+        database, ignorable error messages will be reported during
+        restore, unless <option>--if-exists</option> is also specified.
        </para>
 
        <para>
@@ -323,14 +326,16 @@ PostgreSQL documentation
           <para>
            Output a directory-format archive suitable for input into
            <application>pg_restore</application>. This will create a directory
-           with one file for each table and blob being dumped, plus a
+           with one file for each table and large object being dumped, plus a
            so-called Table of Contents file describing the dumped objects in a
            machine-readable format that <application>pg_restore</application>
            can read. A directory format archive can be manipulated with
            standard Unix tools; for example, files in an uncompressed archive
-           can be compressed with the <application>gzip</application> tool.
-           This format is compressed by default and also supports parallel
-           dumps.
+           can be compressed with the <application>gzip</application>,
+           <application>lz4</application>, or
+           <application>zstd</application> tools.
+           This format is compressed by default using <literal>gzip</literal>
+           and also supports parallel dumps.
           </para>
          </listitem>
         </varlistentry>
@@ -415,7 +420,7 @@ PostgreSQL documentation
         <replaceable class="parameter">pattern</replaceable> parameter is
         interpreted as a pattern according to the same rules used by
         <application>psql</application>'s <literal>\d</literal> commands
-        (see <xref linkend="app-psql-patterns"/> below),
+        (see <xref linkend="app-psql-patterns"/>),
         so multiple schemas can also be selected by writing wildcard characters
         in the pattern.  When using wildcards, be careful to quote the pattern
         if needed to prevent the shell from expanding the wildcards;  see
@@ -434,9 +439,9 @@ PostgreSQL documentation
 
        <note>
         <para>
-         Non-schema objects such as blobs are not dumped when <option>-n</option> is
-         specified.  You can add blobs back to the dump with the
-         <option>--blobs</option> switch.
+         Non-schema objects such as large objects are not dumped when <option>-n</option> is
+         specified.  You can add large objects back to the dump with the
+         <option>--large-objects</option> switch.
         </para>
        </note>
 
@@ -550,7 +555,7 @@ PostgreSQL documentation
         <replaceable class="parameter">pattern</replaceable> parameter is
         interpreted as a pattern according to the same rules used by
         <application>psql</application>'s <literal>\d</literal> commands
-        (see <xref linkend="app-psql-patterns"/> below),
+        (see <xref linkend="app-psql-patterns"/>),
         so multiple tables can also be selected by writing wildcard characters
         in the pattern.  When using wildcards, be careful to quote the pattern
         if needed to prevent the shell from expanding the wildcards;  see
@@ -644,17 +649,44 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>-Z <replaceable class="parameter">0..9</replaceable></option></term>
-      <term><option>--compress=<replaceable class="parameter">0..9</replaceable></option></term>
+      <term><option>-Z <replaceable class="parameter">level</replaceable></option></term>
+      <term><option>-Z <replaceable class="parameter">method</replaceable></option>[:<replaceable>detail</replaceable>]</term>
+      <term><option>--compress=<replaceable class="parameter">level</replaceable></option></term>
+      <term><option>--compress=<replaceable class="parameter">method</replaceable></option>[:<replaceable>detail</replaceable>]</term>
       <listitem>
        <para>
-        Specify the compression level to use.  Zero means no compression.
+        Specify the compression method and/or the compression level to use.
+        The compression method can be set to <literal>gzip</literal>,
+        <literal>lz4</literal>, <literal>zstd</literal>,
+        or <literal>none</literal> for no compression.
+        A compression detail string can optionally be specified.  If the
+        detail string is an integer, it specifies the compression level.
+        Otherwise, it should be a comma-separated list of items, each of the
+        form <literal>keyword</literal> or <literal>keyword=value</literal>.
+        Currently, the supported keywords are <literal>level</literal> and
+        <literal>long</literal>.
+       </para>
+
+       <para>
+        If no compression level is specified, the default compression
+        level will be used. If only a level is specified without mentioning
+        an algorithm, <literal>gzip</literal> compression will be used if
+        the level is greater than <literal>0</literal>, and no compression
+        will be used if the level is <literal>0</literal>.
+       </para>
+
+       <para>
         For the custom and directory archive formats, this specifies compression of
-        individual table-data segments, and the default is to compress
-        at a moderate level.
-        For plain text output, setting a nonzero compression level causes
-        the entire output file to be compressed, as though it had been
-        fed through <application>gzip</application>; but the default is not to compress.
+        individual table-data segments, and the default is to compress using
+        <literal>gzip</literal> at a moderate level. For plain text output,
+        setting a nonzero compression level causes the entire output file to be compressed,
+        as though it had been fed through <application>gzip</application>,
+        <application>lz4</application>, or <application>zstd</application>;
+        but the default is not to compress.
+        With zstd compression, <literal>long</literal> mode may improve the
+        compression ratio, at the cost of increased memory use.
+       </para>
+       <para>
         The tar archive format currently does not support compression at all.
        </para>
       </listitem>
@@ -751,6 +783,40 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--exclude-extension=<replaceable class="parameter">pattern</replaceable></option></term>
+      <listitem>
+       <para>
+        Do not dump any extensions matching <replaceable
+        class="parameter">pattern</replaceable>.  The pattern is
+        interpreted according to the same rules as for <option>-e</option>.
+        <option>--exclude-extension</option> can be given more than once to exclude extensions
+        matching any of several patterns.
+       </para>
+
+       <para>
+        When both <option>-e</option> and <option>--exclude-extension</option> are given, the behavior
+        is to dump just the extensions that match at least one <option>-e</option>
+        switch but no <option>--exclude-extension</option> switches.  If <option>--exclude-extension</option>
+        appears without <option>-e</option>, then extensions matching <option>--exclude-extension</option> are
+        excluded from what is otherwise a normal dump.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--exclude-table-and-children=<replaceable class="parameter">pattern</replaceable></option></term>
+      <listitem>
+       <para>
+        This is the same as
+        the <option>-T</option>/<option>--exclude-table</option> option,
+        except that it also excludes any partitions or inheritance child
+        tables of the table(s) matching the
+        <replaceable class="parameter">pattern</replaceable>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--exclude-table-data=<replaceable class="parameter">pattern</replaceable></option></term>
       <listitem>
        <para>
@@ -769,6 +835,18 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--exclude-table-data-and-children=<replaceable class="parameter">pattern</replaceable></option></term>
+      <listitem>
+       <para>
+        This is the same as the <option>--exclude-table-data</option> option,
+        except that it also excludes data of any partitions or inheritance
+        child tables of the table(s) matching the
+        <replaceable class="parameter">pattern</replaceable>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--extra-float-digits=<replaceable class="parameter">ndigits</replaceable></option></term>
       <listitem>
        <para>
@@ -780,12 +858,117 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--filter=<replaceable class="parameter">filename</replaceable></option></term>
+      <listitem>
+       <para>
+        Specify a filename from which to read patterns for objects to include
+        or exclude from the dump. The patterns are interpreted according to the
+        same rules as the corresponding options:
+        <option>-t</option>/<option>--table</option>,
+        <option>--table-and-children</option>,
+        <option>--exclude-table-and-children</option> or
+        <option>-T</option> for tables,
+        <option>-n</option>/<option>--schema</option> for schemas,
+        <option>--include-foreign-data</option> for data on foreign servers,
+        <option>--exclude-table-data</option>,
+        <option>--exclude-table-data-and-children</option> for table data, and
+        <option>-e</option>/<option>--extension</option> or
+        <option>--exclude-extension</option> for extensions.
+        To read from <literal>STDIN</literal>, use <filename>-</filename> as the
+        filename.  The <option>--filter</option> option can be specified in
+        conjunction with the above listed options for including or excluding
+        objects, and can also be specified more than once for multiple filter
+        files.
+       </para>
+
+       <para>
+        The file lists one object pattern per row, with the following format:
+<synopsis>
+{ include | exclude } { extension | foreign_data | table | table_and_children | table_data | table_data_and_children | schema } <replaceable class="parameter">PATTERN</replaceable>
+</synopsis>
+       </para>
+
+       <para>
+        The first keyword specifies whether the objects matched by the pattern
+        are to be included or excluded. The second keyword specifies the type
+        of object to be filtered using the pattern:
+        <itemizedlist>
+         <listitem>
+          <para>
+           <literal>extension</literal>: extensions, works like the
+           <option>-e</option>/<option>--extension</option> option.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>foreign_data</literal>: data on foreign servers, works like
+           the <option>--include-foreign-data</option> option. This keyword can
+           only be used with the <literal>include</literal> keyword.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>table</literal>: tables, works like the
+           <option>-t</option>/<option>--table</option> option.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>table_and_children</literal>: tables including any partitions
+           or inheritance child tables, works like the
+           <option>--table-and-children</option> option.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>table_data</literal>: table data of any tables matching
+           <replaceable>pattern</replaceable>, works like the
+           <option>--exclude-table-data</option> option. This keyword can only
+           be used with the <literal>exclude</literal> keyword.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>table_data_and_children</literal>: table data of any tables
+           matching <replaceable>pattern</replaceable> as well as any partitions
+           or inheritance children of the table(s), works like the
+           <option>--exclude-table-data-and-children</option> option. This
+           keyword can only be used with the <literal>exclude</literal> keyword.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <literal>schema</literal>: schemas, works like the
+           <option>-n</option>/<option>--schema</option> option.
+          </para>
+         </listitem>
+        </itemizedlist>
+       </para>
+
+       <para>
+        Lines starting with <literal>#</literal> are considered comments and
+        ignored. Comments can be placed after an object pattern row as well.
+        Blank lines are also ignored. See <xref linkend="app-psql-patterns"/>
+        for how to perform quoting in patterns.
+       </para>
+
+       <para>
+        Example files are listed below in the <xref linkend="pg-dump-examples"/>
+        section.
+       </para>
+
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--if-exists</option></term>
       <listitem>
        <para>
-        Use conditional commands (i.e., add an <literal>IF EXISTS</literal>
-        clause) when cleaning database objects.  This option is not valid
-        unless <option>--clean</option> is also specified.
+        Use <literal>DROP ... IF EXISTS</literal> commands to drop objects
+        in <option>--clean</option> mode.  This suppresses <quote>does not
+        exist</quote> errors that might otherwise be reported.  This
+        option is not valid unless <option>--clean</option> is also
+        specified.
        </para>
       </listitem>
      </varlistentry>
@@ -801,7 +984,7 @@ PostgreSQL documentation
         Also, the <replaceable class="parameter">foreignserver</replaceable> parameter is
         interpreted as a pattern according to the same rules used by
         <application>psql</application>'s <literal>\d</literal> commands
-        (see <xref linkend="app-psql-patterns"/> below),
+        (see <xref linkend="app-psql-patterns"/>),
         so multiple foreign servers can also be selected by writing wildcard characters
         in the pattern.  When using wildcards, be careful to quote the pattern
         if needed to prevent the shell from expanding the wildcards; see
@@ -852,16 +1035,6 @@ PostgreSQL documentation
         could happen, for example, if the partitioning column is of type text
         and the two systems have different definitions of the collation used
         to sort the partitioning column.
-       </para>
-
-       <para>
-        It is best not to use parallelism when restoring from an archive made
-        with this option, because <application>pg_restore</application> will
-        not know exactly which partition(s) a given archive data item will
-        load data into.  This could result in inefficiency due to lock
-        conflicts between parallel jobs, or perhaps even restore failures due
-        to foreign key constraints being set up before all the relevant data
-        is loaded.
        </para>
       </listitem>
      </varlistentry>
@@ -1117,18 +1290,55 @@ PostgreSQL documentation
         Require that each
         extension (<option>-e</option>/<option>--extension</option>),
         schema (<option>-n</option>/<option>--schema</option>) and
-        table (<option>-t</option>/<option>--table</option>) qualifier
+        table (<option>-t</option>/<option>--table</option>) pattern
         match at least one extension/schema/table in the database to be dumped.
-        Note that if none of the extension/schema/table qualifiers find
+        This also applies to filters used with <option>--filter</option>.
+        Note that if none of the extension/schema/table patterns find
         matches, <application>pg_dump</application> will generate an error
         even without <option>--strict-names</option>.
        </para>
        <para>
         This option has no effect
-        on <option>-N</option>/<option>--exclude-schema</option>,
+        on <option>--exclude-extension</option>,
+        <option>-N</option>/<option>--exclude-schema</option>,
         <option>-T</option>/<option>--exclude-table</option>,
         or <option>--exclude-table-data</option>.  An exclude pattern failing
         to match any objects is not considered an error.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--sync-method=<replaceable class="parameter">method</replaceable></option></term>
+      <listitem>
+       <para>
+        When set to <literal>fsync</literal>, which is the default,
+        <command>pg_dump --format=directory</command> will recursively open and
+        synchronize all files in the archive directory.
+       </para>
+       <para>
+        On Linux, <literal>syncfs</literal> may be used instead to ask the
+        operating system to synchronize the whole file system that contains the
+        archive directory.  See <xref linkend="guc-recovery-init-sync-method"/>
+        for information about the caveats to be aware of when using
+        <literal>syncfs</literal>.
+       </para>
+       <para>
+        This option has no effect when <option>--no-sync</option> is used or
+        <option>--format</option> is not set to <literal>directory</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--table-and-children=<replaceable class="parameter">pattern</replaceable></option></term>
+      <listitem>
+       <para>
+        This is the same as
+        the <option>-t</option>/<option>--table</option> option,
+        except that it also includes any partitions or inheritance child
+        tables of the table(s) matching the
+        <replaceable class="parameter">pattern</replaceable>.
        </para>
       </listitem>
      </varlistentry>
@@ -1405,9 +1615,9 @@ CREATE DATABASE foo WITH TEMPLATE template0;
    truncate the target tables before initiating a new full table copy.  If users
    intend to copy initial data during refresh they must create the slot with
    <literal>two_phase = false</literal>.  After the initial sync, the
-   <literal>two_phase</literal> option will be automatically enabled by the
-   subscriber if the subscription had been originally created with
-   <literal>two_phase = true</literal> option.
+   <link linkend="sql-createsubscription-params-with-two-phase"><literal>two_phase</literal></link>
+   option will be automatically enabled by the subscriber if the subscription
+   had been originally created with <literal>two_phase = true</literal> option.
   </para>
  </refsect1>
 
@@ -1521,13 +1731,26 @@ CREATE DATABASE foo WITH TEMPLATE template0;
   <para>
    To specify an upper-case or mixed-case name in <option>-t</option> and related
    switches, you need to double-quote the name; else it will be folded to
-   lower case (see <xref linkend="app-psql-patterns"/> below).  But
+   lower case (see <xref linkend="app-psql-patterns"/>).  But
    double quotes are special to the shell, so in turn they must be quoted.
    Thus, to dump a single table with a mixed-case name, you need something
    like
 
 <screen>
 <prompt>$</prompt> <userinput>pg_dump -t "\"MixedCaseName\"" mydb &gt; mytab.sql</userinput>
+</screen></para>
+
+  <para>
+   To dump all tables whose names start with <literal>mytable</literal>, except
+   for table <literal>mytable2</literal>, specify a filter file
+   <filename>filter.txt</filename> like:
+<programlisting>
+include table mytable*
+exclude table mytable2
+</programlisting>
+
+<screen>
+<prompt>$</prompt> <userinput>pg_dump --filter=filter.txt mydb &gt; db.sql</userinput>
 </screen></para>
 
  </refsect1>

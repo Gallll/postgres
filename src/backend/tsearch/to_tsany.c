@@ -3,7 +3,7 @@
  * to_tsany.c
  *		to_ts* function definitions
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,7 +13,6 @@
  */
 #include "postgres.h"
 
-#include "common/jsonapi.h"
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
@@ -97,7 +96,7 @@ uniqueWORD(ParsedWord *a, int32 l)
 	/*
 	 * Sort words with its positions
 	 */
-	qsort((void *) a, l, sizeof(ParsedWord), compareWORD);
+	qsort(a, l, sizeof(ParsedWord), compareWORD);
 
 	/*
 	 * Initialize first word and its first position
@@ -252,6 +251,8 @@ to_tsvector_byid(PG_FUNCTION_ARGS)
 												 * number */
 	if (prs.lenwords < 2)
 		prs.lenwords = 2;
+	else if (prs.lenwords > MaxAllocSize / sizeof(ParsedWord))
+		prs.lenwords = MaxAllocSize / sizeof(ParsedWord);
 	prs.curwords = 0;
 	prs.pos = 0;
 	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
@@ -594,7 +595,8 @@ to_tsquery_byid(PG_FUNCTION_ARGS)
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
 						  PointerGetDatum(&data),
-						  0);
+						  0,
+						  NULL);
 
 	PG_RETURN_TSQUERY(query);
 }
@@ -630,7 +632,8 @@ plainto_tsquery_byid(PG_FUNCTION_ARGS)
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
 						  PointerGetDatum(&data),
-						  P_TSQ_PLAIN);
+						  P_TSQ_PLAIN,
+						  NULL);
 
 	PG_RETURN_POINTER(query);
 }
@@ -667,7 +670,8 @@ phraseto_tsquery_byid(PG_FUNCTION_ARGS)
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
 						  PointerGetDatum(&data),
-						  P_TSQ_PLAIN);
+						  P_TSQ_PLAIN,
+						  NULL);
 
 	PG_RETURN_TSQUERY(query);
 }
@@ -704,7 +708,8 @@ websearch_to_tsquery_byid(PG_FUNCTION_ARGS)
 	query = parse_tsquery(text_to_cstring(in),
 						  pushval_morph,
 						  PointerGetDatum(&data),
-						  P_TSQ_WEB);
+						  P_TSQ_WEB,
+						  NULL);
 
 	PG_RETURN_TSQUERY(query);
 }

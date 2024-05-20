@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 =pod
 
@@ -64,7 +64,7 @@ specific infrastructure. Currently only OpenSSL is supported.
 package SSL::Server;
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -94,7 +94,7 @@ sub new
 	bless $self, $class;
 	if ($flavor =~ /\Aopenssl\z/i)
 	{
-		$self->{flavor}  = 'openssl';
+		$self->{flavor} = 'openssl';
 		$self->{backend} = SSL::Backend::OpenSSL->new();
 	}
 	else
@@ -115,7 +115,7 @@ string.
 
 sub sslkey
 {
-	my $self    = shift;
+	my $self = shift;
 	my $keyfile = shift;
 	my $backend = $self->{backend};
 
@@ -143,10 +143,10 @@ sub configure_test_server_for_ssl
 	my $self = shift;
 	my ($node, $serverhost, $servercidr, $authmethod, %params) = @_;
 	my $backend = $self->{backend};
-	my $pgdata  = $node->data_dir;
+	my $pgdata = $node->data_dir;
 
 	my @databases = (
-		'trustdb',   'certdb', 'certdb_dn', 'certdb_dn_re',
+		'trustdb', 'certdb', 'certdb_dn', 'certdb_dn_re',
 		'certdb_cn', 'verifydb');
 
 	# Create test users and databases
@@ -191,7 +191,7 @@ sub configure_test_server_for_ssl
 	}
 
 	# enable logging etc.
-	open my $conf, '>>', "$pgdata/postgresql.conf";
+	open my $conf, '>>', "$pgdata/postgresql.conf" or die $!;
 	print $conf "fsync=off\n";
 	print $conf "log_connections=on\n";
 	print $conf "log_hostname=on\n";
@@ -204,7 +204,7 @@ sub configure_test_server_for_ssl
 	close $conf;
 
 	# SSL configuration will be placed here
-	open my $sslconf, '>', "$pgdata/sslconfig.conf";
+	open my $sslconf, '>', "$pgdata/sslconfig.conf" or die $!;
 	close $sslconf;
 
 	# Perform backend specific configuration
@@ -229,7 +229,7 @@ Get the name of the currently used SSL backend.
 
 sub ssl_library
 {
-	my $self    = shift;
+	my $self = shift;
 	my $backend = $self->{backend};
 
 	return $backend->get_library();
@@ -257,7 +257,7 @@ The certificate file to use. Implementation is SSL backend specific.
 
 =item keyfile => B<value>
 
-The private key to to use. Implementation is SSL backend specific.
+The private key file to use. Implementation is SSL backend specific.
 
 =item crlfile => B<value>
 
@@ -284,13 +284,13 @@ returning.
 
 sub switch_server_cert
 {
-	my $self    = shift;
-	my $node    = shift;
+	my $self = shift;
+	my $node = shift;
 	my $backend = $self->{backend};
-	my %params  = @_;
-	my $pgdata  = $node->data_dir;
+	my %params = @_;
+	my $pgdata = $node->data_dir;
 
-	open my $sslconf, '>', "$pgdata/sslconfig.conf";
+	open my $sslconf, '>', "$pgdata/sslconfig.conf" or die $!;
 	print $sslconf "ssl=on\n";
 	print $sslconf $backend->set_server_cert(\%params);
 	print $sslconf "ssl_passphrase_command='"
@@ -315,7 +315,7 @@ sub _configure_hba_for_ssl
 	# but seems best to keep it as narrow as possible for security reasons.
 	#
 	# When connecting to certdb, also check the client certificate.
-	open my $hba, '>', "$pgdata/pg_hba.conf";
+	open my $hba, '>', "$pgdata/pg_hba.conf" or die $!;
 	print $hba
 	  "# TYPE  DATABASE        USER            ADDRESS                 METHOD             OPTIONS\n";
 	print $hba
@@ -337,7 +337,7 @@ sub _configure_hba_for_ssl
 	close $hba;
 
 	# Also set the ident maps. Note: fields with commas must be quoted
-	open my $map, ">", "$pgdata/pg_ident.conf";
+	open my $map, ">", "$pgdata/pg_ident.conf" or die $!;
 	print $map
 	  "# MAPNAME       SYSTEM-USERNAME                           PG-USERNAME\n",
 	  "dn             \"CN=ssltestuser-dn,OU=Testing,OU=Engineering,O=PGDG\"    ssltestuser\n",

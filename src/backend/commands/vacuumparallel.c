@@ -8,15 +8,15 @@
  *
  * In a parallel vacuum, we perform both index bulk deletion and index cleanup
  * with parallel worker processes.  Individual indexes are processed by one
- * vacuum process.  ParalleVacuumState contains shared information as well as
- * the memory space for storing dead items allocated in the DSM segment.  We
+ * vacuum process.  ParallelVacuumState contains shared information as well as
+ * the memory space for storing dead items allocated in the DSA area.  We
  * launch parallel worker processes at the start of parallel index
  * bulk-deletion and index cleanup and once all indexes are processed, the
  * parallel worker processes exit.  Each time we process indexes in parallel,
  * the parallel context is re-initialized so that the same DSM can be used for
  * multiple passes of index bulk-deletion and index cleanup.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,8 +29,9 @@
 #include "access/amapi.h"
 #include "access/table.h"
 #include "access/xact.h"
-#include "catalog/index.h"
+#include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/instrument.h"
 #include "optimizer/paths.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -44,11 +45,10 @@
  * use small integers.
  */
 #define PARALLEL_VACUUM_KEY_SHARED			1
-#define PARALLEL_VACUUM_KEY_DEAD_ITEMS		2
-#define PARALLEL_VACUUM_KEY_QUERY_TEXT		3
-#define PARALLEL_VACUUM_KEY_BUFFER_USAGE	4
-#define PARALLEL_VACUUM_KEY_WAL_USAGE		5
-#define PARALLEL_VACUUM_KEY_INDEX_STATS		6
+#define PARALLEL_VACUUM_KEY_QUERY_TEXT		2
+#define PARALLEL_VACUUM_KEY_BUFFER_USAGE	3
+#define PARALLEL_VACUUM_KEY_WAL_USAGE		4
+#define PARALLEL_VACUUM_KEY_INDEX_STATS		5
 
 /*
  * Shared information among parallel workers.  So this is allocated in the DSM
@@ -88,6 +88,12 @@ typedef struct PVShared
 	int			maintenance_work_mem_worker;
 
 	/*
+	 * The number of buffers each worker's Buffer Access Strategy ring should
+	 * contain.
+	 */
+	int			ring_nbuffers;
+
+	/*
 	 * Shared vacuum cost balance.  During parallel vacuum,
 	 * VacuumSharedCostBalance points to this value and it accumulates the
 	 * balance of each parallel vacuum worker.
@@ -103,6 +109,15 @@ typedef struct PVShared
 
 	/* Counter for vacuuming and cleanup */
 	pg_atomic_uint32 idx;
+
+	/* DSA handle where the TidStore lives */
+	dsa_handle	dead_items_dsa_handle;
+
+	/* DSA pointer to the shared TidStore */
+	dsa_pointer dead_items_handle;
+
+	/* Statistics of shared dead items */
+	VacDeadItemsInfo dead_items_info;
 } PVShared;
 
 /* Status used during parallel index vacuum or cleanup */
@@ -111,7 +126,7 @@ typedef enum PVIndVacStatus
 	PARALLEL_INDVAC_STATUS_INITIAL = 0,
 	PARALLEL_INDVAC_STATUS_NEED_BULKDELETE,
 	PARALLEL_INDVAC_STATUS_NEED_CLEANUP,
-	PARALLEL_INDVAC_STATUS_COMPLETED
+	PARALLEL_INDVAC_STATUS_COMPLETED,
 } PVIndVacStatus;
 
 /*
@@ -148,6 +163,9 @@ struct ParallelVacuumState
 	/* NULL for worker processes */
 	ParallelContext *pcxt;
 
+	/* Parent Heap Relation */
+	Relation	heaprel;
+
 	/* Target indexes */
 	Relation   *indrels;
 	int			nindexes;
@@ -166,7 +184,7 @@ struct ParallelVacuumState
 	PVIndStats *indstats;
 
 	/* Shared dead items space among parallel vacuum workers */
-	VacDeadItems *dead_items;
+	TidStore   *dead_items;
 
 	/* Points to buffer usage area in DSM */
 	BufferUsage *buffer_usage;
@@ -222,20 +240,19 @@ static void parallel_vacuum_error_callback(void *arg);
  */
 ParallelVacuumState *
 parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
-					 int nrequested_workers, int max_items,
+					 int nrequested_workers, int vac_work_mem,
 					 int elevel, BufferAccessStrategy bstrategy)
 {
 	ParallelVacuumState *pvs;
 	ParallelContext *pcxt;
 	PVShared   *shared;
-	VacDeadItems *dead_items;
+	TidStore   *dead_items;
 	PVIndStats *indstats;
 	BufferUsage *buffer_usage;
 	WalUsage   *wal_usage;
 	bool	   *will_parallel_vacuum;
 	Size		est_indstats_len;
 	Size		est_shared_len;
-	Size		est_dead_items_len;
 	int			nindexes_mwm = 0;
 	int			parallel_workers = 0;
 	int			querylen;
@@ -266,6 +283,7 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 	pvs->nindexes = nindexes;
 	pvs->will_parallel_vacuum = will_parallel_vacuum;
 	pvs->bstrategy = bstrategy;
+	pvs->heaprel = rel;
 
 	EnterParallelMode();
 	pcxt = CreateParallelContext("postgres", "parallel_vacuum_main",
@@ -281,11 +299,6 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 	/* Estimate size for shared information -- PARALLEL_VACUUM_KEY_SHARED */
 	est_shared_len = sizeof(PVShared);
 	shm_toc_estimate_chunk(&pcxt->estimator, est_shared_len);
-	shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-	/* Estimate size for dead_items -- PARALLEL_VACUUM_KEY_DEAD_ITEMS */
-	est_dead_items_len = vac_max_items_to_alloc_size(max_items);
-	shm_toc_estimate_chunk(&pcxt->estimator, est_dead_items_len);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 
 	/*
@@ -317,6 +330,7 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 
 	/* Prepare index vacuum stats */
 	indstats = (PVIndStats *) shm_toc_allocate(pcxt->toc, est_indstats_len);
+	MemSet(indstats, 0, est_indstats_len);
 	for (int i = 0; i < nindexes; i++)
 	{
 		Relation	indrel = indrels[i];
@@ -359,6 +373,17 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 		(nindexes_mwm > 0) ?
 		maintenance_work_mem / Min(parallel_workers, nindexes_mwm) :
 		maintenance_work_mem;
+	shared->dead_items_info.max_bytes = vac_work_mem * 1024L;
+
+	/* Prepare DSA space for dead items */
+	dead_items = TidStoreCreateShared(shared->dead_items_info.max_bytes,
+									  LWTRANCHE_PARALLEL_VACUUM_DSA);
+	pvs->dead_items = dead_items;
+	shared->dead_items_handle = TidStoreGetHandle(dead_items);
+	shared->dead_items_dsa_handle = dsa_get_handle(TidStoreGetDSA(dead_items));
+
+	/* Use the same buffer size for all workers */
+	shared->ring_nbuffers = GetAccessStrategyBufferCount(bstrategy);
 
 	pg_atomic_init_u32(&(shared->cost_balance), 0);
 	pg_atomic_init_u32(&(shared->active_nworkers), 0);
@@ -366,15 +391,6 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 
 	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_SHARED, shared);
 	pvs->shared = shared;
-
-	/* Prepare the dead_items space */
-	dead_items = (VacDeadItems *) shm_toc_allocate(pcxt->toc,
-												   est_dead_items_len);
-	dead_items->max_items = max_items;
-	dead_items->num_items = 0;
-	MemSet(dead_items->items, 0, sizeof(ItemPointerData) * max_items);
-	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_DEAD_ITEMS, dead_items);
-	pvs->dead_items = dead_items;
 
 	/*
 	 * Allocate space for each worker's BufferUsage and WalUsage; no need to
@@ -433,6 +449,8 @@ parallel_vacuum_end(ParallelVacuumState *pvs, IndexBulkDeleteResult **istats)
 			istats[i] = NULL;
 	}
 
+	TidStoreDestroy(pvs->dead_items);
+
 	DestroyParallelContext(pvs->pcxt);
 	ExitParallelMode();
 
@@ -440,11 +458,38 @@ parallel_vacuum_end(ParallelVacuumState *pvs, IndexBulkDeleteResult **istats)
 	pfree(pvs);
 }
 
-/* Returns the dead items space */
-VacDeadItems *
-parallel_vacuum_get_dead_items(ParallelVacuumState *pvs)
+/*
+ * Returns the dead items space and dead items information.
+ */
+TidStore *
+parallel_vacuum_get_dead_items(ParallelVacuumState *pvs, VacDeadItemsInfo **dead_items_info_p)
 {
+	*dead_items_info_p = &(pvs->shared->dead_items_info);
 	return pvs->dead_items;
+}
+
+/* Forget all items in dead_items */
+void
+parallel_vacuum_reset_dead_items(ParallelVacuumState *pvs)
+{
+	TidStore   *dead_items = pvs->dead_items;
+	VacDeadItemsInfo *dead_items_info = &(pvs->shared->dead_items_info);
+
+	/*
+	 * Free the current tidstore and return allocated DSA segments to the
+	 * operating system. Then we recreate the tidstore with the same max_bytes
+	 * limitation we just used.
+	 */
+	TidStoreDestroy(dead_items);
+	pvs->dead_items = TidStoreCreateShared(dead_items_info->max_bytes,
+										   LWTRANCHE_PARALLEL_VACUUM_DSA);
+
+	/* Update the DSA pointer for dead_items to the new one */
+	pvs->shared->dead_items_dsa_handle = dsa_get_handle(TidStoreGetDSA(dead_items));
+	pvs->shared->dead_items_handle = TidStoreGetHandle(dead_items);
+
+	/* Reset the counter */
+	dead_items_info->num_items = 0;
 }
 
 /*
@@ -611,13 +656,13 @@ parallel_vacuum_process_all_indexes(ParallelVacuumState *pvs, int num_index_scan
 		Assert(indstats->status == PARALLEL_INDVAC_STATUS_INITIAL);
 		indstats->status = new_status;
 		indstats->parallel_workers_can_process =
-			(pvs->will_parallel_vacuum[i] &
+			(pvs->will_parallel_vacuum[i] &&
 			 parallel_vacuum_index_is_parallel_safe(pvs->indrels[i],
 													num_index_scans,
 													vacuum));
 	}
 
-	/* Reset the parallel index processing counter */
+	/* Reset the parallel index processing and progress counters */
 	pg_atomic_write_u32(&(pvs->shared->idx), 0);
 
 	/* Setup the shared cost-based vacuum delay and launch workers */
@@ -831,6 +876,7 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 		istat = &(indstats->istat);
 
 	ivinfo.index = indrel;
+	ivinfo.heaprel = pvs->heaprel;
 	ivinfo.analyze_only = false;
 	ivinfo.report_progress = false;
 	ivinfo.message_level = DEBUG2;
@@ -845,7 +891,8 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 	switch (indstats->status)
 	{
 		case PARALLEL_INDVAC_STATUS_NEED_BULKDELETE:
-			istat_res = vac_bulkdel_one_index(&ivinfo, istat, pvs->dead_items);
+			istat_res = vac_bulkdel_one_index(&ivinfo, istat, pvs->dead_items,
+											  &pvs->shared->dead_items_info);
 			break;
 		case PARALLEL_INDVAC_STATUS_NEED_CLEANUP:
 			istat_res = vac_cleanup_one_index(&ivinfo, istat);
@@ -887,6 +934,12 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 	pvs->status = PARALLEL_INDVAC_STATUS_COMPLETED;
 	pfree(pvs->indname);
 	pvs->indname = NULL;
+
+	/*
+	 * Call the parallel variant of pgstat_progress_incr_param so workers can
+	 * report progress of index vacuum to the leader.
+	 */
+	pgstat_progress_parallel_incr_param(PROGRESS_VACUUM_INDEXES_PROCESSED, 1);
 }
 
 /*
@@ -939,7 +992,7 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	Relation   *indrels;
 	PVIndStats *indstats;
 	PVShared   *shared;
-	VacDeadItems *dead_items;
+	TidStore   *dead_items;
 	BufferUsage *buffer_usage;
 	WalUsage   *wal_usage;
 	int			nindexes;
@@ -983,13 +1036,12 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 											 PARALLEL_VACUUM_KEY_INDEX_STATS,
 											 false);
 
-	/* Set dead_items space */
-	dead_items = (VacDeadItems *) shm_toc_lookup(toc,
-												 PARALLEL_VACUUM_KEY_DEAD_ITEMS,
-												 false);
+	/* Find dead_items in shared memory */
+	dead_items = TidStoreAttach(shared->dead_items_dsa_handle,
+								shared->dead_items_handle);
 
 	/* Set cost-based vacuum delay */
-	VacuumCostActive = (VacuumCostDelay > 0);
+	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	VacuumPageHit = 0;
 	VacuumPageMiss = 0;
@@ -1006,13 +1058,15 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	pvs.dead_items = dead_items;
 	pvs.relnamespace = get_namespace_name(RelationGetNamespace(rel));
 	pvs.relname = pstrdup(RelationGetRelationName(rel));
+	pvs.heaprel = rel;
 
 	/* These fields will be filled during index vacuum or cleanup */
 	pvs.indname = NULL;
 	pvs.status = PARALLEL_INDVAC_STATUS_INITIAL;
 
-	/* Each parallel VACUUM worker gets its own access strategy */
-	pvs.bstrategy = GetAccessStrategy(BAS_VACUUM);
+	/* Each parallel VACUUM worker gets its own access strategy. */
+	pvs.bstrategy = GetAccessStrategyWithSize(BAS_VACUUM,
+											  shared->ring_nbuffers * (BLCKSZ / 1024));
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = parallel_vacuum_error_callback;
@@ -1031,6 +1085,8 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	wal_usage = shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_WAL_USAGE, false);
 	InstrEndParallelQuery(&buffer_usage[ParallelWorkerNumber],
 						  &wal_usage[ParallelWorkerNumber]);
+
+	TidStoreDetach(dead_items);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;

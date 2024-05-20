@@ -3,7 +3,7 @@
  * jsonpath.h
  *	Definitions for jsonpath datatype
  *
- * Copyright (c) 2019-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/include/utils/jsonpath.h
@@ -14,12 +14,11 @@
 #ifndef JSONPATH_H
 #define JSONPATH_H
 
-#include "fmgr.h"
 #include "executor/tablefunc.h"
+#include "fmgr.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
 #include "utils/jsonb.h"
-#include "utils/jsonfuncs.h"
 
 typedef struct
 {
@@ -32,8 +31,18 @@ typedef struct
 #define JSONPATH_LAX		(0x80000000)
 #define JSONPATH_HDRSZ		(offsetof(JsonPath, data))
 
-#define DatumGetJsonPathP(d)			((JsonPath *) DatumGetPointer(PG_DETOAST_DATUM(d)))
-#define DatumGetJsonPathPCopy(d)		((JsonPath *) DatumGetPointer(PG_DETOAST_DATUM_COPY(d)))
+static inline JsonPath *
+DatumGetJsonPathP(Datum d)
+{
+	return (JsonPath *) PG_DETOAST_DATUM(d);
+}
+
+static inline JsonPath *
+DatumGetJsonPathPCopy(Datum d)
+{
+	return (JsonPath *) PG_DETOAST_DATUM_COPY(d);
+}
+
 #define PG_GETARG_JSONPATH_P(x)			DatumGetJsonPathP(PG_GETARG_DATUM(x))
 #define PG_GETARG_JSONPATH_P_COPY(x)	DatumGetJsonPathPCopy(PG_GETARG_DATUM(x))
 #define PG_RETURN_JSONPATH_P(p)			PG_RETURN_POINTER(p)
@@ -42,6 +51,13 @@ typedef struct
 
 /*
  * All node's type of jsonpath expression
+ *
+ * These become part of the on-disk representation of the jsonpath type.
+ * Therefore, to preserve pg_upgradability, the order must not be changed, and
+ * new values must be added at the end.
+ *
+ * It is recommended that switch cases etc. in other parts of the code also
+ * use this order, to maintain some consistency.
  */
 typedef enum JsonPathItemType
 {
@@ -88,6 +104,17 @@ typedef enum JsonPathItemType
 	jpiLast,					/* LAST array subscript */
 	jpiStartsWith,				/* STARTS WITH predicate */
 	jpiLikeRegex,				/* LIKE_REGEX predicate */
+	jpiBigint,					/* .bigint() item method */
+	jpiBoolean,					/* .boolean() item method */
+	jpiDate,					/* .date() item method */
+	jpiDecimal,					/* .decimal() item method */
+	jpiInteger,					/* .integer() item method */
+	jpiNumber,					/* .number() item method */
+	jpiStringFunc,				/* .string() item method */
+	jpiTime,					/* .time() item method */
+	jpiTimeTz,					/* .time_tz() item method */
+	jpiTimestamp,				/* .timestamp() item method */
+	jpiTimestampTz,				/* .timestamp_tz() item method */
 } JsonPathItemType;
 
 /* XQuery regex mode flags for LIKE_REGEX predicate */
@@ -248,41 +275,35 @@ typedef struct JsonPathParseResult
 	bool		lax;
 } JsonPathParseResult;
 
-extern JsonPathParseResult *parsejsonpath(const char *str, int len);
+extern JsonPathParseResult *parsejsonpath(const char *str, int len,
+										  struct Node *escontext);
 
-extern int	jspConvertRegexFlags(uint32 xflags);
+extern bool jspConvertRegexFlags(uint32 xflags, int *result,
+								 struct Node *escontext);
 
 /*
- * Evaluation of jsonpath
+ * Struct for details about external variables passed into jsonpath executor
  */
-
-/* External variable passed into jsonpath. */
-typedef struct JsonPathVariableEvalContext
+typedef struct JsonPathVariable
 {
 	char	   *name;
 	Oid			typid;
 	int32		typmod;
-	struct ExprContext *econtext;
-	struct ExprState *estate;
-	MemoryContext mcxt;			/* memory context for cached value */
 	Datum		value;
 	bool		isnull;
-	bool		evaluated;
-} JsonPathVariableEvalContext;
+} JsonPathVariable;
 
-/* SQL/JSON item */
-extern void JsonItemFromDatum(Datum val, Oid typid, int32 typmod,
-							  JsonbValue *res);
 
-extern bool JsonPathExists(Datum jb, JsonPath *path, List *vars, bool *error);
+/* SQL/JSON query functions */
+extern bool JsonPathExists(Datum jb, JsonPath *path, bool *error, List *vars);
 extern Datum JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper,
-						   bool *empty, bool *error, List *vars);
+						   bool *empty, bool *error, List *vars,
+						   const char *column_name);
 extern JsonbValue *JsonPathValue(Datum jb, JsonPath *jp, bool *empty,
-								 bool *error, List *vars);
+								 bool *error, List *vars,
+								 const char *column_name);
 
-extern int	EvalJsonPathVar(void *vars, char *varName, int varNameLen,
-							JsonbValue *val, JsonbValue *baseObject);
-
+/* For JSON_TABLE() */
 extern PGDLLIMPORT const TableFuncRoutine JsonbTableRoutine;
 
 #endif

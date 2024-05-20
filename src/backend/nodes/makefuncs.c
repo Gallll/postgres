@@ -4,7 +4,7 @@
  *	  creator functions for various nodes. The functions here are for the
  *	  most frequently created nodes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,6 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/errcodes.h"
 #include "utils/lsyscache.h"
 
 
@@ -81,11 +80,13 @@ makeVar(int varno,
 	var->varlevelsup = varlevelsup;
 
 	/*
-	 * Only a few callers need to make Var nodes with varnosyn/varattnosyn
-	 * different from varno/varattno.  We don't provide separate arguments for
-	 * them, but just initialize them to the given varno/varattno.  This
-	 * reduces code clutter and chance of error for most callers.
+	 * Only a few callers need to make Var nodes with non-null varnullingrels,
+	 * or with varnosyn/varattnosyn different from varno/varattno.  We don't
+	 * provide separate arguments for them, but just initialize them to NULL
+	 * and the given varno/varattno.  This reduces code clutter and chance of
+	 * error for most callers.
 	 */
+	var->varnullingrels = NULL;
 	var->varnosyn = (Index) varno;
 	var->varattnosyn = varattno;
 
@@ -537,6 +538,22 @@ makeFuncExpr(Oid funcid, Oid rettype, List *args,
 }
 
 /*
+ * makeStringConst -
+ * 	build a A_Const node of type T_String for given string
+ */
+Node *
+makeStringConst(char *str, int location)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.sval.type = T_String;
+	n->val.sval.sval = str;
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
  * makeDefElem -
  *	build a DefElem node
  *
@@ -742,7 +759,8 @@ make_ands_implicit(Expr *clause)
  */
 IndexInfo *
 makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
-			  List *predicates, bool unique, bool nulls_not_distinct, bool isready, bool concurrent)
+			  List *predicates, bool unique, bool nulls_not_distinct,
+			  bool isready, bool concurrent, bool summarizing)
 {
 	IndexInfo  *n = makeNode(IndexInfo);
 
@@ -756,6 +774,10 @@ makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 	n->ii_CheckedUnchanged = false;
 	n->ii_IndexUnchanged = false;
 	n->ii_Concurrent = concurrent;
+	n->ii_Summarizing = summarizing;
+
+	/* summarizing indexes cannot contain non-key attributes */
+	Assert(!summarizing || (numkeyattrs == numattrs));
 
 	/* expressions */
 	n->ii_Expressions = expressions;
@@ -769,9 +791,6 @@ makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 	n->ii_ExclusionOps = NULL;
 	n->ii_ExclusionProcs = NULL;
 	n->ii_ExclusionStrats = NULL;
-
-	/* opclass options */
-	n->ii_OpclassOptions = NULL;
 
 	/* speculative inserts */
 	n->ii_UniqueOps = NULL;
@@ -841,12 +860,13 @@ makeJsonFormat(JsonFormatType type, JsonEncoding encoding, int location)
  *	  creates a JsonValueExpr node
  */
 JsonValueExpr *
-makeJsonValueExpr(Expr *expr, JsonFormat *format)
+makeJsonValueExpr(Expr *raw_expr, Expr *formatted_expr,
+				  JsonFormat *format)
 {
 	JsonValueExpr *jve = makeNode(JsonValueExpr);
 
-	jve->raw_expr = expr;
-	jve->formatted_expr = NULL;
+	jve->raw_expr = raw_expr;
+	jve->formatted_expr = formatted_expr;
 	jve->format = format;
 
 	return jve;
@@ -857,54 +877,15 @@ makeJsonValueExpr(Expr *expr, JsonFormat *format)
  *	  creates a JsonBehavior node
  */
 JsonBehavior *
-makeJsonBehavior(JsonBehaviorType type, Node *default_expr)
+makeJsonBehavior(JsonBehaviorType btype, Node *expr, int location)
 {
 	JsonBehavior *behavior = makeNode(JsonBehavior);
 
-	behavior->btype = type;
-	behavior->default_expr = default_expr;
+	behavior->btype = btype;
+	behavior->expr = expr;
+	behavior->location = location;
 
 	return behavior;
-}
-
-/*
- * makeJsonTableJoinedPlan -
- *	   creates a joined JsonTablePlan node
- */
-Node *
-makeJsonTableJoinedPlan(JsonTablePlanJoinType type, Node *plan1, Node *plan2,
-						int location)
-{
-	JsonTablePlan *n = makeNode(JsonTablePlan);
-
-	n->plan_type = JSTP_JOINED;
-	n->join_type = type;
-	n->plan1 = castNode(JsonTablePlan, plan1);
-	n->plan2 = castNode(JsonTablePlan, plan2);
-	n->location = location;
-
-	return (Node *) n;
-}
-
-/*
- * makeJsonEncoding -
- *	  converts JSON encoding name to enum JsonEncoding
- */
-JsonEncoding
-makeJsonEncoding(char *name)
-{
-	if (!pg_strcasecmp(name, "utf8"))
-		return JS_ENC_UTF8;
-	if (!pg_strcasecmp(name, "utf16"))
-		return JS_ENC_UTF16;
-	if (!pg_strcasecmp(name, "utf32"))
-		return JS_ENC_UTF32;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("unrecognized JSON encoding: %s", name)));
-
-	return JS_ENC_DEFAULT;
 }
 
 /*
@@ -939,4 +920,41 @@ makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
 	n->location = location;
 
 	return (Node *) n;
+}
+
+/*
+ * makeJsonTablePathSpec -
+ *		Make JsonTablePathSpec node from given path string and name (if any)
+ */
+JsonTablePathSpec *
+makeJsonTablePathSpec(char *string, char *name, int string_location,
+					  int name_location)
+{
+	JsonTablePathSpec *pathspec = makeNode(JsonTablePathSpec);
+
+	Assert(string != NULL);
+	pathspec->string = makeStringConst(string, string_location);
+	if (name != NULL)
+		pathspec->name = pstrdup(name);
+
+	pathspec->name_location = name_location;
+	pathspec->location = string_location;
+
+	return pathspec;
+}
+
+/*
+ * makeJsonTablePath -
+ *		Make JsonTablePath node for given path string and name
+ */
+JsonTablePath *
+makeJsonTablePath(Const *pathvalue, char *pathname)
+{
+	JsonTablePath *path = makeNode(JsonTablePath);
+
+	Assert(IsA(pathvalue, Const));
+	path->value = pathvalue;
+	path->name = pathname;
+
+	return path;
 }

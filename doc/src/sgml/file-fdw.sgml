@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/file-fdw.sgml -->
 
 <sect1 id="file-fdw" xreflabel="file_fdw">
- <title>file_fdw</title>
+ <title>file_fdw &mdash; access data files in the server's file system</title>
 
  <indexterm zone="file-fdw">
   <primary>file_fdw</primary>
@@ -277,6 +277,22 @@ OPTIONS ( filename 'log/pglog.csv', format 'csv' );
    That's it &mdash; now you can query your log directly. In production, of
    course, you would need to define some way to deal with log rotation.
   </para>
+ </example>
+
+ <example>
+  <title>Create a Foreign Table with an option on a column</title>
+  <para>
+   To set the <literal>force_null</literal> option for a column, use the
+   <literal>OPTIONS</literal> keyword.
+  </para>
+<programlisting>
+CREATE FOREIGN TABLE films (
+ code char(5) NOT NULL,
+ title text NOT NULL,
+ rating text OPTIONS (force_null 'true')
+) SERVER film_server
+OPTIONS ( filename 'films/db.csv', format 'csv' );
+</programlisting>
  </example>
 
 </sect1>

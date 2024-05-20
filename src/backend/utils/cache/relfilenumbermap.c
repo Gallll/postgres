@@ -3,7 +3,7 @@
  * relfilenumbermap.c
  *	  relfilenumber to oid mapping cache.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,12 +19,10 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "miscadmin.h"
-#include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
-#include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
 #include "utils/relmapper.h"
 
@@ -72,7 +70,7 @@ RelfilenumberMapInvalidateCallback(Datum arg, Oid relid)
 			entry->relid == relid)	/* individual flushed relation */
 		{
 			if (hash_search(RelfilenumberMapHash,
-							(void *) &entry->key,
+							&entry->key,
 							HASH_REMOVE,
 							NULL) == NULL)
 				elog(ERROR, "hash table corrupted");
@@ -164,7 +162,7 @@ RelidByRelfilenumber(Oid reltablespace, RelFileNumber relfilenumber)
 	 * since querying invalid values isn't supposed to be a frequent thing,
 	 * but it's basically free.
 	 */
-	entry = hash_search(RelfilenumberMapHash, (void *) &key, HASH_FIND, &found);
+	entry = hash_search(RelfilenumberMapHash, &key, HASH_FIND, &found);
 
 	if (found)
 		return entry->relid;
@@ -235,7 +233,7 @@ RelidByRelfilenumber(Oid reltablespace, RelFileNumber relfilenumber)
 	 * caused cache invalidations to be executed which would have deleted a
 	 * new entry if we had entered it above.
 	 */
-	entry = hash_search(RelfilenumberMapHash, (void *) &key, HASH_ENTER, &found);
+	entry = hash_search(RelfilenumberMapHash, &key, HASH_ENTER, &found);
 	if (found)
 		elog(ERROR, "corrupted hashtable");
 	entry->relid = relid;

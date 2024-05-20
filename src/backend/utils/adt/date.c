@@ -3,7 +3,7 @@
  * date.c
  *	  implements DATE and TIME data types specified in SQL standard
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
+#include "common/int.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/supportnodes.h"
@@ -96,7 +97,7 @@ anytime_typmodout(bool istz, int32 typmod)
 	if (typmod >= 0)
 		return psprintf("(%d)%s", (int) typmod, tz);
 	else
-		return psprintf("%s", tz);
+		return pstrdup(tz);
 }
 
 
@@ -112,6 +113,7 @@ Datum
 date_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	DateADT		date;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -123,13 +125,18 @@ date_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			ftype[MAXDATEFIELDS];
 	char		workbuf[MAXDATELEN + 1];
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tzp);
+		dterr = DecodeDateTime(field, ftype, nf,
+							   &dtype, tm, &fsec, &tzp, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "date");
+	{
+		DateTimeParseError(dterr, &extra, str, "date", escontext);
+		PG_RETURN_NULL();
+	}
 
 	switch (dtype)
 	{
@@ -149,13 +156,13 @@ date_in(PG_FUNCTION_ARGS)
 			PG_RETURN_DATEADT(date);
 
 		default:
-			DateTimeParseError(DTERR_BAD_FORMAT, str, "date");
-			break;
+			DateTimeParseError(DTERR_BAD_FORMAT, &extra, str, "date", escontext);
+			PG_RETURN_NULL();
 	}
 
 	/* Prevent overflow in Julian-day routines */
 	if (!IS_VALID_JULIAN(tm->tm_year, tm->tm_mon, tm->tm_mday))
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("date out of range: \"%s\"", str)));
 
@@ -163,7 +170,7 @@ date_in(PG_FUNCTION_ARGS)
 
 	/* Now check for just-out-of-range dates */
 	if (!IS_VALID_DATE(date))
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("date out of range: \"%s\"", str)));
 
@@ -1367,11 +1374,11 @@ Datum
 time_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-
 #ifdef NOT_USED
 	Oid			typelem = PG_GETARG_OID(1);
 #endif
 	int32		typmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	TimeADT		result;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -1383,13 +1390,18 @@ time_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			dtype;
 	int			ftype[MAXDATEFIELDS];
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
+		dterr = DecodeTimeOnly(field, ftype, nf,
+							   &dtype, tm, &fsec, &tz, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "time");
+	{
+		DateTimeParseError(dterr, &extra, str, "time", escontext);
+		PG_RETURN_NULL();
+	}
 
 	tm2time(tm, fsec, &result);
 	AdjustTimeForTypmod(&result, typmod);
@@ -2001,19 +2013,15 @@ interval_time(PG_FUNCTION_ARGS)
 {
 	Interval   *span = PG_GETARG_INTERVAL_P(0);
 	TimeADT		result;
-	int64		days;
 
-	result = span->time;
-	if (result >= USECS_PER_DAY)
-	{
-		days = result / USECS_PER_DAY;
-		result -= days * USECS_PER_DAY;
-	}
-	else if (result < 0)
-	{
-		days = (-result + USECS_PER_DAY - 1) / USECS_PER_DAY;
-		result += days * USECS_PER_DAY;
-	}
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot convert infinite interval to time")));
+
+	result = span->time % USECS_PER_DAY;
+	if (result < 0)
+		result += USECS_PER_DAY;
 
 	PG_RETURN_TIMEADT(result);
 }
@@ -2047,6 +2055,11 @@ time_pl_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeADT		result;
 
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot add infinite interval to time")));
+
 	result = time + span->time;
 	result -= result / USECS_PER_DAY * USECS_PER_DAY;
 	if (result < INT64CONST(0))
@@ -2064,6 +2077,11 @@ time_mi_interval(PG_FUNCTION_ARGS)
 	TimeADT		time = PG_GETARG_TIMEADT(0);
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeADT		result;
+
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot subtract infinite interval from time")));
 
 	result = time - span->time;
 	result -= result / USECS_PER_DAY * USECS_PER_DAY;
@@ -2088,7 +2106,8 @@ in_range_time_interval(PG_FUNCTION_ARGS)
 
 	/*
 	 * Like time_pl_interval/time_mi_interval, we disregard the month and day
-	 * fields of the offset.  So our test for negative should too.
+	 * fields of the offset.  So our test for negative should too.  This also
+	 * catches -infinity, so we only need worry about +infinity below.
 	 */
 	if (offset->time < 0)
 		ereport(ERROR,
@@ -2098,13 +2117,14 @@ in_range_time_interval(PG_FUNCTION_ARGS)
 	/*
 	 * We can't use time_pl_interval/time_mi_interval here, because their
 	 * wraparound behavior would give wrong (or at least undesirable) answers.
-	 * Fortunately the equivalent non-wrapping behavior is trivial, especially
-	 * since we don't worry about integer overflow.
+	 * Fortunately the equivalent non-wrapping behavior is trivial, except
+	 * that adding an infinite (or very large) interval might cause integer
+	 * overflow.  Subtraction cannot overflow here.
 	 */
 	if (sub)
 		sum = base - offset->time;
-	else
-		sum = base + offset->time;
+	else if (pg_add_s64_overflow(base, offset->time, &sum))
+		PG_RETURN_BOOL(less);
 
 	if (less)
 		PG_RETURN_BOOL(val <= sum);
@@ -2253,11 +2273,11 @@ Datum
 timetz_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-
 #ifdef NOT_USED
 	Oid			typelem = PG_GETARG_OID(1);
 #endif
 	int32		typmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	TimeTzADT  *result;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -2269,13 +2289,19 @@ timetz_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			dtype;
 	int			ftype[MAXDATEFIELDS];
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
+		dterr = DecodeTimeOnly(field, ftype, nf,
+							   &dtype, tm, &fsec, &tz, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "time with time zone");
+	{
+		DateTimeParseError(dterr, &extra, str, "time with time zone",
+						   escontext);
+		PG_RETURN_NULL();
+	}
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 	tm2timetz(tm, fsec, tz, result);
@@ -2573,6 +2599,11 @@ timetz_pl_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeTzADT  *result;
 
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot add infinite interval to time")));
+
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
 	result->time = time->time + span->time;
@@ -2594,6 +2625,11 @@ timetz_mi_interval(PG_FUNCTION_ARGS)
 	TimeTzADT  *time = PG_GETARG_TIMETZADT_P(0);
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeTzADT  *result;
+
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot subtract infinite interval from time")));
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
@@ -2622,7 +2658,8 @@ in_range_timetz_interval(PG_FUNCTION_ARGS)
 
 	/*
 	 * Like timetz_pl_interval/timetz_mi_interval, we disregard the month and
-	 * day fields of the offset.  So our test for negative should too.
+	 * day fields of the offset.  So our test for negative should too. This
+	 * also catches -infinity, so we only need worry about +infinity below.
 	 */
 	if (offset->time < 0)
 		ereport(ERROR,
@@ -2632,13 +2669,14 @@ in_range_timetz_interval(PG_FUNCTION_ARGS)
 	/*
 	 * We can't use timetz_pl_interval/timetz_mi_interval here, because their
 	 * wraparound behavior would give wrong (or at least undesirable) answers.
-	 * Fortunately the equivalent non-wrapping behavior is trivial, especially
-	 * since we don't worry about integer overflow.
+	 * Fortunately the equivalent non-wrapping behavior is trivial, except
+	 * that adding an infinite (or very large) interval might cause integer
+	 * overflow.  Subtraction cannot overflow here.
 	 */
 	if (sub)
 		sum.time = base->time - offset->time;
-	else
-		sum.time = base->time + offset->time;
+	else if (pg_add_s64_overflow(base->time, offset->time, &sum.time))
+		PG_RETURN_BOOL(less);
 	sum.zone = base->zone;
 
 	if (less)
@@ -3026,34 +3064,23 @@ timetz_zone(PG_FUNCTION_ARGS)
 	TimeTzADT  *result;
 	int			tz;
 	char		tzname[TZ_STRLEN_MAX + 1];
-	char	   *lowzone;
 	int			type,
 				val;
 	pg_tz	   *tzp;
 
 	/*
-	 * Look up the requested timezone.  First we look in the timezone
-	 * abbreviation table (to handle cases like "EST"), and if that fails, we
-	 * look in the timezone database (to handle cases like
-	 * "America/New_York").  (This matches the order in which timestamp input
-	 * checks the cases; it's important because the timezone database unwisely
-	 * uses a few zone names that are identical to offset abbreviations.)
+	 * Look up the requested timezone.
 	 */
 	text_to_cstring_buffer(zone, tzname, sizeof(tzname));
 
-	/* DecodeTimezoneAbbrev requires lowercase input */
-	lowzone = downcase_truncate_identifier(tzname,
-										   strlen(tzname),
-										   false);
+	type = DecodeTimezoneName(tzname, &val, &tzp);
 
-	type = DecodeTimezoneAbbrev(0, lowzone, &val, &tzp);
-
-	if (type == TZ || type == DTZ)
+	if (type == TZNAME_FIXED_OFFSET)
 	{
 		/* fixed-offset abbreviation */
 		tz = -val;
 	}
-	else if (type == DYNTZ)
+	else if (type == TZNAME_DYNTZ)
 	{
 		/* dynamic-offset abbreviation, resolve using transaction start time */
 		TimestampTz now = GetCurrentTransactionStartTimestamp();
@@ -3063,36 +3090,25 @@ timetz_zone(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		/* try it as a full zone name */
-		tzp = pg_tzset(tzname);
-		if (tzp)
-		{
-			/* Get the offset-from-GMT that is valid now for the zone */
-			TimestampTz now = GetCurrentTransactionStartTimestamp();
-			struct pg_tm tm;
-			fsec_t		fsec;
+		/* Get the offset-from-GMT that is valid now for the zone name */
+		TimestampTz now = GetCurrentTransactionStartTimestamp();
+		struct pg_tm tm;
+		fsec_t		fsec;
 
-			if (timestamp2tm(now, &tz, &tm, &fsec, NULL, tzp) != 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-						 errmsg("timestamp out of range")));
-		}
-		else
-		{
+		if (timestamp2tm(now, &tz, &tm, &fsec, NULL, tzp) != 0)
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("time zone \"%s\" not recognized", tzname)));
-			tz = 0;				/* keep compiler quiet */
-		}
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
 	}
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
 	result->time = t->time + (t->zone - tz) * USECS_PER_SEC;
+	/* C99 modulo has the wrong sign convention for negative input */
 	while (result->time < INT64CONST(0))
 		result->time += USECS_PER_DAY;
-	while (result->time >= USECS_PER_DAY)
-		result->time -= USECS_PER_DAY;
+	if (result->time >= USECS_PER_DAY)
+		result->time %= USECS_PER_DAY;
 
 	result->zone = tz;
 
@@ -3110,6 +3126,13 @@ timetz_izone(PG_FUNCTION_ARGS)
 	TimeTzADT  *result;
 	int			tz;
 
+	if (INTERVAL_NOT_FINITE(zone))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("interval time zone \"%s\" must be finite",
+						DatumGetCString(DirectFunctionCall1(interval_out,
+															PointerGetDatum(zone))))));
+
 	if (zone->month != 0 || zone->day != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3122,12 +3145,28 @@ timetz_izone(PG_FUNCTION_ARGS)
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
 	result->time = time->time + (time->zone - tz) * USECS_PER_SEC;
+	/* C99 modulo has the wrong sign convention for negative input */
 	while (result->time < INT64CONST(0))
 		result->time += USECS_PER_DAY;
-	while (result->time >= USECS_PER_DAY)
-		result->time -= USECS_PER_DAY;
+	if (result->time >= USECS_PER_DAY)
+		result->time %= USECS_PER_DAY;
 
 	result->zone = tz;
 
 	PG_RETURN_TIMETZADT_P(result);
+}
+
+/* timetz_at_local()
+ *
+ * Unlike for timestamp[tz]_at_local, the type for timetz does not flip between
+ * time with/without time zone, so we cannot just call the conversion function.
+ */
+Datum
+timetz_at_local(PG_FUNCTION_ARGS)
+{
+	Datum		time = PG_GETARG_DATUM(0);
+	const char *tzn = pg_get_timezone_name(session_timezone);
+	Datum		zone = PointerGetDatum(cstring_to_text(tzn));
+
+	return DirectFunctionCall2(timetz_zone, zone, time);
 }

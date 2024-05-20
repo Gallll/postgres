@@ -40,7 +40,7 @@
  * doesn't really save much executor work anyway.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -90,7 +90,8 @@ assign_param_for_var(PlannerInfo *root, Var *var)
 				pvar->varattno == var->varattno &&
 				pvar->vartype == var->vartype &&
 				pvar->vartypmod == var->vartypmod &&
-				pvar->varcollid == var->varcollid)
+				pvar->varcollid == var->varcollid &&
+				bms_equal(pvar->varnullingrels, var->varnullingrels))
 				return pitem->paramId;
 		}
 	}
@@ -307,6 +308,57 @@ replace_outer_grouping(PlannerInfo *root, GroupingFunc *grp)
 }
 
 /*
+ * Generate a Param node to replace the given MergeSupportFunc expression
+ * which is expected to be in the RETURNING list of an upper-level MERGE
+ * query.  Record the need for the MergeSupportFunc in the proper upper-level
+ * root->plan_params.
+ */
+Param *
+replace_outer_merge_support(PlannerInfo *root, MergeSupportFunc *msf)
+{
+	Param	   *retval;
+	PlannerParamItem *pitem;
+	Oid			ptype = exprType((Node *) msf);
+
+	Assert(root->parse->commandType != CMD_MERGE);
+
+	/*
+	 * The parser should have ensured that the MergeSupportFunc is in the
+	 * RETURNING list of an upper-level MERGE query, so find that query.
+	 */
+	do
+	{
+		root = root->parent_root;
+		if (root == NULL)
+			elog(ERROR, "MergeSupportFunc found outside MERGE");
+	} while (root->parse->commandType != CMD_MERGE);
+
+	/*
+	 * It does not seem worthwhile to try to de-duplicate references to outer
+	 * MergeSupportFunc expressions.  Just make a new slot every time.
+	 */
+	msf = copyObject(msf);
+
+	pitem = makeNode(PlannerParamItem);
+	pitem->item = (Node *) msf;
+	pitem->paramId = list_length(root->glob->paramExecTypes);
+	root->glob->paramExecTypes = lappend_oid(root->glob->paramExecTypes,
+											 ptype);
+
+	root->plan_params = lappend(root->plan_params, pitem);
+
+	retval = makeNode(Param);
+	retval->paramkind = PARAM_EXEC;
+	retval->paramid = pitem->paramId;
+	retval->paramtype = ptype;
+	retval->paramtypmod = -1;
+	retval->paramcollid = InvalidOid;
+	retval->location = msf->location;
+
+	return retval;
+}
+
+/*
  * Generate a Param node to replace the given Var,
  * which is expected to come from some upper NestLoop plan node.
  * Record the need for the Var in root->curOuterParams.
@@ -437,16 +489,16 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
 		{
 			Var		   *var = (Var *) pitem->item;
 			NestLoopParam *nlp;
-			ListCell   *lc;
+			ListCell   *lc2;
 
 			/* If not from a nestloop outer rel, complain */
 			if (!bms_is_member(var->varno, root->curOuterRels))
 				elog(ERROR, "non-LATERAL parameter required by subquery");
 
 			/* Is this param already listed in root->curOuterParams? */
-			foreach(lc, root->curOuterParams)
+			foreach(lc2, root->curOuterParams)
 			{
-				nlp = (NestLoopParam *) lfirst(lc);
+				nlp = (NestLoopParam *) lfirst(lc2);
 				if (nlp->paramno == pitem->paramId)
 				{
 					Assert(equal(var, nlp->paramval));
@@ -454,7 +506,7 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
 					break;
 				}
 			}
-			if (lc == NULL)
+			if (lc2 == NULL)
 			{
 				/* No, so add it */
 				nlp = makeNode(NestLoopParam);
@@ -467,17 +519,17 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
 		{
 			PlaceHolderVar *phv = (PlaceHolderVar *) pitem->item;
 			NestLoopParam *nlp;
-			ListCell   *lc;
+			ListCell   *lc2;
 
 			/* If not from a nestloop outer rel, complain */
-			if (!bms_is_subset(find_placeholder_info(root, phv, false)->ph_eval_at,
+			if (!bms_is_subset(find_placeholder_info(root, phv)->ph_eval_at,
 							   root->curOuterRels))
 				elog(ERROR, "non-LATERAL parameter required by subquery");
 
 			/* Is this param already listed in root->curOuterParams? */
-			foreach(lc, root->curOuterParams)
+			foreach(lc2, root->curOuterParams)
 			{
-				nlp = (NestLoopParam *) lfirst(lc);
+				nlp = (NestLoopParam *) lfirst(lc2);
 				if (nlp->paramno == pitem->paramId)
 				{
 					Assert(equal(phv, nlp->paramval));
@@ -485,7 +537,7 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
 					break;
 				}
 			}
-			if (lc == NULL)
+			if (lc2 == NULL)
 			{
 				/* No, so add it */
 				nlp = makeNode(NestLoopParam);
@@ -503,6 +555,28 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
  * Identify any NestLoopParams that should be supplied by a NestLoop plan
  * node with the specified lefthand rels.  Remove them from the active
  * root->curOuterParams list and return them as the result list.
+ *
+ * XXX Here we also hack up the returned Vars and PHVs so that they do not
+ * contain nullingrel sets exceeding what is available from the outer side.
+ * This is needed if we have applied outer join identity 3,
+ *		(A leftjoin B on (Pab)) leftjoin C on (Pb*c)
+ *		= A leftjoin (B leftjoin C on (Pbc)) on (Pab)
+ * and C contains lateral references to B.  It's still safe to apply the
+ * identity, but the parser will have created those references in the form
+ * "b*" (i.e., with varnullingrels listing the A/B join), while what we will
+ * have available from the nestloop's outer side is just "b".  We deal with
+ * that here by stripping the nullingrels down to what is available from the
+ * outer side according to leftrelids.
+ *
+ * That fixes matters for the case of forward application of identity 3.
+ * If the identity was applied in the reverse direction, we will have
+ * parameter Vars containing too few nullingrel bits rather than too many.
+ * Currently, that causes no problems because setrefs.c applies only a
+ * subset check to nullingrels in NestLoopParams, but we'd have to work
+ * harder if we ever want to tighten that check.  This is all pretty annoying
+ * because it greatly weakens setrefs.c's cross-check, but the alternative
+ * seems to be to generate multiple versions of each laterally-parameterized
+ * subquery, which'd be unduly expensive.
  */
 List *
 identify_current_nestloop_params(PlannerInfo *root, Relids leftrelids)
@@ -517,26 +591,32 @@ identify_current_nestloop_params(PlannerInfo *root, Relids leftrelids)
 
 		/*
 		 * We are looking for Vars and PHVs that can be supplied by the
-		 * lefthand rels.  The "bms_overlap" test is just an optimization to
-		 * allow skipping find_placeholder_info() if the PHV couldn't match.
+		 * lefthand rels.  When we find one, it's okay to modify it in-place
+		 * because all the routines above make a fresh copy to put into
+		 * curOuterParams.
 		 */
 		if (IsA(nlp->paramval, Var) &&
 			bms_is_member(nlp->paramval->varno, leftrelids))
 		{
+			Var		   *var = (Var *) nlp->paramval;
+
 			root->curOuterParams = foreach_delete_current(root->curOuterParams,
 														  cell);
+			var->varnullingrels = bms_intersect(var->varnullingrels,
+												leftrelids);
 			result = lappend(result, nlp);
 		}
 		else if (IsA(nlp->paramval, PlaceHolderVar) &&
-				 bms_overlap(((PlaceHolderVar *) nlp->paramval)->phrels,
-							 leftrelids) &&
 				 bms_is_subset(find_placeholder_info(root,
-													 (PlaceHolderVar *) nlp->paramval,
-													 false)->ph_eval_at,
+													 (PlaceHolderVar *) nlp->paramval)->ph_eval_at,
 							   leftrelids))
 		{
+			PlaceHolderVar *phv = (PlaceHolderVar *) nlp->paramval;
+
 			root->curOuterParams = foreach_delete_current(root->curOuterParams,
 														  cell);
+			phv->phnullingrels = bms_intersect(phv->phnullingrels,
+											   leftrelids);
 			result = lappend(result, nlp);
 		}
 	}

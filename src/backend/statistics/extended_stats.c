@@ -6,7 +6,7 @@
  * Generic code supporting statistics objects created via CREATE STATISTICS.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,15 +21,13 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
-#include "catalog/pg_collation.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
-#include "executor/executor.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "pgstat.h"
@@ -47,7 +45,6 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
-#include "utils/typcache.h"
 
 /*
  * To avoid consuming too much memory during analysis and/or too much space
@@ -83,7 +80,7 @@ static void statext_store(Oid statOid, bool inh,
 						  MVNDistinct *ndistinct, MVDependencies *dependencies,
 						  MCVList *mcv, Datum exprs, VacAttrStats **stats);
 static int	statext_compute_stattarget(int stattarget,
-									   int natts, VacAttrStats **stats);
+									   int nattrs, VacAttrStats **stats);
 
 /* Information needed to analyze a single simple expression. */
 typedef struct AnlExprData
@@ -99,7 +96,7 @@ static Datum serialize_expr_stats(AnlExprData *exprdata, int nexprs);
 static Datum expr_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static AnlExprData *build_expr_data(List *exprs, int stattarget);
 
-static StatsBuildData *make_build_data(Relation onerel, StatExtEntry *stat,
+static StatsBuildData *make_build_data(Relation rel, StatExtEntry *stat,
 									   int numrows, HeapTuple *rows,
 									   VacAttrStats **stats, int stattarget);
 
@@ -173,7 +170,7 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 									  natts, vacattrstats);
 		if (!stats)
 		{
-			if (!IsAutoVacuumWorkerProcess())
+			if (!AmAutoVacuumWorkerProcess())
 				ereport(WARNING,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("statistics object \"%s.%s\" could not be computed for relation \"%s.%s\"",
@@ -366,8 +363,8 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 	for (i = 0; i < nattrs; i++)
 	{
 		/* keep the maximum statistics target */
-		if (stats[i]->attr->attstattarget > stattarget)
-			stattarget = stats[i]->attr->attstattarget;
+		if (stats[i]->attstattarget > stattarget)
+			stattarget = stats[i]->attstattarget;
 	}
 
 	/*
@@ -379,7 +376,7 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 		stattarget = default_statistics_target;
 
 	/* As this point we should have a valid statistics target. */
-	Assert((stattarget >= 0) && (stattarget <= 10000));
+	Assert((stattarget >= 0) && (stattarget <= MAX_STATISTICS_TARGET));
 
 	return stattarget;
 }
@@ -457,17 +454,18 @@ fetch_statentries_for_relation(Relation pg_statext, Oid relid)
 		entry->statOid = staForm->oid;
 		entry->schema = get_namespace_name(staForm->stxnamespace);
 		entry->name = pstrdup(NameStr(staForm->stxname));
-		entry->stattarget = staForm->stxstattarget;
 		for (i = 0; i < staForm->stxkeys.dim1; i++)
 		{
 			entry->columns = bms_add_member(entry->columns,
 											staForm->stxkeys.values[i]);
 		}
 
+		datum = SysCacheGetAttr(STATEXTOID, htup, Anum_pg_statistic_ext_stxstattarget, &isnull);
+		entry->stattarget = isnull ? -1 : DatumGetInt16(datum);
+
 		/* decode the stxkind char array into a list of chars */
-		datum = SysCacheGetAttr(STATEXTOID, htup,
-								Anum_pg_statistic_ext_stxkind, &isnull);
-		Assert(!isnull);
+		datum = SysCacheGetAttrNotNull(STATEXTOID, htup,
+									   Anum_pg_statistic_ext_stxkind);
 		arr = DatumGetArrayTypeP(datum);
 		if (ARR_NDIM(arr) != 1 ||
 			ARR_HASNULL(arr) ||
@@ -535,14 +533,10 @@ examine_attribute(Node *expr)
 	bool		ok;
 
 	/*
-	 * Create the VacAttrStats struct.  Note that we only have a copy of the
-	 * fixed fields of the pg_attribute tuple.
+	 * Create the VacAttrStats struct.
 	 */
 	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
-
-	/* fake the attribute */
-	stats->attr = (Form_pg_attribute) palloc0(ATTRIBUTE_FIXED_PART_SIZE);
-	stats->attr->attstattarget = -1;
+	stats->attstattarget = -1;
 
 	/*
 	 * When analyzing an expression, believe the expression tree's type not
@@ -596,7 +590,6 @@ examine_attribute(Node *expr)
 	if (!ok || stats->compute_stats == NULL || stats->minrows <= 0)
 	{
 		heap_freetuple(typtuple);
-		pfree(stats->attr);
 		pfree(stats);
 		return NULL;
 	}
@@ -626,6 +619,13 @@ examine_expression(Node *expr, int stattarget)
 	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
 
 	/*
+	 * We can't have statistics target specified for the expression, so we
+	 * could use either the default_statistics_target, or the target computed
+	 * for the extended statistics. The second option seems more reasonable.
+	 */
+	stats->attstattarget = stattarget;
+
+	/*
 	 * When analyzing an expression, believe the expression tree's type.
 	 */
 	stats->attrtypid = exprType(expr);
@@ -638,25 +638,6 @@ examine_expression(Node *expr, int stattarget)
 	 * which case exprCollation() does the right thing.
 	 */
 	stats->attrcollid = exprCollation(expr);
-
-	/*
-	 * We don't have any pg_attribute for expressions, so let's fake something
-	 * reasonable into attstattarget, which is the only thing std_typanalyze
-	 * needs.
-	 */
-	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_FIXED_PART_SIZE);
-
-	/*
-	 * We can't have statistics target specified for the expression, so we
-	 * could use either the default_statistics_target, or the target computed
-	 * for the extended statistics. The second option seems more reasonable.
-	 */
-	stats->attr->attstattarget = stattarget;
-
-	/* initialize some basic fields */
-	stats->attr->attrelid = InvalidOid;
-	stats->attr->attnum = InvalidAttrNumber;
-	stats->attr->atttypid = stats->attrtypid;
 
 	typtuple = SearchSysCacheCopy1(TYPEOID,
 								   ObjectIdGetDatum(stats->attrtypid));
@@ -747,12 +728,6 @@ lookup_var_attr_stats(Relation rel, Bitmapset *attrs, List *exprs,
 			pfree(stats);
 			return NULL;
 		}
-
-		/*
-		 * Sanity check that the column is not dropped - stats should have
-		 * been removed in this case.
-		 */
-		Assert(!stats[i]->attr->attisdropped);
 
 		i++;
 	}
@@ -1129,7 +1104,7 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 	}
 
 	/* do the sort, using the multi-sort */
-	qsort_interruptible((void *) items, nrows, sizeof(SortItem),
+	qsort_interruptible(items, nrows, sizeof(SortItem),
 						multi_sort_compare, mss);
 
 	return items;
@@ -1316,10 +1291,38 @@ choose_best_statistics(List *stats, char requiredkind, bool inh,
  * statext_is_compatible_clause_internal
  *		Determines if the clause is compatible with MCV lists.
  *
- * Does the heavy lifting of actually inspecting the clauses for
- * statext_is_compatible_clause. It needs to be split like this because
- * of recursion.  The attnums bitmap is an input/output parameter collecting
- * attribute numbers from all compatible clauses (recursively).
+ * To be compatible, the given clause must be a combination of supported
+ * clauses built from Vars or sub-expressions (where a sub-expression is
+ * something that exactly matches an expression found in statistics objects).
+ * This function recursively examines the clause and extracts any
+ * sub-expressions that will need to be matched against statistics.
+ *
+ * Currently, we only support the following types of clauses:
+ *
+ * (a) OpExprs of the form (Var/Expr op Const), or (Const op Var/Expr), where
+ * the op is one of ("=", "<", ">", ">=", "<=")
+ *
+ * (b) (Var/Expr IS [NOT] NULL)
+ *
+ * (c) combinations using AND/OR/NOT
+ *
+ * (d) ScalarArrayOpExprs of the form (Var/Expr op ANY (Const)) or
+ * (Var/Expr op ALL (Const))
+ *
+ * In the future, the range of supported clauses may be expanded to more
+ * complex cases, for example (Var op Var).
+ *
+ * Arguments:
+ * clause: (sub)clause to be inspected (bare clause, not a RestrictInfo)
+ * relid: rel that all Vars in clause must belong to
+ * *attnums: input/output parameter collecting attribute numbers of all
+ *		mentioned Vars.  Note that we do not offset the attribute numbers,
+ *		so we can't cope with system columns.
+ * *exprs: input/output parameter collecting primitive subclauses within
+ *		the clause tree
+ *
+ * Returns false if there is something we definitively can't handle.
+ * On true return, we can proceed to match the *exprs against statistics.
  */
 static bool
 statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
@@ -1343,10 +1346,14 @@ statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
 		if (var->varlevelsup > 0)
 			return false;
 
-		/* Also skip system attributes (we don't allow stats on those). */
+		/*
+		 * Also reject system attributes and whole-row Vars (we don't allow
+		 * stats on those).
+		 */
 		if (!AttrNumberIsForUserDefinedAttr(var->varattno))
 			return false;
 
+		/* OK, record the attnum for later permissions checks. */
 		*attnums = bms_add_member(*attnums, var->varattno);
 
 		return true;
@@ -1420,13 +1427,18 @@ statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
 		RangeTblEntry *rte = root->simple_rte_array[relid];
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) clause;
 		Node	   *clause_expr;
+		bool		expronleft;
 
 		/* Only expressions with two arguments are considered compatible. */
 		if (list_length(expr->args) != 2)
 			return false;
 
 		/* Check if the expression has the right shape (one Var, one Const) */
-		if (!examine_opclause_args(expr->args, &clause_expr, NULL, NULL))
+		if (!examine_opclause_args(expr->args, &clause_expr, NULL, &expronleft))
+			return false;
+
+		/* We only support Var on left, Const on right */
+		if (!expronleft)
 			return false;
 
 		/*
@@ -1501,7 +1513,7 @@ statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
 		foreach(lc, expr->args)
 		{
 			/*
-			 * Had we found incompatible clause in the arguments, treat the
+			 * If we find an incompatible clause in the arguments, treat the
 			 * whole clause as incompatible.
 			 */
 			if (!statext_is_compatible_clause_internal(root,
@@ -1540,27 +1552,29 @@ statext_is_compatible_clause_internal(PlannerInfo *root, Node *clause,
  * statext_is_compatible_clause
  *		Determines if the clause is compatible with MCV lists.
  *
- * Currently, we only support the following types of clauses:
+ * See statext_is_compatible_clause_internal, above, for the basic rules.
+ * This layer deals with RestrictInfo superstructure and applies permissions
+ * checks to verify that it's okay to examine all mentioned Vars.
  *
- * (a) OpExprs of the form (Var/Expr op Const), or (Const op Var/Expr), where
- * the op is one of ("=", "<", ">", ">=", "<=")
+ * Arguments:
+ * clause: clause to be inspected (in RestrictInfo form)
+ * relid: rel that all Vars in clause must belong to
+ * *attnums: input/output parameter collecting attribute numbers of all
+ *		mentioned Vars.  Note that we do not offset the attribute numbers,
+ *		so we can't cope with system columns.
+ * *exprs: input/output parameter collecting primitive subclauses within
+ *		the clause tree
  *
- * (b) (Var/Expr IS [NOT] NULL)
- *
- * (c) combinations using AND/OR/NOT
- *
- * (d) ScalarArrayOpExprs of the form (Var/Expr op ANY (array)) or (Var/Expr
- * op ALL (array))
- *
- * In the future, the range of supported clauses may be expanded to more
- * complex cases, for example (Var op Var).
+ * Returns false if there is something we definitively can't handle.
+ * On true return, we can proceed to match the *exprs against statistics.
  */
 static bool
 statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 							 Bitmapset **attnums, List **exprs)
 {
 	RangeTblEntry *rte = root->simple_rte_array[relid];
-	RestrictInfo *rinfo = (RestrictInfo *) clause;
+	RelOptInfo *rel = root->simple_rel_array[relid];
+	RestrictInfo *rinfo;
 	int			clause_relid;
 	Oid			userid;
 
@@ -1589,8 +1603,9 @@ statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 	}
 
 	/* Otherwise it must be a RestrictInfo. */
-	if (!IsA(rinfo, RestrictInfo))
+	if (!IsA(clause, RestrictInfo))
 		return false;
+	rinfo = (RestrictInfo *) clause;
 
 	/* Pseudoconstants are not really interesting here. */
 	if (rinfo->pseudoconstant)
@@ -1607,39 +1622,52 @@ statext_is_compatible_clause(PlannerInfo *root, Node *clause, Index relid,
 		return false;
 
 	/*
-	 * Check that the user has permission to read all required attributes. Use
-	 * checkAsUser if it's set, in case we're accessing the table via a view.
+	 * Check that the user has permission to read all required attributes.
 	 */
-	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+	userid = OidIsValid(rel->userid) ? rel->userid : GetUserId();
 
+	/* Table-level SELECT privilege is sufficient for all columns */
 	if (pg_class_aclcheck(rte->relid, userid, ACL_SELECT) != ACLCHECK_OK)
 	{
 		Bitmapset  *clause_attnums = NULL;
+		int			attnum = -1;
 
-		/* Don't have table privilege, must check individual columns */
+		/*
+		 * We have to check per-column privileges.  *attnums has the attnums
+		 * for individual Vars we saw, but there may also be Vars within
+		 * subexpressions in *exprs.  We can use pull_varattnos() to extract
+		 * those, but there's an impedance mismatch: attnums returned by
+		 * pull_varattnos() are offset by FirstLowInvalidHeapAttributeNumber,
+		 * while attnums within *attnums aren't.  Convert *attnums to the
+		 * offset style so we can combine the results.
+		 */
+		while ((attnum = bms_next_member(*attnums, attnum)) >= 0)
+		{
+			clause_attnums =
+				bms_add_member(clause_attnums,
+							   attnum - FirstLowInvalidHeapAttributeNumber);
+		}
+
+		/* Now merge attnums from *exprs into clause_attnums */
 		if (*exprs != NIL)
-		{
-			pull_varattnos((Node *) exprs, relid, &clause_attnums);
-			clause_attnums = bms_add_members(clause_attnums, *attnums);
-		}
-		else
-			clause_attnums = *attnums;
+			pull_varattnos((Node *) *exprs, relid, &clause_attnums);
 
-		if (bms_is_member(InvalidAttrNumber, clause_attnums))
+		attnum = -1;
+		while ((attnum = bms_next_member(clause_attnums, attnum)) >= 0)
 		{
-			/* Have a whole-row reference, must have access to all columns */
-			if (pg_attribute_aclcheck_all(rte->relid, userid, ACL_SELECT,
-										  ACLMASK_ALL) != ACLCHECK_OK)
-				return false;
-		}
-		else
-		{
-			/* Check the columns referenced by the clause */
-			int			attnum = -1;
+			/* Undo the offset */
+			AttrNumber	attno = attnum + FirstLowInvalidHeapAttributeNumber;
 
-			while ((attnum = bms_next_member(clause_attnums, attnum)) >= 0)
+			if (attno == InvalidAttrNumber)
 			{
-				if (pg_attribute_aclcheck(rte->relid, attnum, userid,
+				/* Whole-row reference, so must have access to all columns */
+				if (pg_attribute_aclcheck_all(rte->relid, userid, ACL_SELECT,
+											  ACLMASK_ALL) != ACLCHECK_OK)
+					return false;
+			}
+			else
+			{
+				if (pg_attribute_aclcheck(rte->relid, attno, userid,
 										  ACL_SELECT) != ACLCHECK_OK)
 					return false;
 			}
@@ -2185,8 +2213,7 @@ compute_expr_stats(Relation onerel, double totalrows,
 		if (tcnt > 0)
 		{
 			AttributeOpts *aopt =
-			get_attribute_options(stats->attr->attrelid,
-								  stats->attr->attnum);
+				get_attribute_options(onerel->rd_id, stats->tupattnum);
 
 			stats->exprvals = exprvals;
 			stats->exprnulls = exprnulls;
@@ -2209,7 +2236,7 @@ compute_expr_stats(Relation onerel, double totalrows,
 
 		ExecDropSingleTupleTableSlot(slot);
 		FreeExecutorState(estate);
-		MemoryContextResetAndDeleteChildren(expr_context);
+		MemoryContextReset(expr_context);
 	}
 
 	MemoryContextSwitchTo(old_context);
@@ -2415,7 +2442,7 @@ statext_expressions_load(Oid stxoid, bool inh, int idx)
 	if (isnull)
 		elog(ERROR,
 			 "requested statistics kind \"%c\" is not yet built for statistics object %u",
-			 STATS_EXT_DEPENDENCIES, stxoid);
+			 STATS_EXT_EXPRESSIONS, stxoid);
 
 	eah = DatumGetExpandedArray(value);
 

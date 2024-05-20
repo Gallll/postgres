@@ -8,7 +8,7 @@
  * pager open/close functions, all that stuff came with it.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/fe_utils/print.c
@@ -1222,15 +1222,16 @@ cleanup:
 
 
 static void
-print_aligned_vertical_line(const printTextFormat *format,
-							const unsigned short opt_border,
+print_aligned_vertical_line(const printTableOpt *topt,
 							unsigned long record,
 							unsigned int hwidth,
 							unsigned int dwidth,
+							int output_columns,
 							printTextRule pos,
 							FILE *fout)
 {
-	const printTextLineFormat *lformat = &format->lrule[pos];
+	const printTextLineFormat *lformat = &get_line_style(topt)->lrule[pos];
+	const unsigned short opt_border = topt->border;
 	unsigned int i;
 	int			reclen = 0;
 
@@ -1259,8 +1260,18 @@ print_aligned_vertical_line(const printTextFormat *format,
 		if (reclen-- <= 0)
 			fputs(lformat->hrule, fout);
 		if (reclen-- <= 0)
-			fputs(lformat->midvrule, fout);
-		if (reclen-- <= 0)
+		{
+			if (topt->expanded_header_width_type == PRINT_XHEADER_COLUMN)
+			{
+				fputs(lformat->rightvrule, fout);
+			}
+			else
+			{
+				fputs(lformat->midvrule, fout);
+			}
+		}
+		if (reclen-- <= 0
+			&& topt->expanded_header_width_type != PRINT_XHEADER_COLUMN)
 			fputs(lformat->hrule, fout);
 	}
 	else
@@ -1268,12 +1279,44 @@ print_aligned_vertical_line(const printTextFormat *format,
 		if (reclen-- <= 0)
 			fputc(' ', fout);
 	}
-	if (reclen < 0)
-		reclen = 0;
-	for (i = reclen; i < dwidth; i++)
-		fputs(opt_border > 0 ? lformat->hrule : " ", fout);
-	if (opt_border == 2)
-		fprintf(fout, "%s%s", lformat->hrule, lformat->rightvrule);
+
+	if (topt->expanded_header_width_type != PRINT_XHEADER_COLUMN)
+	{
+		if (topt->expanded_header_width_type == PRINT_XHEADER_PAGE
+			|| topt->expanded_header_width_type == PRINT_XHEADER_EXACT_WIDTH)
+		{
+			if (topt->expanded_header_width_type == PRINT_XHEADER_EXACT_WIDTH)
+			{
+				output_columns = topt->expanded_header_exact_width;
+			}
+			if (output_columns > 0)
+			{
+				if (opt_border == 0)
+					dwidth = Min(dwidth, Max(0, (int) (output_columns - hwidth)));
+				if (opt_border == 1)
+					dwidth = Min(dwidth, Max(0, (int) (output_columns - hwidth - 3)));
+
+				/*
+				 * Handling the xheader width for border=2 doesn't make much
+				 * sense because this format has an additional right border,
+				 * but keep this for consistency.
+				 */
+				if (opt_border == 2)
+					dwidth = Min(dwidth, Max(0, (int) (output_columns - hwidth - 7)));
+			}
+		}
+
+		if (reclen < 0)
+			reclen = 0;
+		if (dwidth < reclen)
+			dwidth = reclen;
+
+		for (i = reclen; i < dwidth; i++)
+			fputs(opt_border > 0 ? lformat->hrule : " ", fout);
+		if (opt_border == 2)
+			fprintf(fout, "%s%s", lformat->hrule, lformat->rightvrule);
+	}
+
 	fputc('\n', fout);
 }
 
@@ -1358,7 +1401,7 @@ print_aligned_vertical(const printTableContent *cont,
 	}
 
 	/* find longest data cell */
-	for (i = 0, ptr = cont->cells; *ptr; ptr++, i++)
+	for (ptr = cont->cells; *ptr; ptr++)
 	{
 		int			width,
 					height,
@@ -1570,11 +1613,12 @@ print_aligned_vertical(const printTableContent *cont,
 				lhwidth++;		/* for newline indicators */
 
 			if (!opt_tuples_only)
-				print_aligned_vertical_line(format, opt_border, record++,
-											lhwidth, dwidth, pos, fout);
+				print_aligned_vertical_line(cont->opt, record++,
+											lhwidth, dwidth, output_columns,
+											pos, fout);
 			else if (i != 0 || !cont->opt->start_table || opt_border == 2)
-				print_aligned_vertical_line(format, opt_border, 0, lhwidth,
-											dwidth, pos, fout);
+				print_aligned_vertical_line(cont->opt, 0, lhwidth,
+											dwidth, output_columns, pos, fout);
 		}
 
 		/* Format the header */
@@ -1760,8 +1804,8 @@ print_aligned_vertical(const printTableContent *cont,
 	if (cont->opt->stop_table)
 	{
 		if (opt_border == 2 && !cancel_pressed)
-			print_aligned_vertical_line(format, opt_border, 0, hwidth, dwidth,
-										PRINT_RULE_BOTTOM, fout);
+			print_aligned_vertical_line(cont->opt, 0, hwidth, dwidth,
+										output_columns, PRINT_RULE_BOTTOM, fout);
 
 		/* print footers */
 		if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed)
@@ -3075,6 +3119,7 @@ PageOutput(int lines, const printTableOpt *topt)
 				if (strspn(pagerprog, " \t\r\n") == strlen(pagerprog))
 					return stdout;
 			}
+			fflush(NULL);
 			disable_sigpipe_trap();
 			pagerpipe = popen(pagerprog, "w");
 			if (pagerpipe)
@@ -3127,6 +3172,8 @@ void
 printTableInit(printTableContent *const content, const printTableOpt *opt,
 			   const char *title, const int ncolumns, const int nrows)
 {
+	uint64		total_cells;
+
 	content->opt = opt;
 	content->title = title;
 	content->ncolumns = ncolumns;
@@ -3134,7 +3181,16 @@ printTableInit(printTableContent *const content, const printTableOpt *opt,
 
 	content->headers = pg_malloc0((ncolumns + 1) * sizeof(*content->headers));
 
-	content->cells = pg_malloc0((ncolumns * nrows + 1) * sizeof(*content->cells));
+	total_cells = (uint64) ncolumns * nrows;
+	/* Catch possible overflow.  Using >= here allows adding 1 below */
+	if (total_cells >= SIZE_MAX / sizeof(*content->cells))
+	{
+		fprintf(stderr, _("Cannot print table contents: number of cells %lld is equal to or exceeds maximum %lld.\n"),
+				(long long int) total_cells,
+				(long long int) (SIZE_MAX / sizeof(*content->cells)));
+		exit(EXIT_FAILURE);
+	}
+	content->cells = pg_malloc0((total_cells + 1) * sizeof(*content->cells));
 
 	content->cellmustfree = NULL;
 	content->footers = NULL;
@@ -3204,15 +3260,17 @@ void
 printTableAddCell(printTableContent *const content, char *cell,
 				  const bool translate, const bool mustfree)
 {
+	uint64		total_cells;
+
 #ifndef ENABLE_NLS
 	(void) translate;			/* unused parameter */
 #endif
 
-	if (content->cellsadded >= content->ncolumns * content->nrows)
+	total_cells = (uint64) content->ncolumns * content->nrows;
+	if (content->cellsadded >= total_cells)
 	{
-		fprintf(stderr, _("Cannot add cell to table content: "
-						  "total cell count of %d exceeded.\n"),
-				content->ncolumns * content->nrows);
+		fprintf(stderr, _("Cannot add cell to table content: total cell count of %lld exceeded.\n"),
+				(long long int) total_cells);
 		exit(EXIT_FAILURE);
 	}
 
@@ -3228,7 +3286,7 @@ printTableAddCell(printTableContent *const content, char *cell,
 	{
 		if (content->cellmustfree == NULL)
 			content->cellmustfree =
-				pg_malloc0((content->ncolumns * content->nrows + 1) * sizeof(bool));
+				pg_malloc0((total_cells + 1) * sizeof(bool));
 
 		content->cellmustfree[content->cellsadded] = true;
 	}
@@ -3296,9 +3354,10 @@ printTableCleanup(printTableContent *const content)
 {
 	if (content->cellmustfree)
 	{
-		int			i;
+		uint64		total_cells;
 
-		for (i = 0; i < content->nrows * content->ncolumns; i++)
+		total_cells = (uint64) content->ncolumns * content->nrows;
+		for (uint64 i = 0; i < total_cells; i++)
 		{
 			if (content->cellmustfree[i])
 				free(unconstify(char *, content->cells[i]));

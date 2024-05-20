@@ -6,7 +6,8 @@
 
 setup
 {
- CREATE TABLE accounts (accountid text PRIMARY KEY, balance numeric not null);
+ CREATE TABLE accounts (accountid text PRIMARY KEY, balance numeric not null,
+   balance2 numeric GENERATED ALWAYS AS (balance * 2) STORED);
  INSERT INTO accounts VALUES ('checking', 600), ('savings', 600);
 
  CREATE FUNCTION update_checking(int) RETURNS bool LANGUAGE sql AS $$
@@ -33,10 +34,13 @@ setup
  CREATE TABLE jointest AS SELECT generate_series(1,10) AS id, 0 AS data;
  CREATE INDEX ON jointest(id);
 
- CREATE TABLE parttbl (a int, b int, c int) PARTITION BY LIST (a);
+ CREATE TABLE parttbl (a int, b int, c int,
+   d int GENERATED ALWAYS AS (a + b) STORED) PARTITION BY LIST (a);
  CREATE TABLE parttbl1 PARTITION OF parttbl FOR VALUES IN (1);
- CREATE TABLE parttbl2 PARTITION OF parttbl FOR VALUES IN (2);
- INSERT INTO parttbl VALUES (1, 1, 1);
+ CREATE TABLE parttbl2 PARTITION OF parttbl
+   (d WITH OPTIONS GENERATED ALWAYS AS (a + b + 1000) STORED)
+   FOR VALUES IN (2);
+ INSERT INTO parttbl VALUES (1, 1, 1), (2, 2, 2);
 
  CREATE TABLE another_parttbl (a int, b int, c int) PARTITION BY LIST (a);
  CREATE TABLE another_parttbl1 PARTITION OF another_parttbl FOR VALUES IN (1);
@@ -72,6 +76,8 @@ setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
 step wx1	{ UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance; }
 # wy1 then wy2 checks the case where quals pass then fail
 step wy1	{ UPDATE accounts SET balance = balance + 500 WHERE accountid = 'checking' RETURNING balance; }
+# wx2 then wb1 checks the case of re-fetching up-to-date values for DELETE ... RETURNING ...
+step wb1	{ DELETE FROM accounts WHERE balance = 600 RETURNING *; }
 
 step wxext1	{ UPDATE accounts_ext SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance; }
 step tocds1	{ UPDATE accounts SET accountid = 'cds' WHERE accountid = 'checking'; }
@@ -98,11 +104,15 @@ step upsert1	{
 # when the first updated tuple was in a non-first child table.
 # writep2/returningp1 tests a memory allocation issue
 # writep3a/writep3b tests updates touching more than one table
+# writep4a/writep4b tests a case where matches in another table confused EPQ
+# writep4a/deletep4 tests the same case in the DELETE path
 
+step readp		{ SELECT tableoid::regclass, ctid, * FROM p; }
 step readp1		{ SELECT tableoid::regclass, ctid, * FROM p WHERE b IN (0, 1) AND c = 0 FOR UPDATE; }
 step writep1	{ UPDATE p SET b = -1 WHERE a = 1 AND b = 1 AND c = 0; }
 step writep2	{ UPDATE p SET b = -b WHERE a = 1 AND c = 0; }
 step writep3a	{ UPDATE p SET b = -b WHERE c = 0; }
+step writep4a	{ UPDATE p SET c = 4 WHERE c = 0; }
 step c1		{ COMMIT; }
 step r1		{ ROLLBACK; }
 
@@ -171,7 +181,7 @@ step selectresultforupdate	{
 # test for EPQ on a partitioned result table
 
 step simplepartupdate	{
-	update parttbl set a = a;
+	update parttbl set b = b + 10;
 }
 
 # test scenarios where update may cause row movement
@@ -206,6 +216,8 @@ step returningp1 {
 	  SELECT * FROM u;
 }
 step writep3b	{ UPDATE p SET b = -b WHERE c = 0; }
+step writep4b	{ UPDATE p SET b = -4 WHERE c = 0; }
+step deletep4	{ DELETE FROM p WHERE c = 0; }
 step readforss	{
 	SELECT ta.id AS ta_id, ta.value AS ta_value,
 		(SELECT ROW(tb.id, tb.value)
@@ -222,9 +234,14 @@ step updateforcip3	{
 }
 step wrtwcte	{ UPDATE table_a SET value = 'tableAValue2' WHERE id = 1; }
 step wrjt	{ UPDATE jointest SET data = 42 WHERE id = 7; }
+
+step conditionalpartupdate	{
+	update parttbl set c = -c where b < 10;
+}
+
 step complexpartupdate	{
-	with u as (update parttbl set a = a returning parttbl.*)
-	update parttbl set a = u.a from u;
+	with u as (update parttbl set b = b + 1 returning parttbl.*)
+	update parttbl p set b = u.b + 100 from u where p.a = u.a;
 }
 
 step complexpartupdate_route_err1 {
@@ -273,6 +290,7 @@ setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
 step read	{ SELECT * FROM accounts ORDER BY accountid; }
 step read_ext	{ SELECT * FROM accounts_ext ORDER BY accountid; }
 step read_a		{ SELECT * FROM table_a ORDER BY id; }
+step read_part	{ SELECT * FROM parttbl ORDER BY a, c; }
 
 # this test exercises EvalPlanQual with a CTE, cf bug #14328
 step readwcte	{
@@ -337,11 +355,15 @@ permutation wx1 delwcte c1 c2 read
 # test that a delete to a self-modified row throws error when
 # previously updated by a different cid
 permutation wx1 delwctefail c1 c2 read
+# test that a delete re-fetches up-to-date values for returning clause
+permutation read wx2 wb1 c2 c1 read
 
 permutation upsert1 upsert2 c1 c2 read
 permutation readp1 writep1 readp2 c1 c2
 permutation writep2 returningp1 c1 c2
 permutation writep3a writep3b c1 c2
+permutation writep4a writep4b c1 c2 readp
+permutation writep4a deletep4 c1 c2 readp
 permutation wx2 partiallock c2 c1 read
 permutation wx2 lockwithvalues c2 c1 read
 permutation wx2_ext partiallock_ext c2 c1 read_ext
@@ -353,7 +375,8 @@ permutation wrjt selectjoinforupdate c2 c1
 permutation wrjt selectresultforupdate c2 c1
 permutation wrtwcte multireadwcte c1 c2
 
-permutation simplepartupdate complexpartupdate c1 c2
-permutation simplepartupdate_route1to2 complexpartupdate_route_err1 c1 c2
-permutation simplepartupdate_noroute complexpartupdate_route c1 c2
-permutation simplepartupdate_noroute complexpartupdate_doesnt_route c1 c2
+permutation simplepartupdate conditionalpartupdate c1 c2 read_part
+permutation simplepartupdate complexpartupdate c1 c2 read_part
+permutation simplepartupdate_route1to2 complexpartupdate_route_err1 c1 c2 read_part
+permutation simplepartupdate_noroute complexpartupdate_route c1 c2 read_part
+permutation simplepartupdate_noroute complexpartupdate_doesnt_route c1 c2 read_part

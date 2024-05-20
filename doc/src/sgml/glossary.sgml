@@ -39,6 +39,21 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-am">
+   <glossterm>Access Method</glossterm>
+   <glossdef>
+    <para>
+     Interfaces which <productname>PostgreSQL</productname> use in order to
+     access data in tables and indexes.  This abstraction allows for adding
+     support for new types of data storage.
+    </para>
+    <para>
+     For more information, see <xref linkend="tableam" /> and
+     <xref linkend="indexam" />.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry>
    <glossterm>Analytic function</glossterm>
    <glosssee otherterm="glossary-window-function" />
@@ -233,6 +248,54 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-bootstrap-superuser">
+   <glossterm>Bootstrap superuser</glossterm>
+   <glossdef>
+    <para>
+     The first <glossterm linkend="glossary-user">user</glossterm> initialized in a
+     <glossterm linkend="glossary-db-cluster">database cluster</glossterm>.
+    </para>
+    <para>
+     This user owns all system catalog tables in each database.  It is also the role
+     from which all granted permissions originate.  Because of these things, this
+     role may not be dropped.
+    </para>
+    <para>
+     This role also behaves as a normal
+     <glossterm linkend="glossary-database-superuser">database superuser</glossterm>,
+     and its superuser status cannot be removed.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-buffer-access-strategy">
+   <glossterm>Buffer Access Strategy</glossterm>
+   <glossdef>
+    <para>
+     Some operations will access a large number of
+     <glossterm linkend="glossary-data-page">pages</glossterm>.  A
+     <firstterm>Buffer Access Strategy</firstterm> helps to prevent these
+     operations from evicting too many pages from
+     <glossterm linkend="glossary-shared-memory">shared buffers</glossterm>.
+    </para>
+    <para>
+     A Buffer Access Strategy sets up references to a limited number of
+     <glossterm linkend="glossary-shared-memory">shared buffers</glossterm> and
+     reuses them circularly.  When the operation requires a new page, a victim
+     buffer is chosen from the buffers in the strategy ring, which may require
+     flushing the page's dirty data and possibly also unflushed
+     <glossterm linkend="glossary-wal">WAL</glossterm> to permanent storage.
+    </para>
+    <para>
+     Buffer Access Strategies are used for various operations such as
+     sequential scans of large tables, <command>VACUUM</command>,
+     <command>COPY</command>, <command>CREATE TABLE AS SELECT</command>,
+     <command>ALTER TABLE</command>, <command>CREATE DATABASE</command>,
+     <command>CREATE INDEX</command>, and <command>CLUSTER</command>.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-cast">
    <glossterm>Cast</glossterm>
    <glossdef>
@@ -338,6 +401,23 @@
      by <glossterm linkend="glossary-connection">connecting</glossterm> to an
      <glossterm linkend="glossary-instance">instance</glossterm>
      to interact with a <glossterm linkend="glossary-database">database</glossterm>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-cluster-owner">
+   <glossterm>Cluster owner</glossterm>
+   <glossdef>
+    <para>
+     The operating system user that owns the
+     <glossterm linkend="glossary-data-directory">data directory</glossterm>
+     and under which the <literal>postgres</literal> process is run.
+     It is required that this user exist prior to creating a new
+     <glossterm linkend="glossary-db-cluster">database cluster</glossterm>.
+    </para>
+    <para>
+     On operating systems with a <literal>root</literal> user,
+     said user is not allowed to be the cluster owner.
     </para>
    </glossdef>
   </glossentry>
@@ -475,11 +555,19 @@
      and their common static and dynamic metadata.
      Sometimes referred to as a
      <firstterm>cluster</firstterm>.
+     A database cluster is created using the
+     <xref linkend="app-initdb" /> program.
     </para>
     <para>
      In <productname>PostgreSQL</productname>, the term
      <firstterm>cluster</firstterm> is also sometimes used to refer to an instance.
      (Don't confuse this term with the SQL command <command>CLUSTER</command>.)
+    </para>
+    <para>
+     See also <glossterm linkend="glossary-cluster-owner">cluster owner</glossterm>,
+     the operating-system owner of a cluster,
+     and <glossterm linkend="glossary-bootstrap-superuser">bootstrap superuser</glossterm>,
+     the <productname>PostgreSQL</productname> owner of a cluster.
     </para>
    </glossdef>
   </glossentry>
@@ -487,6 +575,19 @@
   <glossentry>
    <glossterm>Database server</glossterm>
    <glosssee otherterm="glossary-instance" />
+  </glossentry>
+
+  <glossentry id="glossary-database-superuser">
+   <glossterm>Database superuser</glossterm>
+   <glossdef>
+    <para>
+     A role having <firstterm>superuser status</firstterm>
+     (see <xref linkend="role-attributes"/>).
+    </para>
+    <para>
+     Frequently referred to as <firstterm>superuser</firstterm>.
+    </para>
+   </glossdef>
   </glossentry>
 
   <glossentry id="glossary-data-directory">
@@ -808,6 +909,28 @@
     </para>
    </glossdef>
   </glossentry>
+  <glossentry id="glossary-incremental-backup">
+   <glossterm>Incremental backup</glossterm>
+   <glossdef>
+    <para>
+     A special <glossterm linkend="glossary-basebackup">base backup</glossterm>
+     that for some files may contain only those pages that were modified since
+     a previous backup, as opposed to the full contents of every file. Like
+     base backups, it is generated by the tool <xref linkend="app-pgbasebackup"/>.
+    </para>
+    <para>
+     To restore incremental backups the tool <xref linkend="app-pgcombinebackup"/>
+     is used, which combines incremental backups with a base backup.
+     Afterwards, recovery can use
+     <glossterm linkend="glossary-wal">WAL</glossterm> to bring the
+     <glossterm linkend="glossary-db-cluster">database cluster</glossterm> to
+     a consistent state.
+    </para>
+    <para>
+     For more information, see <xref linkend="backup-incremental-backup"/>.
+    </para>
+   </glossdef>
+  </glossentry>
 
   <glossentry id="glossary-insert">
    <glossterm>Insert</glossterm>
@@ -954,6 +1077,28 @@
     </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-log-sequence-number">
+   <glossterm>Log sequence number</glossterm>
+   <acronym>LSN</acronym>
+   <glossdef>
+    <para>
+     Byte offset into the <glossterm linkend="glossary-wal">WAL</glossterm>,
+     increasing monotonically with each new <glossterm
+     linkend="glossary-wal-record">WAL record</glossterm>.
+    </para>
+    <para>
+     For more information, see <link
+     linkend="datatype-pg-lsn"><type>pg_lsn</type></link> and <xref
+     linkend="wal-internals"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry>
+   <glossterm>LSN</glossterm>
+   <glosssee otherterm="glossary-log-sequence-number"/>
+  </glossentry>
+
   <glossentry>
    <glossterm>Master (server)</glossterm>
    <glosssee otherterm="glossary-primary-server" />
@@ -990,12 +1135,29 @@
      (just like a <glossterm linkend="glossary-view">view</glossterm>),
      but stores data in the same way that a
      <glossterm linkend="glossary-table">table</glossterm> does. It cannot be
-     modified via <command>INSERT</command>, <command>UPDATE</command>, or
-     <command>DELETE</command> operations.
+     modified via <command>INSERT</command>, <command>UPDATE</command>,
+     <command>DELETE</command>, or <command>MERGE</command> operations.
     </para>
     <para>
      For more information, see
      <xref linkend="sql-creatematerializedview"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-merge">
+   <glossterm>Merge</glossterm>
+   <glossdef>
+    <para>
+     An <acronym>SQL</acronym> command used to conditionally add, modify,
+     or remove <glossterm linkend="glossary-tuple">rows</glossterm>
+     in a given <glossterm linkend="glossary-table">table</glossterm>,
+     using data from a source
+     <glossterm linkend="glossary-relation">relation</glossterm>.
+    </para>
+    <para>
+     For more information, see
+     <xref linkend="sql-merge"/>.
     </para>
    </glossdef>
   </glossentry>
@@ -1257,6 +1419,20 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-restartpoint">
+   <glossterm>Restartpoint</glossterm>
+   <glossdef>
+    <para>
+     A variant of a <glossterm
+     linkend="glossary-checkpoint">checkpoint</glossterm> performed on a
+     <glossterm linkend="glossary-replica">replica</glossterm>.
+    </para>
+    <para>
+     For more information, see <xref linkend="wal-configuration"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-result-set">
    <glossterm>Result set</glossterm>
    <glossdef>
@@ -1266,9 +1442,9 @@
      to a <glossterm linkend="glossary-client">client</glossterm> upon the
      completion of an <acronym>SQL</acronym> command, usually a
      <command>SELECT</command> but it can be an
-     <command>INSERT</command>, <command>UPDATE</command>, or
-     <command>DELETE</command> command if the <literal>RETURNING</literal>
-     clause is specified.
+     <command>INSERT</command>, <command>UPDATE</command>,
+     <command>DELETE</command>, or <command>MERGE</command> command if the
+     <literal>RETURNING</literal> clause is specified.
     </para>
     <para>
      The fact that a result set is a relation means that a query can be used
@@ -1577,6 +1753,16 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-superuser">
+   <glossterm>Superuser</glossterm>
+   <glossdef>
+    <para>
+     As used in this documentation, it is a synonym for
+     <glossterm linkend="glossary-database-superuser">database superuser</glossterm>.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-system-catalog">
    <glossterm>System catalog</glossterm>
    <glossdef>
@@ -1710,7 +1896,8 @@
      <literal>3</literal> (values under that are reserved) and the
      epoch value is incremented by one.
      In some contexts, the epoch and xid values are
-     considered together as a single 64-bit value.
+     considered together as a single 64-bit value;  see <xref
+     linkend="transaction-id"/> for more details.
     </para>
     <para>
      For more information, see
@@ -1827,7 +2014,8 @@
    <glossdef>
     <para>
      A <glossterm linkend="glossary-role">role</glossterm> that has the
-     <literal>LOGIN</literal> privilege.
+     <firstterm>login privilege</firstterm>
+     (see <xref linkend="role-attributes"/>).
     </para>
    </glossdef>
   </glossentry>
@@ -2003,6 +2191,20 @@
      in a <glossterm linkend="glossary-replica">replica</glossterm>,
      <xref linkend="app-pgreceivewal"/>, or any other client program
      that speaks the replication protocol.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-wal-summarizer">
+   <glossterm>WAL summarizer (process)</glossterm>
+   <glossdef>
+    <para>
+     A special <glossterm linkend="glossary-backend">backend process</glossterm>
+     that summarizes WAL data for
+     <glossterm linkend="glossary-incremental-backup">incremental backups</glossterm>.
+    </para>
+    <para>
+     For more information, see <xref linkend="runtime-config-wal-summarization"/>.
     </para>
    </glossdef>
   </glossentry>

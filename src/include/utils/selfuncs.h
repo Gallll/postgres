@@ -5,7 +5,7 @@
  *	  infrastructure for selectivity and cost estimation.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/selfuncs.h
@@ -117,6 +117,9 @@ typedef struct VariableStatData
  * Callers should initialize all fields of GenericCosts to zero.  In addition,
  * they can set numIndexTuples to some positive value if they have a better
  * than default way of estimating the number of leaf index tuples visited.
+ * Similarly, they can set num_sa_scans to some value >= 1 for an index AM
+ * that doesn't necessarily perform exactly one primitive index scan per
+ * distinct combination of ScalarArrayOp array elements.
  */
 typedef struct
 {
@@ -200,7 +203,7 @@ extern Selectivity scalararraysel(PlannerInfo *root,
 								  ScalarArrayOpExpr *clause,
 								  bool is_join_clause,
 								  int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
-extern int	estimate_array_length(Node *arrayexpr);
+extern double estimate_array_length(PlannerInfo *root, Node *arrayexpr);
 extern Selectivity rowcomparesel(PlannerInfo *root,
 								 RowCompareExpr *clause,
 								 int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
@@ -213,11 +216,6 @@ extern void mergejoinscansel(PlannerInfo *root, Node *clause,
 extern double estimate_num_groups(PlannerInfo *root, List *groupExprs,
 								  double input_rows, List **pgset,
 								  EstimationInfo *estinfo);
-
-extern double estimate_num_groups_incremental(PlannerInfo *root, List *groupExprs,
-											  double input_rows, List **pgset,
-											  EstimationInfo *estinfo,
-											  List **cache_varinfos, int prevNExprs);
 
 extern void estimate_hash_bucket_stats(PlannerInfo *root,
 									   Node *hashkey, double nbuckets,

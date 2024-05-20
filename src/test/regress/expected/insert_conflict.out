@@ -50,7 +50,7 @@ explain (costs off) insert into insertconflicttest values(0, 'Crowberry') on con
  Insert on insertconflicttest
    Conflict Resolution: UPDATE
    Conflict Arbiter Indexes: op_index_key, collation_index_key, both_index_key
-   Conflict Filter: (SubPlan 1)
+   Conflict Filter: EXISTS(SubPlan 1)
    ->  Result
    SubPlan 1
      ->  Index Only Scan using both_index_expr_key on insertconflicttest ii
@@ -242,7 +242,7 @@ insert into insertconflicttest values (1, 'Apple') on conflict (key) do update s
 ERROR:  invalid reference to FROM-clause entry for table "excluded"
 LINE 1: ...y) do update set fruit = excluded.fruit RETURNING excluded.f...
                                                              ^
-HINT:  There is an entry for table "excluded", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "excluded", but it cannot be referenced from this part of the query.
 -- Only suggest <table>.* column when inference element misspelled:
 insert into insertconflicttest values (1, 'Apple') on conflict (keyy) do update set fruit = excluded.fruit;
 ERROR:  column "keyy" does not exist
@@ -272,6 +272,12 @@ ERROR:  invalid reference to FROM-clause entry for table "insertconflicttest"
 LINE 1: ...onfruit') on conflict (key) do update set fruit = insertconf...
                                                              ^
 HINT:  Perhaps you meant to reference the table alias "ict".
+-- Check helpful hint when qualifying set column with target table
+insert into insertconflicttest values (3, 'Kiwi') on conflict (key, fruit) do update set insertconflicttest.fruit = 'Mango';
+ERROR:  column "insertconflicttest" of relation "insertconflicttest" does not exist
+LINE 1: ...3, 'Kiwi') on conflict (key, fruit) do update set insertconf...
+                                                             ^
+HINT:  SET target columns cannot be qualified with the relation name.
 drop index key_index;
 --
 -- Composite key tests

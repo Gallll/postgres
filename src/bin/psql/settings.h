@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2024, PostgreSQL Global Development Group
  *
  * src/bin/psql/settings.h
  */
@@ -37,21 +37,21 @@ typedef enum
 	PSQL_ECHO_NONE,
 	PSQL_ECHO_QUERIES,
 	PSQL_ECHO_ERRORS,
-	PSQL_ECHO_ALL
+	PSQL_ECHO_ALL,
 } PSQL_ECHO;
 
 typedef enum
 {
 	PSQL_ECHO_HIDDEN_OFF,
 	PSQL_ECHO_HIDDEN_ON,
-	PSQL_ECHO_HIDDEN_NOEXEC
+	PSQL_ECHO_HIDDEN_NOEXEC,
 } PSQL_ECHO_HIDDEN;
 
 typedef enum
 {
 	PSQL_ERROR_ROLLBACK_OFF,
 	PSQL_ERROR_ROLLBACK_INTERACTIVE,
-	PSQL_ERROR_ROLLBACK_ON
+	PSQL_ERROR_ROLLBACK_ON,
 } PSQL_ERROR_ROLLBACK;
 
 typedef enum
@@ -59,7 +59,7 @@ typedef enum
 	PSQL_COMP_CASE_PRESERVE_UPPER,
 	PSQL_COMP_CASE_PRESERVE_LOWER,
 	PSQL_COMP_CASE_UPPER,
-	PSQL_COMP_CASE_LOWER
+	PSQL_COMP_CASE_LOWER,
 } PSQL_COMP_CASE;
 
 typedef enum
@@ -67,14 +67,14 @@ typedef enum
 	hctl_none = 0,
 	hctl_ignorespace = 1,
 	hctl_ignoredups = 2,
-	hctl_ignoreboth = hctl_ignorespace | hctl_ignoredups
+	hctl_ignoreboth = hctl_ignorespace | hctl_ignoredups,
 } HistControl;
 
 enum trivalue
 {
 	TRI_DEFAULT,
 	TRI_NO,
-	TRI_YES
+	TRI_YES,
 };
 
 typedef struct _psqlSettings
@@ -96,6 +96,10 @@ typedef struct _psqlSettings
 	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
 	bool		gdesc_flag;		/* one-shot request to describe query result */
 	bool		gexec_flag;		/* one-shot request to execute query result */
+	bool		bind_flag;		/* one-shot request to use extended query
+								 * protocol */
+	int			bind_nparams;	/* number of parameters */
+	char	  **bind_params;	/* parameters for extended query protocol call */
 	bool		crosstab_flag;	/* one-shot request to crosstab result */
 	char	   *ctv_args[4];	/* \crosstabview arguments */
 

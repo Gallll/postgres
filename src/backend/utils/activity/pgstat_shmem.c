@@ -3,7 +3,7 @@
  * pgstat_shmem.c
  *	  Storage of stats entries in shared memory
  *
- * Copyright (c) 2001-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_shmem.c
@@ -64,6 +64,7 @@ static const dshash_parameters dsh_params = {
 	sizeof(PgStatShared_HashEntry),
 	pgstat_cmp_hash_key,
 	pgstat_hash_hash_key,
+	dshash_memcpy,
 	LWTRANCHE_PGSTATS_HASH
 };
 
@@ -180,7 +181,7 @@ StatsShmemInit(void)
 		 * With the limit in place, create the dshash table. XXX: It'd be nice
 		 * if there were dshash_create_in_place().
 		 */
-		dsh = dshash_create(dsa, &dsh_params, 0);
+		dsh = dshash_create(dsa, &dsh_params, NULL);
 		ctl->hash_handle = dshash_get_hash_table_handle(dsh);
 
 		/* lift limit set above */
@@ -202,6 +203,10 @@ StatsShmemInit(void)
 		LWLockInitialize(&ctl->checkpointer.lock, LWTRANCHE_PGSTATS_DATA);
 		LWLockInitialize(&ctl->slru.lock, LWTRANCHE_PGSTATS_DATA);
 		LWLockInitialize(&ctl->wal.lock, LWTRANCHE_PGSTATS_DATA);
+
+		for (int i = 0; i < BACKEND_NUM_TYPES; i++)
+			LWLockInitialize(&ctl->io.locks[i],
+							 LWTRANCHE_PGSTATS_DATA);
 	}
 	else
 	{
@@ -402,7 +407,7 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, Oid objoid, bool create,
 	 * passing in created_entry only makes sense if we possibly could create
 	 * entry.
 	 */
-	AssertArg(create || created_entry == NULL);
+	Assert(create || created_entry == NULL);
 	pgstat_assert_is_up();
 	Assert(pgStatLocal.shared_hash != NULL);
 	Assert(!pgStatLocal.shmem->is_shutdown);
@@ -576,6 +581,22 @@ pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 		return LWLockConditionalAcquire(lock, LW_EXCLUSIVE);
 
 	LWLockAcquire(lock, LW_EXCLUSIVE);
+	return true;
+}
+
+/*
+ * Separate from pgstat_lock_entry() as most callers will need to lock
+ * exclusively.
+ */
+bool
+pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait)
+{
+	LWLock	   *lock = &entry_ref->shared_stats->lock;
+
+	if (nowait)
+		return LWLockConditionalAcquire(lock, LW_SHARED);
+
+	LWLockAcquire(lock, LW_SHARED);
 	return true;
 }
 
@@ -845,7 +866,7 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, Oid objoid)
 	if (pgStatEntryRefHash)
 	{
 		PgStat_EntryRefHashEntry *lohashent =
-		pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, key);
+			pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, key);
 
 		if (lohashent)
 			pgstat_release_entry_ref(lohashent->key, lohashent->entry_ref,
@@ -976,12 +997,12 @@ pgstat_setup_memcxt(void)
 {
 	if (unlikely(!pgStatSharedRefContext))
 		pgStatSharedRefContext =
-			AllocSetContextCreate(CacheMemoryContext,
+			AllocSetContextCreate(TopMemoryContext,
 								  "PgStat Shared Ref",
 								  ALLOCSET_SMALL_SIZES);
 	if (unlikely(!pgStatEntryRefHashContext))
 		pgStatEntryRefHashContext =
-			AllocSetContextCreate(CacheMemoryContext,
+			AllocSetContextCreate(TopMemoryContext,
 								  "PgStat Shared Ref Hash",
 								  ALLOCSET_SMALL_SIZES);
 }

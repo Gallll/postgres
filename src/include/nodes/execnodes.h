@@ -19,7 +19,7 @@
  * not provided.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/execnodes.h
@@ -34,6 +34,7 @@
 #include "fmgr.h"
 #include "lib/ilist.h"
 #include "lib/pairingheap.h"
+#include "nodes/miscnodes.h"
 #include "nodes/params.h"
 #include "nodes/plannodes.h"
 #include "nodes/tidbitmap.h"
@@ -129,6 +130,12 @@ typedef struct ExprState
 
 	Datum	   *innermost_domainval;
 	bool	   *innermost_domainnull;
+
+	/*
+	 * For expression nodes that support soft errors.  Should be set to NULL
+	 * before calling ExecInitExprRec() if the caller wants errors thrown.
+	 */
+	ErrorSaveContext *escontext;
 } ExprState;
 
 
@@ -161,6 +168,7 @@ typedef struct ExprState
  *		IndexUnchanged		aminsert hint, cached for retail inserts
  *		Concurrent			are we doing a concurrent index build?
  *		BrokenHotChain		did we detect any broken HOT chains?
+ *		Summarizing			is it a summarizing index?
  *		ParallelWorkers		# of workers requested (excludes leader)
  *		Am					Oid of index AM
  *		AmCache				private cache area for index AM
@@ -186,7 +194,6 @@ typedef struct IndexInfo
 	Oid		   *ii_UniqueOps;	/* array with one entry per column */
 	Oid		   *ii_UniqueProcs; /* array with one entry per column */
 	uint16	   *ii_UniqueStrats;	/* array with one entry per column */
-	Datum	   *ii_OpclassOptions;	/* array with one entry per column */
 	bool		ii_Unique;
 	bool		ii_NullsNotDistinct;
 	bool		ii_ReadyForInserts;
@@ -194,6 +201,7 @@ typedef struct IndexInfo
 	bool		ii_IndexUnchanged;
 	bool		ii_Concurrent;
 	bool		ii_BrokenHotChain;
+	bool		ii_Summarizing;
 	int			ii_ParallelWorkers;
 	Oid			ii_Am;
 	void	   *ii_AmCache;
@@ -294,7 +302,7 @@ typedef enum
 {
 	ExprSingleResult,			/* expression does not return a set */
 	ExprMultipleResult,			/* this result is an element of a set */
-	ExprEndResult				/* there are no more elements in the set */
+	ExprEndResult,				/* there are no more elements in the set */
 } ExprDoneCond;
 
 /*
@@ -308,7 +316,7 @@ typedef enum
 	SFRM_ValuePerCall = 0x01,	/* one value returned per call */
 	SFRM_Materialize = 0x02,	/* result set instantiated in Tuplestore */
 	SFRM_Materialize_Random = 0x04, /* Tuplestore needs randomAccess */
-	SFRM_Materialize_Preferred = 0x08	/* caller prefers Tuplestore */
+	SFRM_Materialize_Preferred = 0x08,	/* caller prefers Tuplestore */
 } SetFunctionReturnMode;
 
 /*
@@ -462,6 +470,9 @@ typedef struct ResultRelInfo
 	 */
 	AttrNumber	ri_RowIdAttNo;
 
+	/* For UPDATE, attnums of generated columns to be computed */
+	Bitmapset  *ri_extraUpdatedCols;
+
 	/* Projection to generate new tuple in an INSERT/UPDATE */
 	ProjectionInfo *ri_projectNew;
 	/* Slot to hold that tuple */
@@ -513,11 +524,13 @@ typedef struct ResultRelInfo
 	/* array of constraint-checking expr states */
 	ExprState **ri_ConstraintExprs;
 
-	/* array of stored generated columns expr states */
-	ExprState **ri_GeneratedExprs;
+	/* arrays of stored generated columns expr states, for INSERT and UPDATE */
+	ExprState **ri_GeneratedExprsI;
+	ExprState **ri_GeneratedExprsU;
 
 	/* number of stored generated columns we need to compute */
-	int			ri_NumGeneratedNeeded;
+	int			ri_NumGeneratedNeededI;
+	int			ri_NumGeneratedNeededU;
 
 	/* list of RETURNING expressions */
 	List	   *ri_returningList;
@@ -531,28 +544,14 @@ typedef struct ResultRelInfo
 	/* ON CONFLICT evaluation state */
 	OnConflictSetState *ri_onConflict;
 
-	/* for MERGE, lists of MergeActionState */
-	List	   *ri_matchedMergeAction;
-	List	   *ri_notMatchedMergeAction;
+	/* for MERGE, lists of MergeActionState (one per MergeMatchKind) */
+	List	   *ri_MergeActions[NUM_MERGE_MATCH_KINDS];
+
+	/* for MERGE, expr state for checking the join condition */
+	ExprState  *ri_MergeJoinCondition;
 
 	/* partition check expression state (NULL if not set up yet) */
 	ExprState  *ri_PartitionCheckExpr;
-
-	/*
-	 * Information needed by tuple routing target relations
-	 *
-	 * RootResultRelInfo gives the target relation mentioned in the query, if
-	 * it's a partitioned table. It is not set if the target relation
-	 * mentioned in the query is an inherited table, nor when tuple routing is
-	 * not needed.
-	 *
-	 * RootToPartitionMap and PartitionTupleSlot, initialized by
-	 * ExecInitRoutingInfo, are non-NULL if partition has a different tuple
-	 * format than the root table.
-	 */
-	struct ResultRelInfo *ri_RootResultRelInfo;
-	TupleConversionMap *ri_RootToPartitionMap;
-	TupleTableSlot *ri_PartitionTupleSlot;
 
 	/*
 	 * Map to convert child result relation tuples to the format of the table
@@ -562,6 +561,26 @@ typedef struct ResultRelInfo
 	 */
 	TupleConversionMap *ri_ChildToRootMap;
 	bool		ri_ChildToRootMapValid;
+
+	/*
+	 * As above, but in the other direction.
+	 */
+	TupleConversionMap *ri_RootToChildMap;
+	bool		ri_RootToChildMapValid;
+
+	/*
+	 * Information needed by tuple routing target relations
+	 *
+	 * RootResultRelInfo gives the target relation mentioned in the query, if
+	 * it's a partitioned table. It is not set if the target relation
+	 * mentioned in the query is an inherited table, nor when tuple routing is
+	 * not needed.
+	 *
+	 * PartitionTupleSlot is non-NULL if RootToChild conversion is needed and
+	 * the relation is a partition.
+	 */
+	struct ResultRelInfo *ri_RootResultRelInfo;
+	TupleTableSlot *ri_PartitionTupleSlot;
 
 	/* for use by copyfrom.c when performing multi-inserts */
 	struct CopyMultiInsertBuffer *ri_CopyMultiInsertBuffer;
@@ -610,6 +629,7 @@ typedef struct EState
 								 * pointers, or NULL if not yet opened */
 	struct ExecRowMark **es_rowmarks;	/* Array of per-range-table-entry
 										 * ExecRowMarks, or NULL if none */
+	List	   *es_rteperminfos;	/* List of RTEPermissionInfo */
 	PlannedStmt *es_plannedstmt;	/* link to top of plan tree */
 	const char *es_sourceText;	/* Source text from QueryDesc */
 
@@ -648,7 +668,10 @@ typedef struct EState
 
 	List	   *es_tupleTable;	/* List of TupleTableSlots */
 
-	uint64		es_processed;	/* # of tuples processed */
+	uint64		es_processed;	/* # of tuples processed during one
+								 * ExecutorRun() call. */
+	uint64		es_total_processed; /* total # of tuples aggregated across all
+									 * ExecutorRun() calls. */
 
 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
 	int			es_instrument;	/* OR of InstrumentOption flags */
@@ -692,6 +715,13 @@ typedef struct EState
 	int			es_jit_flags;
 	struct JitContext *es_jit;
 	struct JitInstrumentation *es_jit_worker_instr;
+
+	/*
+	 * Lists of ResultRelInfos for foreign tables on which batch-inserts are
+	 * to be executed and owning ModifyTableStates, stored in the same order.
+	 */
+	List	   *es_insert_pending_result_relations;
+	List	   *es_insert_pending_modifytables;
 } EState;
 
 
@@ -699,8 +729,8 @@ typedef struct EState
  * ExecRowMark -
  *	   runtime representation of FOR [KEY] UPDATE/SHARE clauses
  *
- * When doing UPDATE, DELETE, or SELECT FOR [KEY] UPDATE/SHARE, we will have an
- * ExecRowMark for each non-target relation in the query (except inheritance
+ * When doing UPDATE/DELETE/MERGE/SELECT FOR [KEY] UPDATE/SHARE, we will have
+ * an ExecRowMark for each non-target relation in the query (except inheritance
  * parent RTEs, which can be ignored at runtime).  Virtual relations such as
  * subqueries-in-FROM will have an ExecRowMark with relation == NULL.  See
  * PlanRowMark for details about most of the fields.  In addition to fields
@@ -968,7 +998,7 @@ typedef struct SubPlanState
 typedef enum DomainConstraintType
 {
 	DOM_CONSTRAINT_NOTNULL,
-	DOM_CONSTRAINT_CHECK
+	DOM_CONSTRAINT_CHECK,
 } DomainConstraintType;
 
 typedef struct DomainConstraintState
@@ -979,6 +1009,78 @@ typedef struct DomainConstraintState
 	Expr	   *check_expr;		/* for CHECK, a boolean expression */
 	ExprState  *check_exprstate;	/* check_expr's eval state, or NULL */
 } DomainConstraintState;
+
+/*
+ * State for JsonExpr evaluation, too big to inline.
+ *
+ * This contains the information going into and coming out of the
+ * EEOP_JSONEXPR_PATH eval step.
+ */
+typedef struct JsonExprState
+{
+	/* original expression node */
+	JsonExpr   *jsexpr;
+
+	/* value/isnull for formatted_expr */
+	NullableDatum formatted_expr;
+
+	/* value/isnull for pathspec */
+	NullableDatum pathspec;
+
+	/* JsonPathVariable entries for passing_values */
+	List	   *args;
+
+	/*
+	 * Output variables that drive the EEOP_JUMP_IF_NOT_TRUE steps that are
+	 * added for ON ERROR and ON EMPTY expressions, if any.
+	 *
+	 * Reset for each evaluation of EEOP_JSONEXPR_PATH.
+	 */
+
+	/* Set to true if jsonpath evaluation cause an error.  */
+	NullableDatum error;
+
+	/* Set to true if the jsonpath evaluation returned 0 items. */
+	NullableDatum empty;
+
+	/*
+	 * Addresses of steps that implement the non-ERROR variant of ON EMPTY and
+	 * ON ERROR behaviors, respectively.
+	 */
+	int			jump_empty;
+	int			jump_error;
+
+	/*
+	 * Address of the step to coerce the result value of jsonpath evaluation
+	 * to the RETURNING type using JsonExpr.coercion_expr.  -1 if no coercion
+	 * is necessary or if either JsonExpr.use_io_coercion or
+	 * JsonExpr.use_json_coercion is true.
+	 */
+	int			jump_eval_coercion;
+
+	/*
+	 * Address to jump to when skipping all the steps after performing
+	 * ExecEvalJsonExprPath() so as to return whatever the JsonPath* function
+	 * returned as is, that is, in the cases where there's no error and no
+	 * coercion is necessary.
+	 */
+	int			jump_end;
+
+	/*
+	 * RETURNING type input function invocation info when
+	 * JsonExpr.use_io_coercion is true.
+	 */
+	FunctionCallInfo input_fcinfo;
+
+	/*
+	 * For error-safe evaluation of coercions.  When the ON ERROR behavior is
+	 * not ERROR, a pointer to this is passed to ExecInitExprRec() when
+	 * initializing the coercion expressions or to ExecInitJsonCoercion().
+	 *
+	 * Reset for each evaluation of EEOP_JSONEXPR_PATH.
+	 */
+	ErrorSaveContext escontext;
+} JsonExprState;
 
 
 /* ----------------------------------------------------------------
@@ -1147,15 +1249,16 @@ typedef struct PlanState
  */
 typedef struct EPQState
 {
-	/* Initialized at EvalPlanQualInit() time: */
-
+	/* These are initialized by EvalPlanQualInit() and do not change later: */
 	EState	   *parentestate;	/* main query's EState */
 	int			epqParam;		/* ID of Param to force scan node re-eval */
+	List	   *resultRelations;	/* integer list of RT indexes, or NIL */
 
 	/*
-	 * Tuples to be substituted by scan nodes. They need to set up, before
-	 * calling EvalPlanQual()/EvalPlanQualNext(), into the slot returned by
-	 * EvalPlanQualSlot(scanrelid). The array is indexed by scanrelid - 1.
+	 * relsubs_slot[scanrelid - 1] holds the EPQ test tuple to be returned by
+	 * the scan node for the scanrelid'th RT index, in place of performing an
+	 * actual table scan.  Callers should use EvalPlanQualSlot() to fetch
+	 * these slots.
 	 */
 	List	   *tuple_table;	/* tuple table for relsubs_slot */
 	TupleTableSlot **relsubs_slot;
@@ -1189,10 +1292,20 @@ typedef struct EPQState
 	ExecAuxRowMark **relsubs_rowmark;
 
 	/*
-	 * True if a relation's EPQ tuple has been fetched for relation, indexed
-	 * by scanrelid - 1.
+	 * relsubs_done[scanrelid - 1] is true if there is no EPQ tuple for this
+	 * target relation or it has already been fetched in the current scan of
+	 * this target relation within the current EvalPlanQual test.
 	 */
 	bool	   *relsubs_done;
+
+	/*
+	 * relsubs_blocked[scanrelid - 1] is true if there is no EPQ tuple for
+	 * this target relation during the current EvalPlanQual test.  We keep
+	 * these flags set for all relids listed in resultRelations, but
+	 * transiently clear the one for the relation whose tuple is actually
+	 * passed to EvalPlanQual().
+	 */
+	bool	   *relsubs_blocked;
 
 	PlanState  *recheckplanstate;	/* EPQ specific exec nodes, for ->plan */
 } EPQState;
@@ -1286,6 +1399,16 @@ typedef struct ModifyTableState
 	/* Flags showing which subcommands are present INS/UPD/DEL/DO NOTHING */
 	int			mt_merge_subcommands;
 
+	/* For MERGE, the action currently being executed */
+	MergeActionState *mt_merge_action;
+
+	/*
+	 * For MERGE, if there is a pending NOT MATCHED [BY TARGET] action to be
+	 * performed, this will be the last tuple read from the subplan; otherwise
+	 * it will be NULL --- see the comments in ExecMerge().
+	 */
+	TupleTableSlot *mt_merge_pending_not_matched;
+
 	/* tuple counters for MERGE */
 	double		mt_merge_inserted;
 	double		mt_merge_updated;
@@ -1334,6 +1457,7 @@ struct AppendState
 	ParallelAppendState *as_pstate; /* parallel coordination info */
 	Size		pstate_len;		/* size of parallel coordination info */
 	struct PartitionPruneState *as_prune_state;
+	bool		as_valid_subplans_identified;	/* is as_valid_subplans valid? */
 	Bitmapset  *as_valid_subplans;
 	Bitmapset  *as_valid_asyncplans;	/* valid asynchronous plans indexes */
 	bool		(*choose_next_subplan) (AppendState *);
@@ -1566,6 +1690,8 @@ typedef struct IndexScanState
  *		TableSlot		   slot for holding tuples fetched from the table
  *		VMBuffer		   buffer in use for visibility map testing, if any
  *		PscanLen		   size of parallel index-only scan descriptor
+ *		NameCStringAttNums attnums of name typed columns to pad to NAMEDATALEN
+ *		NameCStringCount   number of elements in the NameCStringAttNums array
  * ----------------
  */
 typedef struct IndexOnlyScanState
@@ -1585,6 +1711,8 @@ typedef struct IndexOnlyScanState
 	TupleTableSlot *ioss_TableSlot;
 	Buffer		ioss_VMBuffer;
 	Size		ioss_PscanLen;
+	AttrNumber *ioss_NameCStringAttNums;
+	int			ioss_NameCStringCount;
 } IndexOnlyScanState;
 
 /* ----------------
@@ -1636,7 +1764,7 @@ typedef enum
 {
 	BM_INITIAL,
 	BM_INPROGRESS,
-	BM_FINISHED
+	BM_FINISHED,
 } SharedBitmapState;
 
 /* ----------------
@@ -1649,7 +1777,6 @@ typedef enum
  *		prefetch_target			current target prefetch distance
  *		state					current state of the TIDBitmap
  *		cv						conditional wait variable
- *		phs_snapshot_data		snapshot data shared to workers
  * ----------------
  */
 typedef struct ParallelBitmapHeapState
@@ -1661,7 +1788,6 @@ typedef struct ParallelBitmapHeapState
 	int			prefetch_target;
 	SharedBitmapState state;
 	ConditionVariable cv;
-	char		phs_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 } ParallelBitmapHeapState;
 
 /* ----------------
@@ -1671,17 +1797,13 @@ typedef struct ParallelBitmapHeapState
  *		tbm				   bitmap obtained from child index scan(s)
  *		tbmiterator		   iterator for scanning current pages
  *		tbmres			   current-page data
- *		can_skip_fetch	   can we potentially skip tuple fetches in this scan?
- *		return_empty_tuples number of empty tuples to return
- *		vmbuffer		   buffer for visibility-map lookups
- *		pvmbuffer		   ditto, for prefetched pages
+ *		pvmbuffer		   buffer for visibility-map lookups of prefetched pages
  *		exact_pages		   total number of exact pages retrieved
  *		lossy_pages		   total number of lossy pages retrieved
  *		prefetch_iterator  iterator for prefetching ahead of current page
  *		prefetch_pages	   # pages prefetch iterator is ahead of current
  *		prefetch_target    current target prefetch distance
  *		prefetch_maximum   maximum value for prefetch_target
- *		pscan_len		   size of the shared memory for parallel bitmap
  *		initialized		   is node is ready to iterate
  *		shared_tbmiterator	   shared iterator
  *		shared_prefetch_iterator shared iterator for prefetching
@@ -1695,9 +1817,6 @@ typedef struct BitmapHeapScanState
 	TIDBitmap  *tbm;
 	TBMIterator *tbmiterator;
 	TBMIterateResult *tbmres;
-	bool		can_skip_fetch;
-	int			return_empty_tuples;
-	Buffer		vmbuffer;
 	Buffer		pvmbuffer;
 	long		exact_pages;
 	long		lossy_pages;
@@ -1705,7 +1824,6 @@ typedef struct BitmapHeapScanState
 	int			prefetch_pages;
 	int			prefetch_target;
 	int			prefetch_maximum;
-	Size		pscan_len;
 	bool		initialized;
 	TBMSharedIterator *shared_tbmiterator;
 	TBMSharedIterator *shared_prefetch_iterator;
@@ -1720,7 +1838,6 @@ typedef struct BitmapHeapScanState
  *		NumTids		   number of tids in this scan
  *		TidPtr		   index of currently fetched tid
  *		TidList		   evaluated item pointers (array of size NumTids)
- *		htup		   currently-fetched tuple, if any
  * ----------------
  */
 typedef struct TidScanState
@@ -1731,7 +1848,6 @@ typedef struct TidScanState
 	int			tss_NumTids;
 	int			tss_TidPtr;
 	ItemPointerData *tss_TidList;
-	HeapTupleData tss_htup;
 } TidScanState;
 
 /* ----------------
@@ -1842,6 +1958,8 @@ typedef struct TableFuncScanState
 	ExprState  *rowexpr;		/* state for row-generating expression */
 	List	   *colexprs;		/* state for column-generating expression */
 	List	   *coldefexprs;	/* state for column default expressions */
+	List	   *colvalexprs;	/* state for column value expressions */
+	List	   *passingvalexprs;	/* state for PASSING argument expressions */
 	List	   *ns_names;		/* same as TableFunc.ns_names */
 	List	   *ns_uris;		/* list of states of namespace URI exprs */
 	Bitmapset  *notnulls;		/* nullability flag for each output column */
@@ -1949,6 +2067,7 @@ typedef struct CustomScanState
 	List	   *custom_ps;		/* list of child PlanState nodes, if any */
 	Size		pscan_len;		/* size of parallel coordination information */
 	const struct CustomExecMethods *methods;
+	const struct TupleTableSlotOps *slotOps;
 } CustomScanState;
 
 /* ----------------------------------------------------------------
@@ -2051,7 +2170,8 @@ typedef struct MergeJoinState
  *								OuterTupleSlot is empty!)
  *		hj_OuterTupleSlot		tuple slot for outer tuples
  *		hj_HashTupleSlot		tuple slot for inner (hashed) tuples
- *		hj_NullOuterTupleSlot	prepared null tuple for right/full outer joins
+ *		hj_NullOuterTupleSlot	prepared null tuple for right/right-anti/full
+ *								outer joins
  *		hj_NullInnerTupleSlot	prepared null tuple for left/full outer joins
  *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan
  *		hj_JoinState			current state of ExecHashJoin state machine
@@ -2411,7 +2531,6 @@ typedef struct AggState
 #define FIELDNO_AGGSTATE_ALL_PERGROUPS 53
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
-	ProjectionInfo *combinedproj;	/* projection machinery */
 	SharedAggInfo *shared_info; /* one entry per worker */
 } AggState;
 
@@ -2431,7 +2550,7 @@ typedef enum WindowAggStatus
 	WINDOWAGG_DONE,				/* No more processing to do */
 	WINDOWAGG_RUN,				/* Normal processing of window funcs */
 	WINDOWAGG_PASSTHROUGH,		/* Don't eval window funcs */
-	WINDOWAGG_PASSTHROUGH_STRICT	/* Pass-through plus don't store new
+	WINDOWAGG_PASSTHROUGH_STRICT,	/* Pass-through plus don't store new
 									 * tuples during spool */
 } WindowAggStatus;
 
@@ -2709,7 +2828,7 @@ typedef enum
 	LIMIT_WINDOWEND_TIES,		/* have returned a tied row */
 	LIMIT_SUBPLANEOF,			/* at EOF of subplan (within window) */
 	LIMIT_WINDOWEND,			/* stepped off end of window */
-	LIMIT_WINDOWSTART			/* stepped off beginning of window */
+	LIMIT_WINDOWSTART,			/* stepped off beginning of window */
 } LimitStateCond;
 
 typedef struct LimitState

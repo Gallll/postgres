@@ -1,7 +1,8 @@
 <!-- doc/src/sgml/sepgsql.sgml -->
 
 <sect1 id="sepgsql" xreflabel="sepgsql">
- <title>sepgsql</title>
+ <title>sepgsql &mdash;
+   SELinux-, label-based mandatory access control (MAC) security module</title>
 
  <indexterm zone="sepgsql">
   <primary>sepgsql</primary>
@@ -86,9 +87,14 @@ Policy from config file:        targeted
   </para>
 
   <para>
-   To build this module, include the option <literal>--with-selinux</literal> in
-   your PostgreSQL <literal>configure</literal> command.  Be sure that the
-   <filename>libselinux-devel</filename> RPM is installed at build time.
+   To build this module specify <xref
+   linkend="configure-option-with-sepgsql"/> (when using <link
+   linkend="install-make">make and autoconf</link> ) or <xref
+   linkend="configure-with-sepgsql-meson"/> (when using <link
+   linkend="install-meson">meson</link>).
+
+   Be sure that the <filename>libselinux-devel</filename> RPM is installed at
+   build time.
   </para>
 
   <para>
@@ -315,7 +321,7 @@ $ sudo semodule -r sepgsql-regtest
 
  <sect2 id="sepgsql-features">
   <title>Features</title>
-  <sect3>
+  <sect3 id="sepgsql-features-controlled-obj-classes">
    <title>Controlled Object Classes</title>
    <para>
     The security model of <productname>SELinux</productname> describes all the access
@@ -348,7 +354,7 @@ $ sudo semodule -r sepgsql-regtest
    </para>
   </sect3>
 
-  <sect3>
+  <sect3 id="sepgsql-features-dml-permissions">
    <title>DML Permissions</title>
 
    <para>
@@ -432,7 +438,7 @@ UPDATE t1 SET x = 2, y = func1(y) WHERE z = 100;
    </para>
   </sect3>
 
-  <sect3>
+  <sect3 id="sepgsql-features-ddl-permissions">
    <title>DDL Permissions</title>
    <para>
     <productname>SELinux</productname> defines several permissions to control common
@@ -523,7 +529,7 @@ UPDATE t1 SET x = 2, y = func1(y) WHERE z = 100;
 
   </sect3>
 
-  <sect3>
+  <sect3 id="sepgsql-features-trusted-procedures">
    <title>Trusted Procedures</title>
    <para>
     Trusted procedures are similar to security definer functions or setuid
@@ -579,7 +585,7 @@ postgres=# SELECT cid, cname, show_credit(cid) FROM customer;
    </para>
   </sect3>
 
-  <sect3>
+  <sect3 id="sepgsql-features-dynamic-domain-transitions">
    <title>Dynamic Domain Transitions</title>
    <para>
     It is possible to use SELinux's dynamic domain transition feature
@@ -641,7 +647,7 @@ ERROR:  SELinux: security policy violation
    </para>
   </sect3>
 
-  <sect3>
+  <sect3 id="sepgsql-features-misc">
    <title>Miscellaneous</title>
    <para>
     We reject the <link linkend="sql-load"><command>LOAD</command></link> command across the board, because

@@ -23,7 +23,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,9 +37,9 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "mb/pg_wchar.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
+#include "varatt.h"
 
 /*
  * We maintain a simple linked list caching the fmgr lookup info for the
@@ -409,8 +409,8 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 	(void) OidFunctionCall6(proc,
 							Int32GetDatum(src_encoding),
 							Int32GetDatum(dest_encoding),
-							CStringGetDatum(src),
-							CStringGetDatum(result),
+							CStringGetDatum((char *) src),
+							CStringGetDatum((char *) result),
 							Int32GetDatum(len),
 							BoolGetDatum(false));
 
@@ -452,7 +452,7 @@ pg_do_encoding_conversion(unsigned char *src, int len,
  *
  * The output is null-terminated.
  *
- * If destlen < srclen * MAX_CONVERSION_LENGTH + 1, the converted output
+ * If destlen < srclen * MAX_CONVERSION_INPUT_LENGTH + 1, the converted output
  * wouldn't necessarily fit in the output buffer, and the function will not
  * convert the whole input.
  *
@@ -485,8 +485,8 @@ pg_do_encoding_conversion_buf(Oid proc,
 	result = OidFunctionCall6(proc,
 							  Int32GetDatum(src_encoding),
 							  Int32GetDatum(dest_encoding),
-							  CStringGetDatum(src),
-							  CStringGetDatum(dest),
+							  CStringGetDatum((char *) src),
+							  CStringGetDatum((char *) dest),
 							  Int32GetDatum(srclen),
 							  BoolGetDatum(noError));
 	return DatumGetInt32(result);
@@ -584,19 +584,19 @@ pg_convert(PG_FUNCTION_ARGS)
 												  src_encoding,
 												  dest_encoding);
 
-	/* update len if conversion actually happened */
-	if (dest_str != src_str)
-		len = strlen(dest_str);
+
+	/* return source string if no conversion happened */
+	if (dest_str == src_str)
+		PG_RETURN_BYTEA_P(string);
 
 	/*
 	 * build bytea data type structure.
 	 */
+	len = strlen(dest_str);
 	retval = (bytea *) palloc(len + VARHDRSZ);
 	SET_VARSIZE(retval, len + VARHDRSZ);
 	memcpy(VARDATA(retval), dest_str, len);
-
-	if (dest_str != src_str)
-		pfree(dest_str);
+	pfree(dest_str);
 
 	/* free memory if allocated by the toaster */
 	PG_FREE_IF_COPY(string, 0);
@@ -910,10 +910,67 @@ pg_unicode_to_server(pg_wchar c, unsigned char *s)
 	FunctionCall6(Utf8ToServerConvProc,
 				  Int32GetDatum(PG_UTF8),
 				  Int32GetDatum(server_encoding),
-				  CStringGetDatum(c_as_utf8),
-				  CStringGetDatum(s),
+				  CStringGetDatum((char *) c_as_utf8),
+				  CStringGetDatum((char *) s),
 				  Int32GetDatum(c_as_utf8_len),
 				  BoolGetDatum(false));
+}
+
+/*
+ * Convert a single Unicode code point into a string in the server encoding.
+ *
+ * Same as pg_unicode_to_server(), except that we don't throw errors,
+ * but simply return false on conversion failure.
+ */
+bool
+pg_unicode_to_server_noerror(pg_wchar c, unsigned char *s)
+{
+	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
+	int			c_as_utf8_len;
+	int			converted_len;
+	int			server_encoding;
+
+	/* Fail if invalid Unicode code point */
+	if (!is_valid_unicode_codepoint(c))
+		return false;
+
+	/* Otherwise, if it's in ASCII range, conversion is trivial */
+	if (c <= 0x7F)
+	{
+		s[0] = (unsigned char) c;
+		s[1] = '\0';
+		return true;
+	}
+
+	/* If the server encoding is UTF-8, we just need to reformat the code */
+	server_encoding = GetDatabaseEncoding();
+	if (server_encoding == PG_UTF8)
+	{
+		unicode_to_utf8(c, s);
+		s[pg_utf_mblen(s)] = '\0';
+		return true;
+	}
+
+	/* For all other cases, we must have a conversion function available */
+	if (Utf8ToServerConvProc == NULL)
+		return false;
+
+	/* Construct UTF-8 source string */
+	unicode_to_utf8(c, c_as_utf8);
+	c_as_utf8_len = pg_utf_mblen(c_as_utf8);
+	c_as_utf8[c_as_utf8_len] = '\0';
+
+	/* Convert, but without throwing error if we can't */
+	converted_len = DatumGetInt32(FunctionCall6(Utf8ToServerConvProc,
+												Int32GetDatum(PG_UTF8),
+												Int32GetDatum(server_encoding),
+												CStringGetDatum((char *) c_as_utf8),
+												CStringGetDatum((char *) s),
+												Int32GetDatum(c_as_utf8_len),
+												BoolGetDatum(true)));
+
+	/* Conversion was successful iff it consumed the whole input */
+	return (converted_len == c_as_utf8_len);
 }
 
 
@@ -1130,24 +1187,18 @@ static bool
 raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
 {
 	bool		elog_ok = (CurrentMemoryContext != NULL);
-	int			i;
 
-	for (i = 0; pg_enc2gettext_tbl[i].name != NULL; i++)
-	{
-		if (pg_enc2gettext_tbl[i].encoding == encoding)
-		{
-			if (bind_textdomain_codeset(domainname,
-										pg_enc2gettext_tbl[i].name) != NULL)
-				return true;
+	if (!PG_VALID_ENCODING(encoding) || pg_enc2gettext_tbl[encoding] == NULL)
+		return false;
 
-			if (elog_ok)
-				elog(LOG, "bind_textdomain_codeset failed");
-			else
-				write_stderr("bind_textdomain_codeset failed");
+	if (bind_textdomain_codeset(domainname,
+								pg_enc2gettext_tbl[encoding]) != NULL)
+		return true;
 
-			break;
-		}
-	}
+	if (elog_ok)
+		elog(LOG, "bind_textdomain_codeset failed");
+	else
+		write_stderr("bind_textdomain_codeset failed");
 
 	return false;
 }

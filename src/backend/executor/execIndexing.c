@@ -95,7 +95,7 @@
  * with the higher XID backs out.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -121,21 +121,21 @@ typedef enum
 {
 	CEOUC_WAIT,
 	CEOUC_NOWAIT,
-	CEOUC_LIVELOCK_PREVENTING_WAIT
+	CEOUC_LIVELOCK_PREVENTING_WAIT,
 } CEOUC_WAIT_MODE;
 
 static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 IndexInfo *indexInfo,
 												 ItemPointer tupleid,
-												 Datum *values, bool *isnull,
+												 const Datum *values, const bool *isnull,
 												 EState *estate, bool newIndex,
 												 CEOUC_WAIT_MODE waitMode,
-												 bool errorOK,
+												 bool violationOK,
 												 ItemPointer conflictTid);
 
-static bool index_recheck_constraint(Relation index, Oid *constr_procs,
-									 Datum *existing_values, bool *existing_isnull,
-									 Datum *new_values);
+static bool index_recheck_constraint(Relation index, const Oid *constr_procs,
+									 const Datum *existing_values, const bool *existing_isnull,
+									 const Datum *new_values);
 static bool index_unchanged_by_update(ResultRelInfo *resultRelInfo,
 									  EState *estate, IndexInfo *indexInfo,
 									  Relation indexRelation);
@@ -233,14 +233,19 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 	int			i;
 	int			numIndices;
 	RelationPtr indexDescs;
+	IndexInfo **indexInfos;
 
 	numIndices = resultRelInfo->ri_NumIndices;
 	indexDescs = resultRelInfo->ri_IndexRelationDescs;
+	indexInfos = resultRelInfo->ri_IndexRelationInfo;
 
 	for (i = 0; i < numIndices; i++)
 	{
 		if (indexDescs[i] == NULL)
 			continue;			/* shouldn't happen? */
+
+		/* Give the index a chance to do some post-insert cleanup */
+		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
 		index_close(indexDescs[i], RowExclusiveLock);
@@ -259,15 +264,24 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		into all the relations indexing the result relation
  *		when a heap tuple is inserted into the result relation.
  *
- *		When 'update' is true, executor is performing an UPDATE
- *		that could not use an optimization like heapam's HOT (in
- *		more general terms a call to table_tuple_update() took
- *		place and set 'update_indexes' to true).  Receiving this
- *		hint makes us consider if we should pass down the
- *		'indexUnchanged' hint in turn.  That's something that we
- *		figure out for each index_insert() call iff 'update' is
- *		true.  (When 'update' is false we already know not to pass
- *		the hint to any index.)
+ *		When 'update' is true and 'onlySummarizing' is false,
+ *		executor is performing an UPDATE that could not use an
+ *		optimization like heapam's HOT (in more general terms a
+ *		call to table_tuple_update() took place and set
+ *		'update_indexes' to TUUI_All).  Receiving this hint makes
+ *		us consider if we should pass down the 'indexUnchanged'
+ *		hint in turn.  That's something that we figure out for
+ *		each index_insert() call iff 'update' is true.
+ *		(When 'update' is false we already know not to pass the
+ *		hint to any index.)
+ *
+ *		If onlySummarizing is set, an equivalent optimization to
+ *		HOT has been applied and any updated columns are indexed
+ *		only by summarizing indexes (or in more general terms a
+ *		call to table_tuple_update() took place and set
+ *		'update_indexes' to TUUI_Summarizing). We can (and must)
+ *		therefore only update the indexes that have
+ *		'amsummarizing' = true.
  *
  *		Unique and exclusion constraints are enforced at the same
  *		time.  This returns a list of index OIDs for any unique or
@@ -287,7 +301,8 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 					  bool update,
 					  bool noDupErr,
 					  bool *specConflict,
-					  List *arbiterIndexes)
+					  List *arbiterIndexes,
+					  bool onlySummarizing)
 {
 	ItemPointer tupleid = &slot->tts_tid;
 	List	   *result = NIL;
@@ -341,6 +356,13 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 
 		/* If the index is marked as read-only, ignore it */
 		if (!indexInfo->ii_ReadyForInserts)
+			continue;
+
+		/*
+		 * Skip processing of non-summarizing indexes if we only update
+		 * summarizing indexes
+		 */
+		if (onlySummarizing && !indexInfo->ii_Summarizing)
 			continue;
 
 		/* Check for partial index */
@@ -667,7 +689,7 @@ static bool
 check_exclusion_or_unique_constraint(Relation heap, Relation index,
 									 IndexInfo *indexInfo,
 									 ItemPointer tupleid,
-									 Datum *values, bool *isnull,
+									 const Datum *values, const bool *isnull,
 									 EState *estate, bool newIndex,
 									 CEOUC_WAIT_MODE waitMode,
 									 bool violationOK,
@@ -699,13 +721,19 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	}
 
 	/*
-	 * If any of the input values are NULL, the constraint check is assumed to
-	 * pass (i.e., we assume the operators are strict).
+	 * If any of the input values are NULL, and the index uses the default
+	 * nulls-are-distinct mode, the constraint check is assumed to pass (i.e.,
+	 * we assume the operators are strict).  Otherwise, we interpret the
+	 * constraint as specifying IS NULL for each column whose input value is
+	 * NULL.
 	 */
-	for (i = 0; i < indnkeyatts; i++)
+	if (!indexInfo->ii_NullsNotDistinct)
 	{
-		if (isnull[i])
-			return true;
+		for (i = 0; i < indnkeyatts; i++)
+		{
+			if (isnull[i])
+				return true;
+		}
 	}
 
 	/*
@@ -717,7 +745,7 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	for (i = 0; i < indnkeyatts; i++)
 	{
 		ScanKeyEntryInitialize(&scankeys[i],
-							   0,
+							   isnull[i] ? SK_ISNULL | SK_SEARCHNULL : 0,
 							   i + 1,
 							   constr_strats[i],
 							   InvalidOid,
@@ -887,7 +915,7 @@ void
 check_exclusion_constraint(Relation heap, Relation index,
 						   IndexInfo *indexInfo,
 						   ItemPointer tupleid,
-						   Datum *values, bool *isnull,
+						   const Datum *values, const bool *isnull,
 						   EState *estate, bool newIndex)
 {
 	(void) check_exclusion_or_unique_constraint(heap, index, indexInfo, tupleid,
@@ -901,9 +929,9 @@ check_exclusion_constraint(Relation heap, Relation index,
  * exclusion condition against the new_values.  Returns true if conflict.
  */
 static bool
-index_recheck_constraint(Relation index, Oid *constr_procs,
-						 Datum *existing_values, bool *existing_isnull,
-						 Datum *new_values)
+index_recheck_constraint(Relation index, const Oid *constr_procs,
+						 const Datum *existing_values, const bool *existing_isnull,
+						 const Datum *new_values)
 {
 	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
 	int			i;

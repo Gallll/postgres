@@ -1,11 +1,12 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Verify that various forms of corruption are detected by pg_verifybackup.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use File::Path qw(rmtree);
+use File::Copy;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -16,7 +17,7 @@ $primary->start;
 
 # Include a user-defined tablespace in the hopes of detecting problems in that
 # area.
-my $source_ts_path   = PostgreSQL::Test::Utils::tempdir_short();
+my $source_ts_path = PostgreSQL::Test::Utils::tempdir_short();
 my $source_ts_prefix = $source_ts_path;
 $source_ts_prefix =~ s!(^[A-Z]:/[^/]*)/.*!$1!;
 
@@ -30,67 +31,73 @@ EOM
 
 my @scenario = (
 	{
-		'name'     => 'extra_file',
+		'name' => 'extra_file',
 		'mutilate' => \&mutilate_extra_file,
 		'fails_like' =>
 		  qr/extra_file.*present on disk but not in the manifest/
 	},
 	{
-		'name'     => 'extra_tablespace_file',
+		'name' => 'extra_tablespace_file',
 		'mutilate' => \&mutilate_extra_tablespace_file,
 		'fails_like' =>
 		  qr/extra_ts_file.*present on disk but not in the manifest/
 	},
 	{
-		'name'     => 'missing_file',
+		'name' => 'missing_file',
 		'mutilate' => \&mutilate_missing_file,
 		'fails_like' =>
 		  qr/pg_xact\/0000.*present in the manifest but not on disk/
 	},
 	{
-		'name'     => 'missing_tablespace',
+		'name' => 'missing_tablespace',
 		'mutilate' => \&mutilate_missing_tablespace,
 		'fails_like' =>
 		  qr/pg_tblspc.*present in the manifest but not on disk/
 	},
 	{
-		'name'       => 'append_to_file',
-		'mutilate'   => \&mutilate_append_to_file,
+		'name' => 'append_to_file',
+		'mutilate' => \&mutilate_append_to_file,
 		'fails_like' => qr/has size \d+ on disk but size \d+ in the manifest/
 	},
 	{
-		'name'       => 'truncate_file',
-		'mutilate'   => \&mutilate_truncate_file,
+		'name' => 'truncate_file',
+		'mutilate' => \&mutilate_truncate_file,
 		'fails_like' => qr/has size 0 on disk but size \d+ in the manifest/
 	},
 	{
-		'name'       => 'replace_file',
-		'mutilate'   => \&mutilate_replace_file,
+		'name' => 'replace_file',
+		'mutilate' => \&mutilate_replace_file,
 		'fails_like' => qr/checksum mismatch for file/
 	},
 	{
-		'name'       => 'bad_manifest',
-		'mutilate'   => \&mutilate_bad_manifest,
+		'name' => 'system_identifier',
+		'mutilate' => \&mutilate_system_identifier,
+		'fails_like' =>
+		  qr/manifest system identifier is .*, but control file has/
+	},
+	{
+		'name' => 'bad_manifest',
+		'mutilate' => \&mutilate_bad_manifest,
 		'fails_like' => qr/manifest checksum mismatch/
 	},
 	{
-		'name'            => 'open_file_fails',
-		'mutilate'        => \&mutilate_open_file_fails,
-		'fails_like'      => qr/could not open file/,
+		'name' => 'open_file_fails',
+		'mutilate' => \&mutilate_open_file_fails,
+		'fails_like' => qr/could not open file/,
 		'skip_on_windows' => 1
 	},
 	{
-		'name'            => 'open_directory_fails',
-		'mutilate'        => \&mutilate_open_directory_fails,
-		'cleanup'         => \&cleanup_open_directory_fails,
-		'fails_like'      => qr/could not open directory/,
+		'name' => 'open_directory_fails',
+		'mutilate' => \&mutilate_open_directory_fails,
+		'cleanup' => \&cleanup_open_directory_fails,
+		'fails_like' => qr/could not open directory/,
 		'skip_on_windows' => 1
 	},
 	{
-		'name'            => 'search_directory_fails',
-		'mutilate'        => \&mutilate_search_directory_fails,
-		'cleanup'         => \&cleanup_search_directory_fails,
-		'fails_like'      => qr/could not stat file or directory/,
+		'name' => 'search_directory_fails',
+		'mutilate' => \&mutilate_search_directory_fails,
+		'cleanup' => \&cleanup_search_directory_fails,
+		'fails_like' => qr/could not stat file or directory/,
 		'skip_on_windows' => 1
 	});
 
@@ -104,7 +111,7 @@ for my $scenario (@scenario)
 		  if $scenario->{'skip_on_windows'} && $windows_os;
 
 		# Take a backup and check that it verifies OK.
-		my $backup_path    = $primary->backup_dir . '/' . $name;
+		my $backup_path = $primary->backup_dir . '/' . $name;
 		my $backup_ts_path = PostgreSQL::Test::Utils::tempdir_short();
 		# The tablespace map parameter confuses Msys2, which tries to mangle
 		# it. Tell it not to.
@@ -216,7 +223,7 @@ sub mutilate_append_to_file
 sub mutilate_truncate_file
 {
 	my ($backup_path) = @_;
-	my $pathname = "$backup_path/global/pg_control";
+	my $pathname = "$backup_path/pg_hba.conf";
 	open(my $fh, '>', $pathname) || die "open $pathname: $!";
 	close($fh);
 	return;
@@ -228,11 +235,30 @@ sub mutilate_truncate_file
 sub mutilate_replace_file
 {
 	my ($backup_path) = @_;
-	my $pathname      = "$backup_path/PG_VERSION";
-	my $contents      = slurp_file($pathname);
+	my $pathname = "$backup_path/PG_VERSION";
+	my $contents = slurp_file($pathname);
 	open(my $fh, '>', $pathname) || die "open $pathname: $!";
 	print $fh 'q' x length($contents);
 	close($fh);
+	return;
+}
+
+# Copy manifest of other backups to demonstrate the case where the wrong
+# manifest is referred
+sub mutilate_system_identifier
+{
+	my ($backup_path) = @_;
+
+	# Set up another new database instance with different system identifier and
+	# make backup
+	my $node = PostgreSQL::Test::Cluster->new('node');
+	$node->init(force_initdb => 1, allows_streaming => 1);
+	$node->start;
+	$node->backup('backup2');
+	move($node->backup_dir . '/backup2/backup_manifest',
+		$backup_path . '/backup_manifest')
+	  or BAIL_OUT "could not copy manifest to $backup_path";
+	$node->teardown_node(fail_ok => 1);
 	return;
 }
 

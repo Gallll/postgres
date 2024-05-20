@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # src/pl/plperl/text2macro.pl
 
@@ -27,14 +27,14 @@ file as capitalized and used as the name of the macro, along with an optional pr
 =cut
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use Getopt::Long;
 
 GetOptions(
-	'prefix=s'  => \my $opt_prefix,
-	'name=s'    => \my $opt_name,
-	'strip=s'   => \my $opt_strip,
+	'prefix=s' => \my $opt_prefix,
+	'name=s' => \my $opt_name,
+	'strip=s' => \my $opt_strip,
 	'selftest!' => sub { exit selftest() },) or exit 1;
 
 die "No text files specified"
@@ -80,7 +80,7 @@ exit 0;
 
 sub selftest
 {
-	my $tmp    = "text2macro_tmp";
+	my $tmp = "text2macro_tmp";
 	my $string = q{a '' '\\'' "" "\\"" "\\\\" "\\\\n" b};
 
 	open my $fh, '>', "$tmp.pl" or die;
@@ -88,11 +88,11 @@ sub selftest
 	close $fh;
 
 	system("perl $0 --name=X $tmp.pl > $tmp.c") == 0 or die;
-	open $fh, '>>', "$tmp.c";
+	open $fh, '>>', "$tmp.c" or die;
 	print $fh "#include <stdio.h>\n";
 	print $fh "int main() { puts(X); return 0; }\n";
 	close $fh;
-	system("cat -n $tmp.c");
+	system("cat -n $tmp.c") == 0 or die;
 
 	system("make $tmp") == 0 or die;
 	open $fh, '<', "./$tmp |" or die;

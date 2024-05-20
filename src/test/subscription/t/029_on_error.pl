@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Tests for disable_on_error and SKIP transaction features.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -13,7 +13,7 @@ my $offset = 0;
 # Test skipping the transaction. This function must be called after the caller
 # has inserted data that conflicts with the subscriber.  The finish LSN of the
 # error transaction that is used to specify to ALTER SUBSCRIPTION ... SKIP is
-# fetched from the server logs. After executing ALTER SUBSCRITPION ... SKIP, we
+# fetched from the server logs. After executing ALTER SUBSCRIPTION ... SKIP, we
 # check if logical replication can continue working by inserting $nonconflict_data
 # on the publisher.
 sub test_skip_lsn
@@ -29,7 +29,7 @@ sub test_skip_lsn
 	# Get the finish LSN of the error transaction.
 	my $contents = slurp_file($node_subscriber->logfile, $offset);
 	$contents =~
-	  qr/processing remote data for replication origin \"pg_\d+\" during "INSERT" for replication target relation "public.tbl" in transaction \d+ finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/
+	  qr/processing remote data for replication origin \"pg_\d+\" during message type "INSERT" for replication target relation "public.tbl" in transaction \d+, finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/
 	  or die "could not get error-LSN";
 	my $lsn = $1;
 
@@ -48,7 +48,7 @@ sub test_skip_lsn
 	# Check the log to ensure that the transaction is skipped, and advance the
 	# offset of the log file for the next test.
 	$offset = $node_subscriber->wait_for_log(
-		qr/LOG: ( [A-Z0-9]+:)? done skipping logical replication transaction finished at $lsn/,
+		qr/LOG: ( [A-Z0-9]+:)? logical replication completed skipping transaction at LSN $lsn/,
 		$offset);
 
 	# Insert non-conflict data
@@ -91,13 +91,13 @@ $node_subscriber->start;
 $node_publisher->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT, t TEXT);
+CREATE TABLE tbl (i INT, t BYTEA);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 $node_subscriber->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT PRIMARY KEY, t TEXT);
+CREATE TABLE tbl (i INT PRIMARY KEY, t BYTEA);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 
@@ -124,10 +124,7 @@ $node_subscriber->safe_psql('postgres', "TRUNCATE tbl");
 $node_subscriber->safe_psql('postgres', "ALTER SUBSCRIPTION sub ENABLE");
 
 # Wait for the data to replicate.
-$node_publisher->wait_for_catchup('sub');
-$node_subscriber->poll_query_until('postgres',
-	"SELECT COUNT(1) = 0 FROM pg_subscription_rel sr WHERE sr.srsubstate NOT IN ('s', 'r') AND sr.srrelid = 'tbl'::regclass"
-);
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'sub');
 
 # Confirm that we have finished the table sync.
 my $result =
@@ -166,10 +163,11 @@ $node_publisher->safe_psql(
 	'postgres',
 	qq[
 BEGIN;
-INSERT INTO tbl SELECT i, md5(i::text) FROM generate_series(1, 10000) s(i);
+INSERT INTO tbl SELECT i, sha256(i::text::bytea) FROM generate_series(1, 10000) s(i);
 COMMIT;
 ]);
-test_skip_lsn($node_publisher, $node_subscriber, "(4, md5(4::text))",
+test_skip_lsn($node_publisher, $node_subscriber,
+	"(4, sha256(4::text::bytea))",
 	"4", "test skipping stream-commit");
 
 $result = $node_subscriber->safe_psql('postgres',

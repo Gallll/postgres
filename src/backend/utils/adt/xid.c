@@ -3,7 +3,7 @@
  * xid.c
  *	  POSTGRES transaction identifier and command identifier datatypes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 #include "access/multixact.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "common/int.h"
 #include "libpq/pqformat.h"
 #include "utils/builtins.h"
 #include "utils/xid8.h"
@@ -31,8 +32,10 @@ Datum
 xidin(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	TransactionId result;
 
-	PG_RETURN_TRANSACTIONID((TransactionId) strtoul(str, NULL, 0));
+	result = uint32in_subr(str, NULL, "xid", fcinfo->context);
+	PG_RETURN_TRANSACTIONID(result);
 }
 
 Datum
@@ -138,11 +141,7 @@ xidComparator(const void *arg1, const void *arg2)
 	TransactionId xid1 = *(const TransactionId *) arg1;
 	TransactionId xid2 = *(const TransactionId *) arg2;
 
-	if (xid1 > xid2)
-		return 1;
-	if (xid1 < xid2)
-		return -1;
-	return 0;
+	return pg_cmp_u32(xid1, xid2);
 }
 
 /*
@@ -183,8 +182,10 @@ Datum
 xid8in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	uint64		result;
 
-	PG_RETURN_FULLTRANSACTIONID(FullTransactionIdFromU64(strtou64(str, NULL, 0)));
+	result = uint64in_subr(str, NULL, "xid8", fcinfo->context);
+	PG_RETURN_FULLTRANSACTIONID(FullTransactionIdFromU64(result));
 }
 
 Datum
@@ -321,8 +322,10 @@ Datum
 cidin(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	CommandId	result;
 
-	PG_RETURN_COMMANDID((CommandId) strtoul(str, NULL, 0));
+	result = uint32in_subr(str, NULL, "cid", fcinfo->context);
+	PG_RETURN_COMMANDID(result);
 }
 
 /*

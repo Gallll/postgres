@@ -3,7 +3,7 @@
  * tsquery_op.c
  *	  Various operations with tsquery
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -16,7 +16,8 @@
 
 #include "lib/qunique.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "varatt.h"
 
 Datum
 tsquery_numnode(PG_FUNCTION_ARGS)
@@ -148,10 +149,10 @@ tsquery_phrase_distance(PG_FUNCTION_ARGS)
 Datum
 tsquery_phrase(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_POINTER(DirectFunctionCall3(tsquery_phrase_distance,
-										  PG_GETARG_DATUM(0),
-										  PG_GETARG_DATUM(1),
-										  Int32GetDatum(1)));
+	PG_RETURN_DATUM(DirectFunctionCall3(tsquery_phrase_distance,
+										PG_GETARG_DATUM(0),
+										PG_GETARG_DATUM(1),
+										Int32GetDatum(1)));
 }
 
 Datum

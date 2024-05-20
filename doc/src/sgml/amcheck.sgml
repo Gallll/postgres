@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/amcheck.sgml -->
 
 <sect1 id="amcheck" xreflabel="amcheck">
- <title>amcheck</title>
+ <title>amcheck &mdash; tools to verify table and index consistency</title>
 
  <indexterm zone="amcheck">
   <primary>amcheck</primary>
@@ -24,6 +24,9 @@
   to hold, we can expect binary searches on the affected page to
   incorrectly guide index scans, resulting in wrong answers to SQL
   queries.  If the structure appears to be valid, no error is raised.
+  While these checking functions are run, the <xref
+  linkend="guc-search-path"/> is temporarily changed to <literal>pg_catalog,
+  pg_temp</literal>.
  </para>
  <para>
   Verification is performed using the same procedures as those used by
@@ -52,13 +55,13 @@
   able to infer something of the data itself from such messages.
  </para>
 
- <sect2>
+ <sect2 id="amcheck-functions">
   <title>Functions</title>
 
   <variablelist>
    <varlistentry>
     <term>
-     <function>bt_index_check(index regclass, heapallindexed boolean) returns void</function>
+     <function>bt_index_check(index regclass, heapallindexed boolean, checkunique boolean) returns void</function>
      <indexterm>
       <primary>bt_index_check</primary>
      </indexterm>
@@ -115,7 +118,10 @@ ORDER BY c.relpages DESC LIMIT 10;
       that span child/parent relationships, but will verify the
       presence of all heap tuples as index tuples within the index
       when <parameter>heapallindexed</parameter> is
-      <literal>true</literal>.  When a routine, lightweight test for
+      <literal>true</literal>.  When <parameter>checkunique</parameter>
+      is <literal>true</literal> <function>bt_index_check</function> will
+      check that no more than one among duplicate entries in unique
+      index is visible.  When a routine, lightweight test for
       corruption is required in a live production environment, using
       <function>bt_index_check</function> often provides the best
       trade-off between thoroughness of verification and limiting the
@@ -126,7 +132,7 @@ ORDER BY c.relpages DESC LIMIT 10;
 
    <varlistentry>
     <term>
-     <function>bt_index_parent_check(index regclass, heapallindexed boolean, rootdescend boolean) returns void</function>
+     <function>bt_index_parent_check(index regclass, heapallindexed boolean, rootdescend boolean, checkunique boolean) returns void</function>
      <indexterm>
       <primary>bt_index_parent_check</primary>
      </indexterm>
@@ -139,7 +145,10 @@ ORDER BY c.relpages DESC LIMIT 10;
       Optionally, when the <parameter>heapallindexed</parameter>
       argument is <literal>true</literal>, the function verifies the
       presence of all heap tuples that should be found within the
-      index.  When the optional <parameter>rootdescend</parameter>
+      index.  When <parameter>checkunique</parameter>
+      is <literal>true</literal> <function>bt_index_parent_check</function> will
+      check that no more than one among duplicate entries in unique
+      index is visible.  When the optional <parameter>rootdescend</parameter>
       argument is <literal>true</literal>, verification re-finds
       tuples on the leaf level by performing a new search from the
       root page for each tuple.  The checks that can be performed by
@@ -346,7 +355,7 @@ SET client_min_messages = DEBUG1;
   </variablelist>
  </sect2>
 
- <sect2>
+ <sect2 id="amcheck-optional-heapallindexed-verification">
   <title>Optional <parameter>heapallindexed</parameter> Verification</title>
  <para>
   When the <parameter>heapallindexed</parameter> argument to B-Tree
@@ -387,7 +396,7 @@ SET client_min_messages = DEBUG1;
 
  </sect2>
 
- <sect2>
+ <sect2 id="amcheck-using-amcheck-effectively">
   <title>Using <filename>amcheck</filename> Effectively</title>
 
  <para>
@@ -535,7 +544,7 @@ SET client_min_messages = DEBUG1;
  </para>
 
  </sect2>
- <sect2>
+ <sect2 id="amcheck-repairing-corruption">
   <title>Repairing Corruption</title>
  <para>
   No error concerning corruption raised by <filename>amcheck</filename> should

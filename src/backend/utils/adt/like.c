@@ -7,7 +7,7 @@
  *		A big hack of the regexp.c code!! Contributed by
  *		Keith Parks <emkxp01@mtcc.demon.co.uk> (7/95).
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,8 +22,9 @@
 #include "catalog/pg_collation.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/pg_locale.h"
+#include "varatt.h"
 
 
 #define LIKE_TRUE						1
@@ -33,11 +34,11 @@
 
 static int	SB_MatchText(const char *t, int tlen, const char *p, int plen,
 						 pg_locale_t locale, bool locale_is_c);
-static text *SB_do_like_escape(text *, text *);
+static text *SB_do_like_escape(text *pat, text *esc);
 
 static int	MB_MatchText(const char *t, int tlen, const char *p, int plen,
 						 pg_locale_t locale, bool locale_is_c);
-static text *MB_do_like_escape(text *, text *);
+static text *MB_do_like_escape(text *pat, text *esc);
 
 static int	UTF8_MatchText(const char *t, int tlen, const char *p, int plen,
 						   pg_locale_t locale, bool locale_is_c);
@@ -94,10 +95,8 @@ SB_lower_char(unsigned char c, pg_locale_t locale, bool locale_is_c)
 {
 	if (locale_is_c)
 		return pg_ascii_tolower(c);
-#ifdef HAVE_LOCALE_T
 	else if (locale)
 		return tolower_l(c, locale->info.lt);
-#endif
 	else
 		return pg_tolower(c);
 }
@@ -154,7 +153,7 @@ GenericMatchText(const char *s, int slen, const char *p, int plen, Oid collation
 	{
 		pg_locale_t locale = pg_newlocale_from_collation(collation);
 
-		if (locale && !locale->deterministic)
+		if (!pg_locale_deterministic(locale))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("nondeterministic collations are not supported for LIKE")));
@@ -195,7 +194,7 @@ Generic_Text_IC_like(text *str, text *pat, Oid collation)
 	else
 		locale = pg_newlocale_from_collation(collation);
 
-	if (locale && !locale->deterministic)
+	if (!pg_locale_deterministic(locale))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("nondeterministic collations are not supported for ILIKE")));

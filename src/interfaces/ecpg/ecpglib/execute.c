@@ -367,10 +367,10 @@ ecpg_store_result(const PGresult *results, int act_field,
 						/* check strlen for each tuple */
 						for (act_tuple = 0; act_tuple < ntuples; act_tuple++)
 						{
-							int			len = strlen(PQgetvalue(results, act_tuple, act_field)) + 1;
+							int			slen = strlen(PQgetvalue(results, act_tuple, act_field)) + 1;
 
-							if (len > var->varcharsize)
-								var->varcharsize = len;
+							if (slen > var->varcharsize)
+								var->varcharsize = slen;
 						}
 						var->offset *= var->varcharsize;
 						len = var->offset * ntuples;
@@ -820,7 +820,7 @@ ecpg_store_input(const int lineno, const bool force_indicator, const struct vari
 			case ECPGt_bytea:
 				{
 					struct ECPGgeneric_bytea *variable =
-					(struct ECPGgeneric_bytea *) (var->value);
+						(struct ECPGgeneric_bytea *) (var->value);
 
 					if (!(mallocedval = (char *) ecpg_alloc(variable->len, lineno)))
 						return false;
@@ -833,7 +833,7 @@ ecpg_store_input(const int lineno, const bool force_indicator, const struct vari
 			case ECPGt_varchar:
 				{
 					struct ECPGgeneric_varchar *variable =
-					(struct ECPGgeneric_varchar *) (var->value);
+						(struct ECPGgeneric_varchar *) (var->value);
 
 					if (!(newcopy = (char *) ecpg_alloc(variable->len + 1, lineno)))
 						return false;
@@ -1961,9 +1961,7 @@ ecpg_do_prologue(int lineno, const int compat, const int force_indicator,
 		return false;
 	}
 
-#ifdef ENABLE_THREAD_SAFETY
 	ecpg_pthreads_init();
-#endif
 
 	con = ecpg_get_connection(connection_name);
 

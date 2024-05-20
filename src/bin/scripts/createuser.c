@@ -2,7 +2,7 @@
  *
  * createuser
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/scripts/createuser.c
@@ -28,19 +28,20 @@ int
 main(int argc, char *argv[])
 {
 	static struct option long_options[] = {
-		{"admin", required_argument, NULL, 'a'},
+		{"with-admin", required_argument, NULL, 'a'},
 		{"connection-limit", required_argument, NULL, 'c'},
 		{"createdb", no_argument, NULL, 'd'},
 		{"no-createdb", no_argument, NULL, 'D'},
 		{"echo", no_argument, NULL, 'e'},
 		{"encrypted", no_argument, NULL, 'E'},
 		{"role", required_argument, NULL, 'g'},
+		{"member-of", required_argument, NULL, 'g'},
 		{"host", required_argument, NULL, 'h'},
 		{"inherit", no_argument, NULL, 'i'},
 		{"no-inherit", no_argument, NULL, 'I'},
 		{"login", no_argument, NULL, 'l'},
 		{"no-login", no_argument, NULL, 'L'},
-		{"member", required_argument, NULL, 'm'},
+		{"with-member", required_argument, NULL, 'm'},
 		{"port", required_argument, NULL, 'p'},
 		{"pwprompt", no_argument, NULL, 'P'},
 		{"createrole", no_argument, NULL, 'r'},
@@ -239,7 +240,7 @@ main(int argc, char *argv[])
 		free(pw2);
 	}
 
-	if (superuser == 0)
+	if (superuser == TRI_DEFAULT)
 	{
 		if (interactive && yesno_prompt("Shall the new role be a superuser?"))
 			superuser = TRI_YES;
@@ -254,7 +255,7 @@ main(int argc, char *argv[])
 		createrole = TRI_YES;
 	}
 
-	if (createdb == 0)
+	if (createdb == TRI_DEFAULT)
 	{
 		if (interactive && yesno_prompt("Shall the new role be allowed to create databases?"))
 			createdb = TRI_YES;
@@ -262,7 +263,7 @@ main(int argc, char *argv[])
 			createdb = TRI_NO;
 	}
 
-	if (createrole == 0)
+	if (createrole == TRI_DEFAULT)
 	{
 		if (interactive && yesno_prompt("Shall the new role be allowed to create more new roles?"))
 			createrole = TRI_YES;
@@ -270,10 +271,16 @@ main(int argc, char *argv[])
 			createrole = TRI_NO;
 	}
 
-	if (inherit == 0)
+	if (bypassrls == TRI_DEFAULT)
+		bypassrls = TRI_NO;
+
+	if (replication == TRI_DEFAULT)
+		replication = TRI_NO;
+
+	if (inherit == TRI_DEFAULT)
 		inherit = TRI_YES;
 
-	if (login == 0)
+	if (login == TRI_DEFAULT)
 		login = TRI_YES;
 
 	cparams.dbname = NULL;		/* this program lacks any dbname option... */
@@ -408,33 +415,35 @@ help(const char *progname)
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]... [ROLENAME]\n"), progname);
 	printf(_("\nOptions:\n"));
-	printf(_("  -a, --admin=ROLE          this role will be a member of new role with admin\n"
+	printf(_("  -a, --with-admin=ROLE     ROLE will be a member of new role with admin\n"
 			 "                            option\n"));
 	printf(_("  -c, --connection-limit=N  connection limit for role (default: no limit)\n"));
 	printf(_("  -d, --createdb            role can create new databases\n"));
 	printf(_("  -D, --no-createdb         role cannot create databases (default)\n"));
 	printf(_("  -e, --echo                show the commands being sent to the server\n"));
-	printf(_("  -g, --role=ROLE           new role will be a member of this role\n"));
+	printf(_("  -g, --member-of=ROLE      new role will be a member of ROLE\n"));
+	printf(_("  --role=ROLE               (same as --member-of, deprecated)\n"));
 	printf(_("  -i, --inherit             role inherits privileges of roles it is a\n"
 			 "                            member of (default)\n"));
 	printf(_("  -I, --no-inherit          role does not inherit privileges\n"));
 	printf(_("  -l, --login               role can login (default)\n"));
 	printf(_("  -L, --no-login            role cannot login\n"));
-	printf(_("  -m, --member=ROLE         this role will be a member of new role\n"));
+	printf(_("  -m, --with-member=ROLE    ROLE will be a member of new role\n"));
 	printf(_("  -P, --pwprompt            assign a password to new role\n"));
 	printf(_("  -r, --createrole          role can create new roles\n"));
 	printf(_("  -R, --no-createrole       role cannot create roles (default)\n"));
 	printf(_("  -s, --superuser           role will be superuser\n"));
 	printf(_("  -S, --no-superuser        role will not be superuser (default)\n"));
 	printf(_("  -v, --valid-until=TIMESTAMP\n"
-			 "                            password expiration date for role\n"));
+			 "                            password expiration date and time for role\n"));
 	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  --interactive             prompt for missing role name and attributes rather\n"
 			 "                            than using defaults\n"));
 	printf(_("  --bypassrls               role can bypass row-level security (RLS) policy\n"));
-	printf(_("  --no-bypassrls            role cannot bypass row-level security (RLS) policy\n"));
+	printf(_("  --no-bypassrls            role cannot bypass row-level security (RLS) policy\n"
+			 "                            (default)\n"));
 	printf(_("  --replication             role can initiate replication\n"));
-	printf(_("  --no-replication          role cannot initiate replication\n"));
+	printf(_("  --no-replication          role cannot initiate replication (default)\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME       database server host or socket directory\n"));

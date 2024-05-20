@@ -559,7 +559,7 @@ explain (costs off)
                          QUERY PLAN                         
 ------------------------------------------------------------
  Result
-   InitPlan 1 (returns $0)
+   InitPlan 1
      ->  Limit
            ->  Index Only Scan using tenk1_unique1 on tenk1
                  Index Cond: (unique1 IS NOT NULL)
@@ -570,16 +570,16 @@ CREATE VIEW gstest_view AS select a, b, grouping(a,b), sum(c), count(*), max(c)
   from gstest2 group by rollup ((a,b,c),(c,d));
 NOTICE:  view "gstest_view" will be a temporary view
 select pg_get_viewdef('gstest_view'::regclass, true);
-                                pg_get_viewdef                                 
--------------------------------------------------------------------------------
-  SELECT gstest2.a,                                                           +
-     gstest2.b,                                                               +
-     GROUPING(gstest2.a, gstest2.b) AS "grouping",                            +
-     sum(gstest2.c) AS sum,                                                   +
-     count(*) AS count,                                                       +
-     max(gstest2.c) AS max                                                    +
-    FROM gstest2                                                              +
-   GROUP BY ROLLUP((gstest2.a, gstest2.b, gstest2.c), (gstest2.c, gstest2.d));
+            pg_get_viewdef             
+---------------------------------------
+  SELECT a,                           +
+     b,                               +
+     GROUPING(a, b) AS "grouping",    +
+     sum(c) AS sum,                   +
+     count(*) AS count,               +
+     max(c) AS max                    +
+    FROM gstest2                      +
+   GROUP BY ROLLUP((a, b, c), (c, d));
 (1 row)
 
 -- Nested queries with 3 or more levels of nesting
@@ -2109,14 +2109,14 @@ order by a, b, c;
 -- test handling of outer GroupingFunc within subqueries
 explain (costs off)
 select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
-        QUERY PLAN         
----------------------------
+          QUERY PLAN           
+-------------------------------
  MixedAggregate
-   Hash Key: $2
+   Hash Key: (InitPlan 3).col1
    Group Key: ()
-   InitPlan 1 (returns $1)
+   InitPlan 1
      ->  Result
-   InitPlan 3 (returns $2)
+   InitPlan 3
      ->  Result
    ->  Result
    SubPlan 2
@@ -2132,18 +2132,17 @@ select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
 
 explain (costs off)
 select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
-        QUERY PLAN         
----------------------------
+   QUERY PLAN   
+----------------
  GroupAggregate
-   Group Key: $2
-   InitPlan 1 (returns $1)
+   InitPlan 1
      ->  Result
-   InitPlan 3 (returns $2)
+   InitPlan 3
      ->  Result
    ->  Result
    SubPlan 2
      ->  Result
-(9 rows)
+(8 rows)
 
 select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
  grouping 

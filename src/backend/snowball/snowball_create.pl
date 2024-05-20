@@ -1,7 +1,9 @@
 #!/usr/bin/perl
 
+# Copyright (c) 2024, PostgreSQL Global Development Group
+
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Getopt::Long;
 
 my $outdir_path = '';
@@ -10,34 +12,34 @@ my $input_path = '';
 my $depfile;
 
 our @languages = qw(
-	arabic
-	armenian
-	basque
-	catalan
-	danish
-	dutch
-	english
-	finnish
-	french
-	german
-	greek
-	hindi
-	hungarian
-	indonesian
-	irish
-	italian
-	lithuanian
-	nepali
-	norwegian
-	portuguese
-	romanian
-	russian
-	serbian
-	spanish
-	swedish
-	tamil
-	turkish
-	yiddish
+  arabic
+  armenian
+  basque
+  catalan
+  danish
+  dutch
+  english
+  finnish
+  french
+  german
+  greek
+  hindi
+  hungarian
+  indonesian
+  irish
+  italian
+  lithuanian
+  nepali
+  norwegian
+  portuguese
+  romanian
+  russian
+  serbian
+  spanish
+  swedish
+  tamil
+  turkish
+  yiddish
 );
 
 # Names of alternative dictionaries for all-ASCII words.  If not
@@ -48,13 +50,12 @@ our @languages = qw(
 
 our %ascii_languages = (
 	'hindi' => 'english',
-	'russian' => 'english',
-);
+	'russian' => 'english',);
 
 GetOptions(
-	'depfile'    => \$depfile,
-	'outdir:s'   => \$outdir_path,
-	'input:s'    => \$input_path) || usage();
+	'depfile' => \$depfile,
+	'outdir:s' => \$outdir_path,
+	'input:s' => \$input_path) || usage();
 
 # Make sure input_path ends in a slash if needed.
 if ($input_path ne '' && substr($input_path, -1) ne '/')
@@ -110,8 +111,8 @@ sub GenerateTsearchFiles
 	foreach my $lang (@languages)
 	{
 		my $asclang = $ascii_languages{$lang} || $lang;
-		my $txt     = $tmpl;
-		my $stop    = '';
+		my $txt = $tmpl;
+		my $stop = '';
 		my $stopword_path = "$input_path/stopwords/$lang.stop";
 
 		if (-s "$stopword_path")

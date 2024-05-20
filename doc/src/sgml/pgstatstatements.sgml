@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/pgstatstatements.sgml -->
 
 <sect1 id="pgstatstatements" xreflabel="pg_stat_statements">
- <title>pg_stat_statements</title>
+ <title>pg_stat_statements &mdash; track statistics of SQL planning and execution</title>
 
  <indexterm zone="pgstatstatements">
   <primary>pg_stat_statements</primary>
@@ -36,7 +36,7 @@
    <command>CREATE EXTENSION pg_stat_statements</command>.
  </para>
 
- <sect2>
+ <sect2 id="pgstatstatements-pg-stat-statements">
   <title>The <structname>pg_stat_statements</structname> View</title>
 
   <para>
@@ -140,9 +140,12 @@
        <structfield>min_plan_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Minimum time spent planning the statement, in milliseconds
-       (if <varname>pg_stat_statements.track_planning</varname> is enabled,
-       otherwise zero)
+       Minimum time spent planning the statement, in milliseconds.
+       This field will be zero if <varname>pg_stat_statements.track_planning</varname>
+       is disabled, or if the counter has been reset using the
+       <function>pg_stat_statements_reset</function> function with the
+       <structfield>minmax_only</structfield> parameter set to <literal>true</literal>
+       and never been planned since.
       </para></entry>
      </row>
 
@@ -151,9 +154,12 @@
        <structfield>max_plan_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Maximum time spent planning the statement, in milliseconds
-       (if <varname>pg_stat_statements.track_planning</varname> is enabled,
-       otherwise zero)
+       Maximum time spent planning the statement, in milliseconds.
+       This field will be zero if <varname>pg_stat_statements.track_planning</varname>
+       is disabled, or if the counter has been reset using the
+       <function>pg_stat_statements_reset</function> function with the
+       <structfield>minmax_only</structfield> parameter set to <literal>true</literal>
+       and never been planned since.
       </para></entry>
      </row>
 
@@ -203,7 +209,11 @@
        <structfield>min_exec_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Minimum time spent executing the statement, in milliseconds
+       Minimum time spent executing the statement, in milliseconds,
+       this field will be zero until this statement
+       is executed first time after reset performed by the
+       <function>pg_stat_statements_reset</function> function with the
+       <structfield>minmax_only</structfield> parameter set to <literal>true</literal>
       </para></entry>
      </row>
 
@@ -212,7 +222,11 @@
        <structfield>max_exec_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Maximum time spent executing the statement, in milliseconds
+       Maximum time spent executing the statement, in milliseconds,
+       this field will be zero until this statement
+       is executed first time after reset performed by the
+       <function>pg_stat_statements_reset</function> function with the
+       <structfield>minmax_only</structfield> parameter set to <literal>true</literal>
       </para></entry>
      </row>
 
@@ -335,20 +349,40 @@
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
-       <structfield>blk_read_time</structfield> <type>double precision</type>
+       <structfield>shared_blk_read_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Total time the statement spent reading data file blocks, in milliseconds
+       Total time the statement spent reading shared blocks, in milliseconds
        (if <xref linkend="guc-track-io-timing"/> is enabled, otherwise zero)
       </para></entry>
      </row>
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
-       <structfield>blk_write_time</structfield> <type>double precision</type>
+       <structfield>shared_blk_write_time</structfield> <type>double precision</type>
       </para>
       <para>
-       Total time the statement spent writing data file blocks, in milliseconds
+       Total time the statement spent writing shared blocks, in milliseconds
+       (if <xref linkend="guc-track-io-timing"/> is enabled, otherwise zero)
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>local_blk_read_time</structfield> <type>double precision</type>
+      </para>
+      <para>
+       Total time the statement spent reading local blocks, in milliseconds
+       (if <xref linkend="guc-track-io-timing"/> is enabled, otherwise zero)
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>local_blk_write_time</structfield> <type>double precision</type>
+      </para>
+      <para>
+       Total time the statement spent writing local blocks, in milliseconds
        (if <xref linkend="guc-track-io-timing"/> is enabled, otherwise zero)
       </para></entry>
      </row>
@@ -473,6 +507,47 @@
        Total time spent by the statement on emitting code, in milliseconds
       </para></entry>
      </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>jit_deform_count</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Total number of tuple deform functions JIT-compiled by the statement
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>jit_deform_time</structfield> <type>double precision</type>
+      </para>
+      <para>
+       Total time spent by the statement on JIT-compiling tuple deform
+       functions, in milliseconds
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>stats_since</structfield> <type>timestamp with time zone</type>
+      </para>
+      <para>
+       Time at which statistics gathering started for this statement
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>minmax_stats_since</structfield> <type>timestamp with time zone</type>
+      </para>
+      <para>
+       Time at which min/max statistics gathering started for this
+       statement (fields <structfield>min_plan_time</structfield>,
+       <structfield>max_plan_time</structfield>,
+       <structfield>min_exec_time</structfield> and
+       <structfield>max_exec_time</structfield>)
+      </para></entry>
+     </row>
     </tbody>
    </tgroup>
   </table>
@@ -487,13 +562,13 @@
 
   <para>
    Plannable queries (that is, <command>SELECT</command>, <command>INSERT</command>,
-   <command>UPDATE</command>, and <command>DELETE</command>) are combined into a single
+   <command>UPDATE</command>, <command>DELETE</command>, and <command>MERGE</command>)
+   and utility commands are combined into a single
    <structname>pg_stat_statements</structname> entry whenever they have identical query
    structures according to an internal hash calculation.  Typically, two
    queries will be considered the same for this purpose if they are
    semantically equivalent except for the values of literal constants
-   appearing in the query.  Utility commands (that is, all other commands)
-   are compared strictly on the basis of their textual query strings, however.
+   appearing in the query.
   </para>
 
   <note>
@@ -514,6 +589,16 @@
    The rest of the query text is that of the first query that had the
    particular <structfield>queryid</structfield> hash value associated with the
    <structname>pg_stat_statements</structname> entry.
+  </para>
+
+  <para>
+   Queries on which normalization can be applied may be observed with constant
+   values in <structname>pg_stat_statements</structname>, especially when there
+   is a high rate of entry deallocations. To reduce the likelihood of this
+   happening, consider increasing <varname>pg_stat_statements.max</varname>.
+   The <structname>pg_stat_statements_info</structname> view, discussed below
+   in <xref linkend="pgstatstatements-pg-stat-statements-info"/>,
+   provides statistics about entry deallocations.
   </para>
 
   <para>
@@ -554,15 +639,21 @@
   </para>
 
   <para>
-   As a rule of thumb, <structfield>queryid</structfield> values can be assumed to be
-   stable and comparable only so long as the underlying server version and
-   catalog metadata details stay exactly the same.  Two servers
-   participating in replication based on physical WAL replay can be expected
-   to have identical <structfield>queryid</structfield> values for the same query.
-   However, logical replication schemes do not promise to keep replicas
-   identical in all relevant details, so <structfield>queryid</structfield> will
-   not be a useful identifier for accumulating costs across a set of logical
-   replicas.  If in doubt, direct testing is recommended.
+   Two servers participating in replication based on physical WAL replay can
+   be expected to have identical <structfield>queryid</structfield> values for
+   the same query.  However, logical replication schemes do not promise to
+   keep replicas identical in all relevant details, so
+   <structfield>queryid</structfield> will not be a useful identifier for
+   accumulating costs across a set of logical replicas.
+   If in doubt, direct testing is recommended.
+  </para>
+
+  <para>
+   Generally, it can be assumed that <structfield>queryid</structfield> values
+   are stable between minor version releases of <productname>PostgreSQL</productname>,
+   providing that instances are running on the same machine architecture and
+   the catalog metadata details match.  Compatibility will only be broken
+   between minor versions as a last resort.
   </para>
 
   <para>
@@ -602,7 +693,7 @@
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="pgstatstatements-pg-stat-statements-info">
   <title>The <structname>pg_stat_statements_info</structname> View</title>
 
   <indexterm>
@@ -658,13 +749,14 @@
   </table>
  </sect2>
 
- <sect2>
+ <sect2 id="pgstatstatements-funcs">
   <title>Functions</title>
 
   <variablelist>
    <varlistentry>
     <term>
-     <function>pg_stat_statements_reset(userid Oid, dbid Oid, queryid bigint) returns void</function>
+     <function>pg_stat_statements_reset(userid Oid, dbid Oid, queryid
+     bigint, minmax_only boolean) returns timestamp with time zone</function>
      <indexterm>
       <primary>pg_stat_statements_reset</primary>
      </indexterm>
@@ -683,6 +775,20 @@
       If all statistics in the <filename>pg_stat_statements</filename>
       view are discarded, it will also reset the statistics in the
       <structname>pg_stat_statements_info</structname> view.
+      When <structfield>minmax_only</structfield> is <literal>true</literal> only the
+      values of minimum and maximum planning and execution time will be reset (i.e.
+      <structfield>min_plan_time</structfield>, <structfield>max_plan_time</structfield>,
+      <structfield>min_exec_time</structfield> and <structfield>max_exec_time</structfield>
+      fields). The default value for <structfield>minmax_only</structfield> parameter is
+      <literal>false</literal>. Time of last min/max reset performed is shown in
+      <structfield>minmax_stats_since</structfield> field of the
+      <structname>pg_stat_statements</structname> view.
+      This function returns the time of a reset. This time is saved to
+      <structfield>stats_reset</structfield> field of
+      <structname>pg_stat_statements_info</structname> view or to
+      <structfield>minmax_stats_since</structfield> field of the
+      <structname>pg_stat_statements</structname> view if the corresponding reset was
+      actually performed.
       By default, this function can only be executed by superusers.
       Access may be granted to others using <command>GRANT</command>.
      </para>
@@ -721,7 +827,7 @@
   </variablelist>
  </sect2>
 
- <sect2>
+ <sect2 id="pgstatstatements-config-params">
   <title>Configuration Parameters</title>
 
   <variablelist>
@@ -783,7 +889,7 @@
       <varname>pg_stat_statements.track_utility</varname> controls whether
       utility commands are tracked by the module.  Utility commands are
       all those other than <command>SELECT</command>, <command>INSERT</command>,
-      <command>UPDATE</command> and <command>DELETE</command>.
+      <command>UPDATE</command>, <command>DELETE</command>, and <command>MERGE</command>.
       The default value is <literal>on</literal>.
       Only superusers can change this setting.
      </para>
@@ -856,7 +962,7 @@ pg_stat_statements.track = all
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="pgstatstatements-sample-output">
   <title>Sample Output</title>
 
 <screen>
@@ -961,7 +1067,7 @@ hit_percent     |
 </screen>
  </sect2>
 
- <sect2>
+ <sect2 id="pgstatstatements-authors">
   <title>Authors</title>
 
   <para>

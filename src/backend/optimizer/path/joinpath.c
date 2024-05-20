@@ -3,7 +3,7 @@
  * joinpath.c
  *	  Routines to find all possible paths for processing a set of joins
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,8 +30,9 @@
 set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
 
 /*
- * Paths parameterized by the parent can be considered to be parameterized by
- * any of its child.
+ * Paths parameterized by a parent rel can be considered to be parameterized
+ * by any of its children, when we are performing partitionwise joins.  These
+ * macros simplify checking for such cases.  Beware multiple eval of args.
  */
 #define PATH_PARAM_BY_PARENT(path, rel)	\
 	((path)->param_info && bms_overlap(PATH_REQ_OUTER(path),	\
@@ -234,7 +235,9 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * reduces the number of parameterized paths we have to deal with at
 	 * higher join levels, without compromising the quality of the resulting
 	 * plan.  We express the restriction as a Relids set that must overlap the
-	 * parameterization of any proposed join path.
+	 * parameterization of any proposed join path.  Note: param_source_rels
+	 * should contain only baserels, not OJ relids, so starting from
+	 * all_baserels not all_query_rels is correct.
 	 */
 	foreach(lc, root->join_info_list)
 	{
@@ -284,8 +287,9 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * 2. Consider paths where the outer relation need not be explicitly
 	 * sorted. This includes both nestloops and mergejoins where the outer
 	 * path is already ordered.  Again, skip this if we can't mergejoin.
-	 * (That's okay because we know that nestloop can't handle right/full
-	 * joins at all, so it wouldn't work in the prohibited cases either.)
+	 * (That's okay because we know that nestloop can't handle
+	 * right/right-anti/full joins at all, so it wouldn't work in the
+	 * prohibited cases either.)
 	 */
 	if (mergejoin_allowed)
 		match_unsorted_outer(root, joinrel, outerrel, innerrel,
@@ -330,7 +334,10 @@ add_paths_to_joinrel(PlannerInfo *root,
 												 jointype, &extra);
 
 	/*
-	 * 6. Finally, give extensions a chance to manipulate the path list.
+	 * 6. Finally, give extensions a chance to manipulate the path list.  They
+	 * could add new paths (such as CustomPaths) by calling add_path(), or
+	 * add_partial_path() if parallel aware.  They could also delete or modify
+	 * paths added by the core code.
 	 */
 	if (set_join_pathlist_hook)
 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
@@ -366,13 +373,67 @@ allow_star_schema_join(PlannerInfo *root,
 }
 
 /*
- * paraminfo_get_equal_hashops
- *		Determine if param_info and innerrel's lateral_vars can be hashed.
- *		Returns true the hashing is possible, otherwise return false.
+ * If the parameterization is only partly satisfied by the outer rel,
+ * the unsatisfied part can't include any outer-join relids that could
+ * null rels of the satisfied part.  That would imply that we're trying
+ * to use a clause involving a Var with nonempty varnullingrels at
+ * a join level where that value isn't yet computable.
  *
- * Additionally we also collect the outer exprs and the hash operators for
- * each parameter to innerrel.  These set in 'param_exprs', 'operators' and
- * 'binary_mode' when we return true.
+ * In practice, this test never finds a problem because earlier join order
+ * restrictions prevent us from attempting a join that would cause a problem.
+ * (That's unsurprising, because the code worked before we ever added
+ * outer-join relids to expression relids.)  It still seems worth checking
+ * as a backstop, but we only do so in assert-enabled builds.
+ */
+#ifdef USE_ASSERT_CHECKING
+static inline bool
+have_unsafe_outer_join_ref(PlannerInfo *root,
+						   Relids outerrelids,
+						   Relids inner_paramrels)
+{
+	bool		result = false;
+	Relids		unsatisfied = bms_difference(inner_paramrels, outerrelids);
+	Relids		satisfied = bms_intersect(inner_paramrels, outerrelids);
+
+	if (bms_overlap(unsatisfied, root->outer_join_rels))
+	{
+		ListCell   *lc;
+
+		foreach(lc, root->join_info_list)
+		{
+			SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+			if (!bms_is_member(sjinfo->ojrelid, unsatisfied))
+				continue;		/* not relevant */
+			if (bms_overlap(satisfied, sjinfo->min_righthand) ||
+				(sjinfo->jointype == JOIN_FULL &&
+				 bms_overlap(satisfied, sjinfo->min_lefthand)))
+			{
+				result = true;	/* doesn't work */
+				break;
+			}
+		}
+	}
+
+	/* Waste no memory when we reject a path here */
+	bms_free(unsatisfied);
+	bms_free(satisfied);
+
+	return result;
+}
+#endif							/* USE_ASSERT_CHECKING */
+
+/*
+ * paraminfo_get_equal_hashops
+ *		Determine if the clauses in param_info and innerrel's lateral_vars
+ *		can be hashed.
+ *		Returns true if hashing is possible, otherwise false.
+ *
+ * Additionally, on success we collect the outer expressions and the
+ * appropriate equality operators for each hashable parameter to innerrel.
+ * These are returned in parallel lists in *param_exprs and *operators.
+ * We also set *binary_mode to indicate whether strict binary matching is
+ * required.
  */
 static bool
 paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
@@ -387,6 +448,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 	*operators = NIL;
 	*binary_mode = false;
 
+	/* Add join clauses from param_info to the hash key */
 	if (param_info != NULL)
 	{
 		List	   *clauses = param_info->ppi_clauses;
@@ -431,8 +493,16 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 				return false;
 			}
 
-			*operators = lappend_oid(*operators, hasheqoperator);
-			*param_exprs = lappend(*param_exprs, expr);
+			/*
+			 * 'expr' may already exist as a parameter from a previous item in
+			 * ppi_clauses.  No need to include it again, however we'd better
+			 * ensure we do switch into binary mode if required.  See below.
+			 */
+			if (!list_member(*param_exprs, expr))
+			{
+				*operators = lappend_oid(*operators, hasheqoperator);
+				*param_exprs = lappend(*param_exprs, expr);
+			}
 
 			/*
 			 * When the join operator is not hashable then it's possible that
@@ -456,7 +526,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 		Node	   *expr = (Node *) lfirst(lc);
 		TypeCacheEntry *typentry;
 
-		/* Reject if there are any volatile functions */
+		/* Reject if there are any volatile functions in lateral vars */
 		if (contain_volatile_functions(expr))
 		{
 			list_free(*operators);
@@ -467,7 +537,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 		typentry = lookup_type_cache(exprType(expr),
 									 TYPECACHE_HASH_PROC | TYPECACHE_EQ_OPR);
 
-		/* can't use a memoize node without a valid hash equals operator */
+		/* can't use memoize without a valid hash proc and equals operator */
 		if (!OidIsValid(typentry->hash_proc) || !OidIsValid(typentry->eq_opr))
 		{
 			list_free(*operators);
@@ -475,8 +545,16 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 			return false;
 		}
 
-		*operators = lappend_oid(*operators, typentry->eq_opr);
-		*param_exprs = lappend(*param_exprs, expr);
+		/*
+		 * 'expr' may already exist as a parameter from the ppi_clauses.  No
+		 * need to include it again, however we'd better ensure we do switch
+		 * into binary mode.
+		 */
+		if (!list_member(*param_exprs, expr))
+		{
+			*operators = lappend_oid(*operators, typentry->eq_opr);
+			*param_exprs = lappend(*param_exprs, expr);
+		}
 
 		/*
 		 * We must go into binary mode as we don't have too much of an idea of
@@ -574,7 +652,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 	 */
 	if (extra->inner_unique &&
 		(inner_path->param_info == NULL ||
-		 list_length(inner_path->param_info->ppi_clauses) <
+		 bms_num_members(inner_path->param_info->ppi_serials) <
 		 list_length(extra->restrictlist)))
 		return NULL;
 
@@ -594,10 +672,28 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 			return NULL;
 	}
 
+	/*
+	 * Also check the parameterized path restrictinfos for volatile functions.
+	 * Indexed functions must be immutable so shouldn't have any volatile
+	 * functions, however, with a lateral join the inner scan may not be an
+	 * index scan.
+	 */
+	if (inner_path->param_info != NULL)
+	{
+		foreach(lc, inner_path->param_info->ppi_clauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (contain_volatile_functions((Node *) rinfo))
+				return NULL;
+		}
+	}
+
 	/* Check if we have hash ops for each parameter to the path */
 	if (paraminfo_get_equal_hashops(root,
 									inner_path->param_info,
-									outerrel,
+									outerrel->top_parent ?
+									outerrel->top_parent : outerrel,
 									innerrel,
 									&param_exprs,
 									&hash_operators,
@@ -640,8 +736,22 @@ try_nestloop_path(PlannerInfo *root,
 	Relids		outer_paramrels = PATH_REQ_OUTER(outer_path);
 
 	/*
-	 * Paths are parameterized by top-level parents, so run parameterization
-	 * tests on the parent relids.
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, inner_paramrels) ||
+		 bms_is_member(extra->sjinfo->ojrelid, outer_paramrels)))
+		return;
+
+	/*
+	 * Any parameterization of the input paths refers to topmost parents of
+	 * the relevant relations, because reparameterize_path_by_child() hasn't
+	 * been called yet.  So we must consider topmost parents of the relations
+	 * being joined, too, while determining parameterization of the result and
+	 * checking for disallowed parameterization cases.
 	 */
 	if (innerrel->top_parent_relids)
 		innerrelids = innerrel->top_parent_relids;
@@ -672,6 +782,23 @@ try_nestloop_path(PlannerInfo *root,
 		return;
 	}
 
+	/* If we got past that, we shouldn't have any unsafe outer-join refs */
+	Assert(!have_unsafe_outer_join_ref(root, outerrelids, inner_paramrels));
+
+	/*
+	 * If the inner path is parameterized, it is parameterized by the topmost
+	 * parent of the outer rel, not the outer rel itself.  We will need to
+	 * translate the parameterization, if this path is chosen, during
+	 * create_plan().  Here we just check whether we will be able to perform
+	 * the translation, and if not avoid creating a nestloop path.
+	 */
+	if (PATH_PARAM_BY_PARENT(inner_path, outer_path->parent) &&
+		!path_is_reparameterizable_by_child(inner_path, outer_path->parent))
+	{
+		bms_free(required_outer);
+		return;
+	}
+
 	/*
 	 * Do a precheck to quickly eliminate obviously-inferior paths.  We
 	 * calculate a cheap lower bound on the path's cost and then use
@@ -688,27 +815,6 @@ try_nestloop_path(PlannerInfo *root,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
-		/*
-		 * If the inner path is parameterized, it is parameterized by the
-		 * topmost parent of the outer rel, not the outer rel itself.  Fix
-		 * that.
-		 */
-		if (PATH_PARAM_BY_PARENT(inner_path, outer_path->parent))
-		{
-			inner_path = reparameterize_path_by_child(root, inner_path,
-													  outer_path->parent);
-
-			/*
-			 * If we could not translate the path, we can't create nest loop
-			 * path.
-			 */
-			if (!inner_path)
-			{
-				bms_free(required_outer);
-				return;
-			}
-		}
-
 		add_path(joinrel, (Path *)
 				 create_nestloop_path(root,
 									  joinrel,
@@ -772,6 +878,17 @@ try_partial_nestloop_path(PlannerInfo *root,
 	}
 
 	/*
+	 * If the inner path is parameterized, it is parameterized by the topmost
+	 * parent of the outer rel, not the outer rel itself.  We will need to
+	 * translate the parameterization, if this path is chosen, during
+	 * create_plan().  Here we just check whether we will be able to perform
+	 * the translation, and if not avoid creating a nestloop path.
+	 */
+	if (PATH_PARAM_BY_PARENT(inner_path, outer_path->parent) &&
+		!path_is_reparameterizable_by_child(inner_path, outer_path->parent))
+		return;
+
+	/*
 	 * Before creating a path, get a quick lower bound on what it is likely to
 	 * cost.  Bail out right away if it looks terrible.
 	 */
@@ -779,22 +896,6 @@ try_partial_nestloop_path(PlannerInfo *root,
 						  outer_path, inner_path, extra);
 	if (!add_partial_path_precheck(joinrel, workspace.total_cost, pathkeys))
 		return;
-
-	/*
-	 * If the inner path is parameterized, it is parameterized by the topmost
-	 * parent of the outer rel, not the outer rel itself.  Fix that.
-	 */
-	if (PATH_PARAM_BY_PARENT(inner_path, outer_path->parent))
-	{
-		inner_path = reparameterize_path_by_child(root, inner_path,
-												  outer_path->parent);
-
-		/*
-		 * If we could not translate the path, we can't create nest loop path.
-		 */
-		if (!inner_path)
-			return;
-	}
 
 	/* Might be good enough to be worth trying, so let's try it. */
 	add_partial_path(joinrel, (Path *)
@@ -845,6 +946,17 @@ try_mergejoin_path(PlannerInfo *root,
 								   extra);
 		return;
 	}
+
+	/*
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(inner_path)) ||
+		 bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(outer_path))))
+		return;
 
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
@@ -991,6 +1103,17 @@ try_hashjoin_path(PlannerInfo *root,
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
+
+	/*
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(inner_path)) ||
+		 bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(outer_path))))
+		return;
 
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
@@ -1204,14 +1327,15 @@ sort_inner_and_outer(PlannerInfo *root,
 	 * If the joinrel is parallel-safe, we may be able to consider a partial
 	 * merge join.  However, we can't handle JOIN_UNIQUE_OUTER, because the
 	 * outer path will be partial, and therefore we won't be able to properly
-	 * guarantee uniqueness.  Similarly, we can't handle JOIN_FULL and
-	 * JOIN_RIGHT, because they can produce false null extended rows.  Also,
-	 * the resulting path must not be parameterized.
+	 * guarantee uniqueness.  Similarly, we can't handle JOIN_FULL, JOIN_RIGHT
+	 * and JOIN_RIGHT_ANTI, because they can produce false null extended rows.
+	 * Also, the resulting path must not be parameterized.
 	 */
 	if (joinrel->consider_parallel &&
 		save_jointype != JOIN_UNIQUE_OUTER &&
 		save_jointype != JOIN_FULL &&
 		save_jointype != JOIN_RIGHT &&
+		save_jointype != JOIN_RIGHT_ANTI &&
 		outerrel->partial_pathlist != NIL &&
 		bms_is_empty(joinrel->lateral_relids))
 	{
@@ -1606,10 +1730,10 @@ match_unsorted_outer(PlannerInfo *root,
 
 	/*
 	 * Nestloop only supports inner, left, semi, and anti joins.  Also, if we
-	 * are doing a right or full mergejoin, we must use *all* the mergeclauses
-	 * as join clauses, else we will not have a valid plan.  (Although these
-	 * two flags are currently inverses, keep them separate for clarity and
-	 * possible future changes.)
+	 * are doing a right, right-anti or full mergejoin, we must use *all* the
+	 * mergeclauses as join clauses, else we will not have a valid plan.
+	 * (Although these two flags are currently inverses, keep them separate
+	 * for clarity and possible future changes.)
 	 */
 	switch (jointype)
 	{
@@ -1621,6 +1745,7 @@ match_unsorted_outer(PlannerInfo *root,
 			useallclauses = false;
 			break;
 		case JOIN_RIGHT:
+		case JOIN_RIGHT_ANTI:
 		case JOIN_FULL:
 			nestjoinOK = false;
 			useallclauses = true;
@@ -1792,13 +1917,14 @@ match_unsorted_outer(PlannerInfo *root,
 	 * handle JOIN_UNIQUE_OUTER, because the outer path will be partial, and
 	 * therefore we won't be able to properly guarantee uniqueness.  Nor can
 	 * we handle joins needing lateral rels, since partial paths must not be
-	 * parameterized. Similarly, we can't handle JOIN_FULL and JOIN_RIGHT,
-	 * because they can produce false null extended rows.
+	 * parameterized. Similarly, we can't handle JOIN_FULL, JOIN_RIGHT and
+	 * JOIN_RIGHT_ANTI, because they can produce false null extended rows.
 	 */
 	if (joinrel->consider_parallel &&
 		save_jointype != JOIN_UNIQUE_OUTER &&
 		save_jointype != JOIN_FULL &&
 		save_jointype != JOIN_RIGHT &&
+		save_jointype != JOIN_RIGHT_ANTI &&
 		outerrel->partial_pathlist != NIL &&
 		bms_is_empty(joinrel->lateral_relids))
 	{
@@ -2133,18 +2259,11 @@ hash_inner_and_outer(PlannerInfo *root,
 		 * If the joinrel is parallel-safe, we may be able to consider a
 		 * partial hash join.  However, we can't handle JOIN_UNIQUE_OUTER,
 		 * because the outer path will be partial, and therefore we won't be
-		 * able to properly guarantee uniqueness.  Similarly, we can't handle
-		 * JOIN_FULL and JOIN_RIGHT, because they can produce false null
-		 * extended rows.  Also, the resulting path must not be parameterized.
-		 * We would be able to support JOIN_FULL and JOIN_RIGHT for Parallel
-		 * Hash, since in that case we're back to a single hash table with a
-		 * single set of match bits for each batch, but that will require
-		 * figuring out a deadlock-free way to wait for the probe to finish.
+		 * able to properly guarantee uniqueness.  Also, the resulting path
+		 * must not be parameterized.
 		 */
 		if (joinrel->consider_parallel &&
 			save_jointype != JOIN_UNIQUE_OUTER &&
-			save_jointype != JOIN_FULL &&
-			save_jointype != JOIN_RIGHT &&
 			outerrel->partial_pathlist != NIL &&
 			bms_is_empty(joinrel->lateral_relids))
 		{
@@ -2178,9 +2297,15 @@ hash_inner_and_outer(PlannerInfo *root,
 			 * total inner path will also be parallel-safe, but if not, we'll
 			 * have to search for the cheapest safe, unparameterized inner
 			 * path.  If doing JOIN_UNIQUE_INNER, we can't use any alternative
-			 * inner path.
+			 * inner path.  If full, right, or right-anti join, we can't use
+			 * parallelism (building the hash table in each backend) because
+			 * no one process has all the match bits.
 			 */
-			if (cheapest_total_inner->parallel_safe)
+			if (save_jointype == JOIN_FULL ||
+				save_jointype == JOIN_RIGHT ||
+				save_jointype == JOIN_RIGHT_ANTI)
+				cheapest_safe_inner = NULL;
+			else if (cheapest_total_inner->parallel_safe)
 				cheapest_safe_inner = cheapest_total_inner;
 			else if (save_jointype != JOIN_UNIQUE_INNER)
 				cheapest_safe_inner =
@@ -2202,10 +2327,10 @@ hash_inner_and_outer(PlannerInfo *root,
  *	  Returns a list of RestrictInfo nodes for those clauses.
  *
  * *mergejoin_allowed is normally set to true, but it is set to false if
- * this is a right/full join and there are nonmergejoinable join clauses.
- * The executor's mergejoin machinery cannot handle such cases, so we have
- * to avoid generating a mergejoin plan.  (Note that this flag does NOT
- * consider whether there are actually any mergejoinable clauses.  This is
+ * this is a right/right-anti/full join and there are nonmergejoinable join
+ * clauses.  The executor's mergejoin machinery cannot handle such cases, so
+ * we have to avoid generating a mergejoin plan.  (Note that this flag does
+ * NOT consider whether there are actually any mergejoinable clauses.  This is
  * correct because in some cases we need to build a clauseless mergejoin.
  * Simply returning NIL is therefore not enough to distinguish safe from
  * unsafe cases.)
@@ -2251,8 +2376,8 @@ select_mergejoin_clauses(PlannerInfo *root,
 		{
 			/*
 			 * The executor can handle extra joinquals that are constants, but
-			 * not anything else, when doing right/full merge join.  (The
-			 * reason to support constants is so we can do FULL JOIN ON
+			 * not anything else, when doing right/right-anti/full merge join.
+			 * (The reason to support constants is so we can do FULL JOIN ON
 			 * FALSE.)
 			 */
 			if (!restrictinfo->clause || !IsA(restrictinfo->clause, Const))
@@ -2276,18 +2401,6 @@ select_mergejoin_clauses(PlannerInfo *root,
 		 * canonical pathkey list, but redundant eclasses can't appear in
 		 * canonical sort orderings.  (XXX it might be worth relaxing this,
 		 * but not enough time to address it for 8.3.)
-		 *
-		 * Note: it would be bad if this condition failed for an otherwise
-		 * mergejoinable FULL JOIN clause, since that would result in
-		 * undesirable planner failure.  I believe that is not possible
-		 * however; a variable involved in a full join could only appear in
-		 * below_outer_join eclasses, which aren't considered redundant.
-		 *
-		 * This case *can* happen for left/right join clauses: the outer-side
-		 * variable could be equated to a constant.  Because we will propagate
-		 * that constant across the join clause, the loss of ability to do a
-		 * mergejoin is not really all that big a deal, and so it's not clear
-		 * that improving this is important.
 		 */
 		update_mergeclause_eclasses(root, restrictinfo);
 
@@ -2307,6 +2420,7 @@ select_mergejoin_clauses(PlannerInfo *root,
 	switch (jointype)
 	{
 		case JOIN_RIGHT:
+		case JOIN_RIGHT_ANTI:
 		case JOIN_FULL:
 			*mergejoin_allowed = !have_nonmergeable_joinclause;
 			break;

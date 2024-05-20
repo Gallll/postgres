@@ -12,7 +12,7 @@
  * For UPDATE and DELETE queries, the targetlist must also contain "junk"
  * tlist entries needed to allow the executor to identify the rows to be
  * updated or deleted; for example, the ctid of a heap row.  (The planner
- * adds these; they're not in what we receive from the planner/rewriter.)
+ * adds these; they're not in what we receive from the parser/rewriter.)
  *
  * For all query types, there can be additional junk tlist entries, such as
  * sort keys, Vars needed for a RETURNING list, and row ID information needed
@@ -25,7 +25,7 @@
  * rewriter's work is more concerned with SQL semantics.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -134,6 +134,7 @@ preprocess_targetlist(PlannerInfo *root)
 	if (command_type == CMD_MERGE)
 	{
 		ListCell   *l;
+		List	   *vars;
 
 		/*
 		 * For MERGE, handle targetlist of each MergeAction separately. Give
@@ -144,7 +145,6 @@ preprocess_targetlist(PlannerInfo *root)
 		foreach(l, parse->mergeActionList)
 		{
 			MergeAction *action = (MergeAction *) lfirst(l);
-			List	   *vars;
 			ListCell   *l2;
 
 			if (action->commandType == CMD_INSERT)
@@ -155,17 +155,15 @@ preprocess_targetlist(PlannerInfo *root)
 					extract_update_targetlist_colnos(action->targetList);
 
 			/*
-			 * Add resjunk entries for any Vars used in each action's
-			 * targetlist and WHEN condition that belong to relations other
-			 * than target.  Note that aggregates, window functions and
-			 * placeholder vars are not possible anywhere in MERGE's WHEN
-			 * clauses.  (PHVs may be added later, but they don't concern us
-			 * here.)
+			 * Add resjunk entries for any Vars and PlaceHolderVars used in
+			 * each action's targetlist and WHEN condition that belong to
+			 * relations other than the target.  We don't expect to see any
+			 * aggregates or window functions here.
 			 */
 			vars = pull_var_clause((Node *)
 								   list_concat_copy((List *) action->qual,
 													action->targetList),
-								   0);
+								   PVC_INCLUDE_PLACEHOLDERS);
 			foreach(l2, vars)
 			{
 				Var		   *var = (Var *) lfirst(l2);
@@ -183,6 +181,30 @@ preprocess_targetlist(PlannerInfo *root)
 				tlist = lappend(tlist, tle);
 			}
 			list_free(vars);
+		}
+
+		/*
+		 * Add resjunk entries for any Vars and PlaceHolderVars used in the
+		 * join condition that belong to relations other than the target.  We
+		 * don't expect to see any aggregates or window functions here.
+		 */
+		vars = pull_var_clause(parse->mergeJoinCondition,
+							   PVC_INCLUDE_PLACEHOLDERS);
+		foreach(l, vars)
+		{
+			Var		   *var = (Var *) lfirst(l);
+			TargetEntry *tle;
+
+			if (IsA(var, Var) && var->varno == result_relation)
+				continue;		/* don't need it */
+
+			if (tlist_member((Expr *) var, tlist))
+				continue;		/* already got it */
+
+			tle = makeTargetEntry((Expr *) var,
+								  list_length(tlist) + 1,
+								  NULL, true);
+			tlist = lappend(tlist, tle);
 		}
 	}
 

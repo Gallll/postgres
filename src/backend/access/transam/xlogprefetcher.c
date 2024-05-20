@@ -3,7 +3,7 @@
  * xlogprefetcher.c
  *		Prefetching support for recovery.
  *
- * Portions Copyright (c) 2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,7 @@
  * avoid a second buffer mapping table lookup.
  *
  * Currently, only the main fork is considered for prefetching.  Currently,
- * prefetching is only effective on systems where BufferPrefetch() does
+ * prefetching is only effective on systems where PrefetchBuffer() does
  * something useful (mainly Linux).
  *
  *-------------------------------------------------------------------------
@@ -27,25 +27,21 @@
 
 #include "postgres.h"
 
-#include "access/xlog.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
-#include "access/xlogutils.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
-#include "utils/fmgrprotos.h"
-#include "utils/timestamp.h"
 #include "funcapi.h"
-#include "pgstat.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
-#include "utils/guc.h"
+#include "utils/fmgrprotos.h"
+#include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
+#include "utils/timestamp.h"
 
 /*
  * Every time we process this much WAL, we'll update the values in
@@ -72,7 +68,9 @@
 int			recovery_prefetch = RECOVERY_PREFETCH_TRY;
 
 #ifdef USE_PREFETCH
-#define RecoveryPrefetchEnabled() (recovery_prefetch != RECOVERY_PREFETCH_OFF)
+#define RecoveryPrefetchEnabled() \
+		(recovery_prefetch != RECOVERY_PREFETCH_OFF && \
+		 maintenance_io_concurrency > 0)
 #else
 #define RecoveryPrefetchEnabled() false
 #endif
@@ -86,7 +84,7 @@ typedef enum
 {
 	LRQ_NEXT_NO_IO,
 	LRQ_NEXT_IO,
-	LRQ_NEXT_AGAIN
+	LRQ_NEXT_AGAIN,
 } LsnReadQueueNextStatus;
 
 /*
@@ -455,9 +453,9 @@ XLogPrefetcherComputeStats(XLogPrefetcher *prefetcher)
  * *lsn, and the I/O will be considered to have completed once that LSN is
  * replayed.
  *
- * Returns LRQ_NO_IO if we examined the next block reference and found that it
- * was already in the buffer pool, or we decided for various reasons not to
- * prefetch.
+ * Returns LRQ_NEXT_NO_IO if we examined the next block reference and found
+ * that it was already in the buffer pool, or we decided for various reasons
+ * not to prefetch.
  */
 static LsnReadQueueNextStatus
 XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
@@ -567,7 +565,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				if (record_type == XLOG_DBASE_CREATE_FILE_COPY)
 				{
 					xl_dbase_create_file_copy_rec *xlrec =
-					(xl_dbase_create_file_copy_rec *) record->main_data;
+						(xl_dbase_create_file_copy_rec *) record->main_data;
 					RelFileLocator rlocator =
 					{InvalidOid, xlrec->db_id, InvalidRelFileNumber};
 
@@ -594,7 +592,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				if (record_type == XLOG_SMGR_CREATE)
 				{
 					xl_smgr_create *xlrec = (xl_smgr_create *)
-					record->main_data;
+						record->main_data;
 
 					if (xlrec->forkNum == MAIN_FORKNUM)
 					{
@@ -622,7 +620,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				else if (record_type == XLOG_SMGR_TRUNCATE)
 				{
 					xl_smgr_truncate *xlrec = (xl_smgr_truncate *)
-					record->main_data;
+						record->main_data;
 
 					/*
 					 * Don't consider prefetching anything in the truncated
@@ -656,7 +654,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			if (!block->in_use)
 				continue;
 
-			Assert(!BufferIsValid(block->prefetch_buffer));;
+			Assert(!BufferIsValid(block->prefetch_buffer));
 
 			/*
 			 * Record the LSN of this record.  When it's replayed,
@@ -720,7 +718,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 * same relation (with some scheme to handle invalidations
 			 * safely), but for now we'll call smgropen() every time.
 			 */
-			reln = smgropen(block->rlocator, InvalidBackendId);
+			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
 			/*
 			 * If the relation file doesn't exist on disk, for example because
@@ -783,7 +781,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				block->prefetch_buffer = InvalidBuffer;
 				return LRQ_NEXT_IO;
 			}
-			else
+			else if ((io_direct_flags & IO_DIRECT_DATA) == 0)
 			{
 				/*
 				 * This shouldn't be possible, because we already determined
@@ -832,7 +830,7 @@ pg_stat_get_recovery_prefetch(PG_FUNCTION_ARGS)
 	Datum		values[PG_STAT_GET_RECOVERY_PREFETCH_COLS];
 	bool		nulls[PG_STAT_GET_RECOVERY_PREFETCH_COLS];
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	for (int i = 0; i < PG_STAT_GET_RECOVERY_PREFETCH_COLS; ++i)
 		nulls[i] = false;
@@ -985,6 +983,7 @@ XLogRecord *
 XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 {
 	DecodedXLogRecord *record;
+	XLogRecPtr	replayed_up_to;
 
 	/*
 	 * See if it's time to reset the prefetching machinery, because a relevant
@@ -1000,7 +999,8 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 
 		if (RecoveryPrefetchEnabled())
 		{
-			max_inflight = Max(maintenance_io_concurrency, 2);
+			Assert(maintenance_io_concurrency > 0);
+			max_inflight = maintenance_io_concurrency;
 			max_distance = max_inflight * XLOGPREFETCHER_DISTANCE_MULTIPLIER;
 		}
 		else
@@ -1018,14 +1018,34 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 	}
 
 	/*
-	 * Release last returned record, if there is one.  We need to do this so
-	 * that we can check for empty decode queue accurately.
+	 * Release last returned record, if there is one, as it's now been
+	 * replayed.
 	 */
-	XLogReleasePreviousRecord(prefetcher->reader);
+	replayed_up_to = XLogReleasePreviousRecord(prefetcher->reader);
 
-	/* If there's nothing queued yet, then start prefetching. */
+	/*
+	 * Can we drop any filters yet?  If we were waiting for a relation to be
+	 * created or extended, it is now OK to access blocks in the covered
+	 * range.
+	 */
+	XLogPrefetcherCompleteFilters(prefetcher, replayed_up_to);
+
+	/*
+	 * All IO initiated by earlier WAL is now completed.  This might trigger
+	 * further prefetching.
+	 */
+	lrq_complete_lsn(prefetcher->streaming_read, replayed_up_to);
+
+	/*
+	 * If there's nothing queued yet, then start prefetching to cause at least
+	 * one record to be queued.
+	 */
 	if (!XLogReaderHasQueuedRecordOrError(prefetcher->reader))
+	{
+		Assert(lrq_inflight(prefetcher->streaming_read) == 0);
+		Assert(lrq_completed(prefetcher->streaming_read) == 0);
 		lrq_prefetch(prefetcher->streaming_read);
+	}
 
 	/* Read the next record. */
 	record = XLogNextRecord(prefetcher->reader, errmsg);
@@ -1039,12 +1059,13 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 	Assert(record == prefetcher->reader->record);
 
 	/*
-	 * Can we drop any prefetch filters yet, given the record we're about to
-	 * return?  This assumes that any records with earlier LSNs have been
-	 * replayed, so if we were waiting for a relation to be created or
-	 * extended, it is now OK to access blocks in the covered range.
+	 * If maintenance_io_concurrency is set very low, we might have started
+	 * prefetching some but not all of the blocks referenced in the record
+	 * we're about to return.  Forget about the rest of the blocks in this
+	 * record by dropping the prefetcher's reference to it.
 	 */
-	XLogPrefetcherCompleteFilters(prefetcher, record->lsn);
+	if (record == prefetcher->record)
+		prefetcher->record = NULL;
 
 	/*
 	 * See if it's time to compute some statistics, because enough WAL has
@@ -1052,13 +1073,6 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 	 */
 	if (unlikely(record->lsn >= prefetcher->next_stats_shm_lsn))
 		XLogPrefetcherComputeStats(prefetcher);
-
-	/*
-	 * The caller is about to replay this record, so we can now report that
-	 * all IO initiated because of early WAL must be finished. This may
-	 * trigger more readahead.
-	 */
-	lrq_complete_lsn(prefetcher->streaming_read, record->lsn);
 
 	Assert(record == prefetcher->reader->record);
 
@@ -1071,7 +1085,7 @@ check_recovery_prefetch(int *new_value, void **extra, GucSource source)
 #ifndef USE_PREFETCH
 	if (*new_value == RECOVERY_PREFETCH_ON)
 	{
-		GUC_check_errdetail("recovery_prefetch not supported on platforms that lack posix_fadvise().");
+		GUC_check_errdetail("\"recovery_prefetch\" is not supported on platforms that lack posix_fadvise().");
 		return false;
 	}
 #endif

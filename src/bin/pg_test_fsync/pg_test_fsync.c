@@ -1,6 +1,12 @@
-/*
- *	pg_test_fsync.c
- *		tests all supported fsync() methods
+/*-------------------------------------------------------------------------
+ *
+ * pg_test_fsync --- tests all supported fsync() methods
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ *
+ * src/bin/pg_test_fsync/pg_test_fsync.c
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres_fe.h"
@@ -68,7 +74,7 @@ static char full_buf[DEFAULT_XLOG_SEG_SIZE],
 		   *filename = FSYNC_FILENAME;
 static struct timeval start_t,
 			stop_t;
-static bool alarm_triggered = false;
+static sig_atomic_t alarm_triggered = false;
 
 
 static void handle_args(int argc, char *argv[]);
@@ -81,11 +87,11 @@ static void test_open_sync(const char *msg, int writes_size);
 static void test_file_descriptor_sync(void);
 
 #ifndef WIN32
-static void process_alarm(int sig);
+static void process_alarm(SIGNAL_ARGS);
 #else
 static DWORD WINAPI process_alarm(LPVOID param);
 #endif
-static void signal_cleanup(int sig);
+static void signal_cleanup(SIGNAL_ARGS);
 
 #ifdef HAVE_FSYNC_WRITETHROUGH
 static int	pg_fsync_writethrough(int fd);
@@ -292,7 +298,7 @@ test_sync(int writes_per_op)
 		printf(_("\nCompare file sync methods using one %dkB write:\n"), XLOG_BLCKSZ_K);
 	else
 		printf(_("\nCompare file sync methods using two %dkB writes:\n"), XLOG_BLCKSZ_K);
-	printf(_("(in wal_sync_method preference order, except fdatasync is Linux's default)\n"));
+	printf(_("(in \"wal_sync_method\" preference order, except fdatasync is Linux's default)\n"));
 
 	/*
 	 * Test open_datasync if available
@@ -331,7 +337,6 @@ test_sync(int writes_per_op)
 	printf(LABEL_FORMAT, "fdatasync");
 	fflush(stdout);
 
-#ifdef HAVE_FDATASYNC
 	if ((tmpfile = open(filename, O_RDWR | PG_BINARY, 0)) == -1)
 		die("could not open output file");
 	START_TIMER;
@@ -347,9 +352,6 @@ test_sync(int writes_per_op)
 	}
 	STOP_TIMER;
 	close(tmpfile);
-#else
-	printf(NA_FORMAT, _("n/a"));
-#endif
 
 /*
  * Test fsync
@@ -594,14 +596,17 @@ test_non_sync(void)
 }
 
 static void
-signal_cleanup(int signum)
+signal_cleanup(SIGNAL_ARGS)
 {
+	int			rc;
+
 	/* Delete the file if it exists. Ignore errors */
 	if (needs_unlink)
 		unlink(filename);
 	/* Finish incomplete line on stdout */
-	puts("");
-	exit(signum);
+	rc = write(STDOUT_FILENO, "\n", 1);
+	(void) rc;					/* silence compiler warnings */
+	_exit(1);
 }
 
 #ifdef HAVE_FSYNC_WRITETHROUGH
@@ -609,9 +614,7 @@ signal_cleanup(int signum)
 static int
 pg_fsync_writethrough(int fd)
 {
-#ifdef WIN32
-	return _commit(fd);
-#elif defined(F_FULLFSYNC)
+#if defined(F_FULLFSYNC)
 	return (fcntl(fd, F_FULLFSYNC, 0) == -1) ? -1 : 0;
 #else
 	errno = ENOSYS;
@@ -627,7 +630,7 @@ static void
 print_elapse(struct timeval start_t, struct timeval stop_t, int ops)
 {
 	double		total_time = (stop_t.tv_sec - start_t.tv_sec) +
-	(stop_t.tv_usec - start_t.tv_usec) * 0.000001;
+		(stop_t.tv_usec - start_t.tv_usec) * 0.000001;
 	double		per_second = ops / total_time;
 	double		avg_op_time_us = (total_time / ops) * USECS_SEC;
 
@@ -636,7 +639,7 @@ print_elapse(struct timeval start_t, struct timeval stop_t, int ops)
 
 #ifndef WIN32
 static void
-process_alarm(int sig)
+process_alarm(SIGNAL_ARGS)
 {
 	alarm_triggered = true;
 }

@@ -23,7 +23,7 @@
  * from LIKE to indexscan limits rather harder than one might think ...
  * but that's the basic idea.)
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,13 +37,13 @@
 #include <math.h>
 
 #include "access/htup_details.h"
-#include "access/stratnum.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
@@ -61,12 +61,12 @@ typedef enum
 	Pattern_Type_Like_IC,
 	Pattern_Type_Regex,
 	Pattern_Type_Regex_IC,
-	Pattern_Type_Prefix
+	Pattern_Type_Prefix,
 } Pattern_Type;
 
 typedef enum
 {
-	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact
+	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact,
 } Pattern_Prefix_Status;
 
 static Node *like_regex_support(Node *rawreq, Pattern_Type ptype);
@@ -1364,6 +1364,9 @@ regex_selectivity_sub(const char *patt, int pattlen, bool case_insensitive)
 	int			paren_pos = 0;	/* dummy init to keep compiler quiet */
 	int			pos;
 
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
 	for (pos = 0; pos < pattlen; pos++)
 	{
 		if (patt[pos] == '(')
@@ -1505,10 +1508,8 @@ pattern_char_isalpha(char c, bool is_multibyte,
 	else if (locale && locale->provider == COLLPROVIDER_ICU)
 		return IS_HIGHBIT_SET(c) ||
 			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-#ifdef HAVE_LOCALE_T
 	else if (locale && locale->provider == COLLPROVIDER_LIBC)
 		return isalpha_l((unsigned char) c, locale->info.lt);
-#endif
 	else
 		return isalpha((unsigned char) c);
 }

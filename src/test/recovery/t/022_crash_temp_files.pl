@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Test remove of temporary files after a crash.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -98,7 +98,7 @@ SELECT $$in-progress-before-sigkill$$;
 INSERT INTO tab_crash (a) SELECT i FROM generate_series(1, 5000) s(i);
 ];
 ok( pump_until(
-		$killme,         $psql_timeout,
+		$killme, $psql_timeout,
 		\$killme_stdout, qr/in-progress-before-sigkill/m),
 	'insert in-progress-before-sigkill');
 $killme_stdout = '';
@@ -205,7 +205,7 @@ SELECT $$in-progress-before-sigkill$$;
 INSERT INTO tab_crash (a) SELECT i FROM generate_series(1, 5000) s(i);
 ];
 ok( pump_until(
-		$killme,         $psql_timeout,
+		$killme, $psql_timeout,
 		\$killme_stdout, qr/in-progress-before-sigkill/m),
 	'insert in-progress-before-sigkill');
 $killme_stdout = '';

@@ -7,6 +7,18 @@
  */
 #include "postgres.h"
 
+#include "access/rmgr.h"
+#include "access/xlog_internal.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "nodes/execnodes.h"
+#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/tuplestore.h"
+
+/* includes needed for "access/rmgrlist.h" */
+/* IWYU pragma: begin_keep */
 #include "access/brin_xlog.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
@@ -19,20 +31,17 @@
 #include "access/nbtxlog.h"
 #include "access/spgxlog.h"
 #include "access/xact.h"
-#include "access/xlog_internal.h"
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
 #include "commands/sequence.h"
 #include "commands/tablespace.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "miscadmin.h"
 #include "replication/decode.h"
 #include "replication/message.h"
 #include "replication/origin.h"
 #include "storage/standby.h"
-#include "utils/builtins.h"
 #include "utils/relmapper.h"
+/* IWYU pragma: end_keep */
+
 
 /* must be kept in sync with RmgrData definition in xlog_internal.h */
 #define PG_RMGR(symname,name,redo,desc,identify,startup,cleanup,mask,decode) \
@@ -82,20 +91,20 @@ void
 RmgrNotFound(RmgrId rmid)
 {
 	ereport(ERROR, (errmsg("resource manager with ID %d not registered", rmid),
-					errhint("Include the extension module that implements this resource manager in shared_preload_libraries.")));
+					errhint("Include the extension module that implements this resource manager in \"shared_preload_libraries\".")));
 }
 
 /*
  * Register a new custom WAL resource manager.
  *
  * Resource manager IDs must be globally unique across all extensions. Refer
- * to https://wiki.postgresql.org/wiki/CustomWALResourceManager to reserve a
+ * to https://wiki.postgresql.org/wiki/CustomWALResourceManagers to reserve a
  * unique RmgrId for your extension, to avoid conflicts with other extension
  * developers. During development, use RM_EXPERIMENTAL_ID to avoid needlessly
  * reserving a new ID.
  */
 void
-RegisterCustomRmgr(RmgrId rmid, RmgrData *rmgr)
+RegisterCustomRmgr(RmgrId rmid, const RmgrData *rmgr)
 {
 	if (rmgr->rm_name == NULL || strlen(rmgr->rm_name) == 0)
 		ereport(ERROR, (errmsg("custom resource manager name is invalid"),
@@ -109,7 +118,7 @@ RegisterCustomRmgr(RmgrId rmid, RmgrData *rmgr)
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errmsg("failed to register custom resource manager \"%s\" with ID %d", rmgr->rm_name, rmid),
-				 errdetail("Custom resource manager must be registered while initializing modules in shared_preload_libraries.")));
+				 errdetail("Custom resource manager must be registered while initializing modules in \"shared_preload_libraries\".")));
 
 	if (RmgrTable[rmid].rm_name != NULL)
 		ereport(ERROR,
@@ -145,7 +154,7 @@ pg_get_wal_resource_managers(PG_FUNCTION_ARGS)
 	Datum		values[PG_GET_RESOURCE_MANAGERS_COLS];
 	bool		nulls[PG_GET_RESOURCE_MANAGERS_COLS] = {0};
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	for (int rmid = 0; rmid <= RM_MAX_ID; rmid++)
 	{

@@ -4,7 +4,7 @@
  *	  definitions for query plan nodes
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/plannodes.h
@@ -16,10 +16,10 @@
 
 #include "access/sdir.h"
 #include "access/stratnum.h"
+#include "common/relpath.h"
 #include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/lockoptions.h"
-#include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 
 
@@ -45,7 +45,7 @@
  */
 typedef struct PlannedStmt
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 
@@ -71,7 +71,10 @@ typedef struct PlannedStmt
 
 	List	   *rtable;			/* list of RangeTblEntry nodes */
 
-	/* rtable indexes of target relations for INSERT/UPDATE/DELETE */
+	List	   *permInfos;		/* list of RTEPermissionInfo nodes for rtable
+								 * entries needing one */
+
+	/* rtable indexes of target relations for INSERT/UPDATE/DELETE/MERGE */
 	List	   *resultRelations;	/* integer list of RT indexes, or NIL */
 
 	List	   *appendRelations;	/* list of AppendRelInfo nodes */
@@ -92,8 +95,8 @@ typedef struct PlannedStmt
 	Node	   *utilityStmt;	/* non-null if this is utility stmt */
 
 	/* statement location in source string (copied from Query) */
-	int			stmt_location;	/* start location, or -1 if unknown */
-	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
+	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -115,7 +118,7 @@ typedef struct PlannedStmt
  */
 typedef struct Plan
 {
-	pg_node_attr(abstract, no_equal)
+	pg_node_attr(abstract, no_equal, no_query_jumble)
 
 	NodeTag		type;
 
@@ -212,11 +215,12 @@ typedef struct ProjectSet
  *		Apply rows produced by outer plan to result table(s),
  *		by inserting, updating, or deleting.
  *
- * If the originally named target table is a partitioned table, both
- * nominalRelation and rootRelation contain the RT index of the partition
- * root, which is not otherwise mentioned in the plan.  Otherwise rootRelation
- * is zero.  However, nominalRelation will always be set, as it's the rel that
- * EXPLAIN should claim is the INSERT/UPDATE/DELETE target.
+ * If the originally named target table is a partitioned table or inheritance
+ * tree, both nominalRelation and rootRelation contain the RT index of the
+ * partition root or appendrel RTE, which is not otherwise mentioned in the
+ * plan.  Otherwise rootRelation is zero.  However, nominalRelation will
+ * always be set, as it's the rel that EXPLAIN should claim is the
+ * INSERT/UPDATE/DELETE/MERGE target.
  *
  * Note that rowMarks and epqParam are presumed to be valid for all the
  * table(s); they can't contain any info that varies across tables.
@@ -228,7 +232,7 @@ typedef struct ModifyTable
 	CmdType		operation;		/* INSERT, UPDATE, DELETE, or MERGE */
 	bool		canSetTag;		/* do we set the command tag/es_processed? */
 	Index		nominalRelation;	/* Parent RT index for use of EXPLAIN */
-	Index		rootRelation;	/* Root RT index, if target is partitioned */
+	Index		rootRelation;	/* Root RT index, if partitioned/inherited */
 	bool		partColsUpdated;	/* some part key in hierarchy updated? */
 	List	   *resultRelations;	/* integer list of RT indexes */
 	List	   *updateColnosLists;	/* per-target-table update_colnos lists */
@@ -247,6 +251,8 @@ typedef struct ModifyTable
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+	List	   *mergeJoinConditions;	/* per-target-table join conditions
+										 * for MERGE */
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -586,7 +592,7 @@ typedef enum SubqueryScanStatus
 {
 	SUBQUERY_SCAN_UNKNOWN,
 	SUBQUERY_SCAN_TRIVIAL,
-	SUBQUERY_SCAN_NONTRIVIAL
+	SUBQUERY_SCAN_NONTRIVIAL,
 } SubqueryScanStatus;
 
 typedef struct SubqueryScan
@@ -688,6 +694,7 @@ typedef struct WorkTableScan
  * When the plan node represents a foreign join, scan.scanrelid is zero and
  * fs_relids must be consulted to identify the join relation.  (fs_relids
  * is valid for simple scans as well, but will always match scan.scanrelid.)
+ * fs_relids includes outer joins; fs_base_relids does not.
  *
  * If the FDW's PlanDirectModify() callback decides to repurpose a ForeignScan
  * node to perform the UPDATE or DELETE operation directly in the remote
@@ -702,12 +709,15 @@ typedef struct ForeignScan
 	Scan		scan;
 	CmdType		operation;		/* SELECT/INSERT/UPDATE/DELETE */
 	Index		resultRelation; /* direct modification target's RT index */
+	Oid			checkAsUser;	/* user to perform the scan as; 0 means to
+								 * check as current user */
 	Oid			fs_server;		/* OID of foreign server */
 	List	   *fdw_exprs;		/* expressions that FDW may evaluate */
 	List	   *fdw_private;	/* private data for FDW */
 	List	   *fdw_scan_tlist; /* optional tlist describing scan tuple */
 	List	   *fdw_recheck_quals;	/* original quals not in scan.plan.qual */
-	Bitmapset  *fs_relids;		/* RTIs generated by this scan */
+	Bitmapset  *fs_relids;		/* base+OJ RTIs generated by this scan */
+	Bitmapset  *fs_base_relids; /* base RTIs generated by this scan */
 	bool		fsSystemCol;	/* true if any "system column" is needed */
 } ForeignScan;
 
@@ -802,7 +812,7 @@ typedef struct NestLoop
 
 typedef struct NestLoopParam
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 	int			paramno;		/* number of the PARAM_EXEC Param to set */
@@ -1301,7 +1311,7 @@ typedef struct Limit
  * doing a separate remote query to lock each selected row is usually pretty
  * unappealing, so early locking remains a credible design choice for FDWs.
  *
- * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we have to uniquely
+ * When doing UPDATE/DELETE/MERGE/SELECT FOR UPDATE/SHARE, we have to uniquely
  * identify all the source rows, not only those from the target relations, so
  * that we can perform EvalPlanQual rechecking at need.  For plain tables we
  * can just fetch the TID, much as for a target relation; this case is
@@ -1321,7 +1331,7 @@ typedef enum RowMarkType
 	ROW_MARK_SHARE,				/* obtain shared tuple lock */
 	ROW_MARK_KEYSHARE,			/* obtain keyshare tuple lock */
 	ROW_MARK_REFERENCE,			/* just fetch the TID, don't lock it */
-	ROW_MARK_COPY				/* physically copy the row value */
+	ROW_MARK_COPY,				/* physically copy the row value */
 } RowMarkType;
 
 #define RowMarkRequiresRowShareLock(marktype)  ((marktype) <= ROW_MARK_KEYSHARE)
@@ -1330,7 +1340,7 @@ typedef enum RowMarkType
  * PlanRowMark -
  *	   plan-time representation of FOR [KEY] UPDATE/SHARE clauses
  *
- * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we create a separate
+ * When doing UPDATE/DELETE/MERGE/SELECT FOR UPDATE/SHARE, we create a separate
  * PlanRowMark node for each non-target relation in the query.  Relations that
  * are not specified as FOR UPDATE/SHARE are marked ROW_MARK_REFERENCE (if
  * regular tables or supported foreign tables) or ROW_MARK_COPY (if not).
@@ -1366,7 +1376,7 @@ typedef enum RowMarkType
  */
 typedef struct PlanRowMark
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 	Index		rti;			/* range table index of markable relation */
@@ -1412,7 +1422,7 @@ typedef struct PlanRowMark
  */
 typedef struct PartitionPruneInfo
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 	List	   *prune_infos;
@@ -1438,7 +1448,7 @@ typedef struct PartitionPruneInfo
  */
 typedef struct PartitionedRelPruneInfo
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 
@@ -1481,7 +1491,7 @@ typedef struct PartitionedRelPruneInfo
  */
 typedef struct PartitionPruneStep
 {
-	pg_node_attr(abstract, no_equal)
+	pg_node_attr(abstract, no_equal, no_query_jumble)
 
 	NodeTag		type;
 	int			step_id;
@@ -1533,7 +1543,7 @@ typedef struct PartitionPruneStepOp
 typedef enum PartitionPruneCombineOp
 {
 	PARTPRUNE_COMBINE_UNION,
-	PARTPRUNE_COMBINE_INTERSECT
+	PARTPRUNE_COMBINE_INTERSECT,
 } PartitionPruneCombineOp;
 
 typedef struct PartitionPruneStepCombine
@@ -1556,7 +1566,7 @@ typedef struct PartitionPruneStepCombine
  */
 typedef struct PlanInvalItem
 {
-	pg_node_attr(no_equal)
+	pg_node_attr(no_equal, no_query_jumble)
 
 	NodeTag		type;
 	int			cacheId;		/* a syscache ID, see utils/syscache.h */
@@ -1577,7 +1587,7 @@ typedef enum MonotonicFunction
 	MONOTONICFUNC_NONE = 0,
 	MONOTONICFUNC_INCREASING = (1 << 0),
 	MONOTONICFUNC_DECREASING = (1 << 1),
-	MONOTONICFUNC_BOTH = MONOTONICFUNC_INCREASING | MONOTONICFUNC_DECREASING
+	MONOTONICFUNC_BOTH = MONOTONICFUNC_INCREASING | MONOTONICFUNC_DECREASING,
 } MonotonicFunction;
 
 #endif							/* PLANNODES_H */

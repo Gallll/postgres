@@ -1,16 +1,15 @@
 #!/usr/bin/perl
 #
 # Generate the errcodes.h header from errcodes.txt
-# Copyright (c) 2000-2022, PostgreSQL Global Development Group
+# Copyright (c) 2000-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Getopt::Long;
 
-my $outfile        = '';
+my $outfile = '';
 
-GetOptions(
-	'outfile=s'   => \$outfile) or die "$0: wrong arguments";
+GetOptions('outfile=s' => \$outfile) or die "$0: wrong arguments";
 
 open my $errcodes, '<', $ARGV[0]
   or die "$0: could not open input file '$ARGV[0]': $!\n";

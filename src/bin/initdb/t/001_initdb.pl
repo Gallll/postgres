@@ -1,12 +1,12 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # To test successful data directory creation with an additional feature, first
 # try to elaborate the "successful creation" test instead of adding a test.
 # Successful initdb consumes much time and I/O.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Fcntl ':mode';
 use File::stat qw{lstat};
 use PostgreSQL::Test::Cluster;
@@ -16,6 +16,7 @@ use Test::More;
 my $tempdir = PostgreSQL::Test::Utils::tempdir;
 my $xlogdir = "$tempdir/pgxlog";
 my $datadir = "$tempdir/data";
+my $supports_syncfs = check_pg_config("#define HAVE_SYNCFS 1");
 
 program_help_ok('initdb');
 program_version_ok('initdb');
@@ -48,7 +49,13 @@ mkdir $datadir;
 	local (%ENV) = %ENV;
 	delete $ENV{TZ};
 
-	command_ok([ 'initdb', '-N', '-T', 'german', '-X', $xlogdir, $datadir ],
+	# while we are here, also exercise -T and -c options
+	command_ok(
+		[
+			'initdb', '-N', '-T', 'german', '-c',
+			'default_text_search_config=german',
+			'-X', $xlogdir, $datadir
+		],
 		'successful creation');
 
 	# Permissions on PGDATA should be default
@@ -76,6 +83,17 @@ command_fails([ 'pg_checksums', '-D', $datadir ],
 command_ok([ 'initdb', '-S', $datadir ], 'sync only');
 command_fails([ 'initdb', $datadir ], 'existing data directory');
 
+if ($supports_syncfs)
+{
+	command_ok([ 'initdb', '-S', $datadir, '--sync-method', 'syncfs' ],
+		'sync method syncfs');
+}
+else
+{
+	command_fails([ 'initdb', '-S', $datadir, '--sync-method', 'syncfs' ],
+		'sync method syncfs');
+}
+
 # Check group access on PGDATA
 SKIP:
 {
@@ -99,25 +117,65 @@ if ($ENV{with_icu} eq 'yes')
 {
 	command_fails_like(
 		[ 'initdb', '--no-sync', '--locale-provider=icu', "$tempdir/data2" ],
-		qr/initdb: error: ICU locale must be specified/,
+		qr/initdb: error: locale must be specified if provider is icu/,
 		'locale provider ICU requires --icu-locale');
 
 	command_ok(
 		[
-			'initdb',                '--no-sync',
+			'initdb', '--no-sync',
 			'--locale-provider=icu', '--icu-locale=en',
 			"$tempdir/data3"
 		],
 		'option --icu-locale');
 
+	command_like(
+		[
+			'initdb', '--no-sync',
+			'-A', 'trust',
+			'--locale-provider=icu', '--locale=und',
+			'--lc-collate=C', '--lc-ctype=C',
+			'--lc-messages=C', '--lc-numeric=C',
+			'--lc-monetary=C', '--lc-time=C',
+			"$tempdir/data4"
+		],
+		qr/^\s+default collation:\s+und\n/ms,
+		'options --locale-provider=icu --locale=und --lc-*=C');
+
 	command_fails_like(
 		[
-			'initdb',                '--no-sync',
+			'initdb', '--no-sync',
 			'--locale-provider=icu', '--icu-locale=@colNumeric=lower',
 			"$tempdir/dataX"
 		],
-		qr/FATAL:  could not open collator for locale/,
+		qr/could not open collator for locale/,
 		'fails for invalid ICU locale');
+
+	command_fails_like(
+		[
+			'initdb', '--no-sync',
+			'--locale-provider=icu', '--encoding=SQL_ASCII',
+			'--icu-locale=en', "$tempdir/dataX"
+		],
+		qr/error: encoding mismatch/,
+		'fails for encoding not supported by ICU');
+
+	command_fails_like(
+		[
+			'initdb', '--no-sync',
+			'--locale-provider=icu', '--icu-locale=nonsense-nowhere',
+			"$tempdir/dataX"
+		],
+		qr/error: locale "nonsense-nowhere" has unknown language "nonsense"/,
+		'fails for nonsense language');
+
+	command_fails_like(
+		[
+			'initdb', '--no-sync',
+			'--locale-provider=icu', '--icu-locale=@colNumeric=lower',
+			"$tempdir/dataX"
+		],
+		qr/could not open collator for locale "und-u-kn-lower": U_ILLEGAL_ARGUMENT_ERROR/,
+		'fails for invalid collation argument');
 }
 else
 {
@@ -127,15 +185,87 @@ else
 }
 
 command_fails(
+	[ 'initdb', '--no-sync', '--locale-provider=builtin', "$tempdir/data6" ],
+	'locale provider builtin fails without --locale');
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--locale=C',
+		"$tempdir/data7"
+	],
+	'locale provider builtin with --locale');
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '-E UTF-8',
+		'--lc-collate=C', '--lc-ctype=C',
+		'--builtin-locale=C.UTF-8', "$tempdir/data8"
+	],
+	'locale provider builtin with -E UTF-8 --builtin-locale=C.UTF-8');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '-E SQL_ASCII',
+		'--lc-collate=C', '--lc-ctype=C',
+		'--builtin-locale=C.UTF-8', "$tempdir/data9"
+	],
+	'locale provider builtin with --builtin-locale=C.UTF-8 fails for SQL_ASCII'
+);
+
+command_ok(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--lc-ctype=C',
+		'--locale=C', "$tempdir/data10"
+	],
+	'locale provider builtin with --lc-ctype');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--icu-locale=en',
+		"$tempdir/dataX"
+	],
+	'fails for locale provider builtin with ICU locale');
+
+command_fails(
+	[
+		'initdb', '--no-sync',
+		'--locale-provider=builtin', '--icu-rules=""',
+		"$tempdir/dataX"
+	],
+	'fails for locale provider builtin with ICU rules');
+
+command_fails(
 	[ 'initdb', '--no-sync', '--locale-provider=xyz', "$tempdir/dataX" ],
 	'fails for invalid locale provider');
 
 command_fails(
 	[
-		'initdb',                 '--no-sync',
+		'initdb', '--no-sync',
 		'--locale-provider=libc', '--icu-locale=en',
 		"$tempdir/dataX"
 	],
 	'fails for invalid option combination');
+
+command_fails([ 'initdb', '--no-sync', '--set', 'foo=bar', "$tempdir/dataX" ],
+	'fails for invalid --set option');
+
+# Make sure multiple invocations of -c parameters are added case insensitive
+command_ok(
+	[
+		'initdb', '-cwork_mem=128',
+		'-cWork_Mem=256', '-cWORK_MEM=512',
+		"$tempdir/dataY"
+	],
+	'multiple -c options with different case');
+
+my $conf = slurp_file("$tempdir/dataY/postgresql.conf");
+ok($conf !~ qr/^WORK_MEM = /m, "WORK_MEM should not be configured");
+ok($conf !~ qr/^Work_Mem = /m, "Work_Mem should not be configured");
+ok($conf =~ qr/^work_mem = 512/m, "work_mem should be in config");
 
 done_testing();

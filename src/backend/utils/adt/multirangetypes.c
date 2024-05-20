@@ -21,7 +21,7 @@
  *	for a particular range index.  Offsets are counted starting from the end of
  *	flags aligned to the bound type.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,14 +37,13 @@
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
-#include "miscadmin.h"
+#include "nodes/nodes.h"
 #include "port/pg_bitutils.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "utils/rangetypes.h"
 #include "utils/multirangetypes.h"
-#include "utils/array.h"
-#include "utils/memutils.h"
+#include "utils/rangetypes.h"
 
 /* fn_extra cache entry for one of the range I/O functions */
 typedef struct MultirangeIOData
@@ -120,6 +119,7 @@ multirange_in(PG_FUNCTION_ARGS)
 	char	   *input_str = PG_GETARG_CSTRING(0);
 	Oid			mltrngtypoid = PG_GETARG_OID(1);
 	Oid			typmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	TypeCacheEntry *rangetyp;
 	int32		ranges_seen = 0;
 	int32		range_count = 0;
@@ -133,6 +133,7 @@ multirange_in(PG_FUNCTION_ARGS)
 	const char *range_str_begin = NULL;
 	int32		range_str_len;
 	char	   *range_str;
+	Datum		range_datum;
 
 	cache = get_multirange_io_data(fcinfo, mltrngtypoid, IOFunc_input);
 	rangetyp = cache->typcache->rngtype;
@@ -144,7 +145,7 @@ multirange_in(PG_FUNCTION_ARGS)
 	if (*ptr == '{')
 		ptr++;
 	else
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed multirange literal: \"%s\"",
 						input_str),
@@ -157,7 +158,7 @@ multirange_in(PG_FUNCTION_ARGS)
 		char		ch = *ptr;
 
 		if (ch == '\0')
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("malformed multirange literal: \"%s\"",
 							input_str),
@@ -186,7 +187,7 @@ multirange_in(PG_FUNCTION_ARGS)
 					parse_state = MULTIRANGE_AFTER_RANGE;
 				}
 				else
-					ereport(ERROR,
+					ereturn(escontext, (Datum) 0,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("malformed multirange literal: \"%s\"",
 									input_str),
@@ -204,10 +205,14 @@ multirange_in(PG_FUNCTION_ARGS)
 							repalloc(ranges, range_capacity * sizeof(RangeType *));
 					}
 					ranges_seen++;
-					range = DatumGetRangeTypeP(InputFunctionCall(&cache->typioproc,
-																 range_str,
-																 cache->typioparam,
-																 typmod));
+					if (!InputFunctionCallSafe(&cache->typioproc,
+											   range_str,
+											   cache->typioparam,
+											   typmod,
+											   escontext,
+											   &range_datum))
+						PG_RETURN_NULL();
+					range = DatumGetRangeTypeP(range_datum);
 					if (!RangeIsEmpty(range))
 						ranges[range_count++] = range;
 					parse_state = MULTIRANGE_AFTER_RANGE;
@@ -256,7 +261,7 @@ multirange_in(PG_FUNCTION_ARGS)
 				else if (ch == '}')
 					parse_state = MULTIRANGE_FINISHED;
 				else
-					ereport(ERROR,
+					ereturn(escontext, (Datum) 0,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("malformed multirange literal: \"%s\"",
 									input_str),
@@ -280,7 +285,7 @@ multirange_in(PG_FUNCTION_ARGS)
 		ptr++;
 
 	if (*ptr != '\0')
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed multirange literal: \"%s\"",
 						input_str),
@@ -325,7 +330,7 @@ multirange_out(PG_FUNCTION_ARGS)
 }
 
 /*
- * Binary representation: First a int32-sized count of ranges, followed by
+ * Binary representation: First an int32-sized count of ranges, followed by
  * ranges in their native binary representation.
  */
 Datum
@@ -807,7 +812,7 @@ multirange_get_union_range(TypeCacheEntry *rangetyp,
 	multirange_get_bounds(rangetyp, mr, 0, &lower, &tmp);
 	multirange_get_bounds(rangetyp, mr, mr->rangeCount - 1, &tmp, &upper);
 
-	return make_range(rangetyp, &lower, &upper, false);
+	return make_range(rangetyp, &lower, &upper, false, NULL);
 }
 
 
@@ -1491,7 +1496,7 @@ multirange_intersect_agg_transfn(PG_FUNCTION_ARGS)
 										   ranges1,
 										   range_count2,
 										   ranges2);
-	PG_RETURN_RANGE_P(result);
+	PG_RETURN_MULTIRANGE_P(result);
 }
 
 
@@ -2696,7 +2701,8 @@ range_merge_from_multirange(PG_FUNCTION_ARGS)
 		multirange_get_bounds(typcache->rngtype, mr, mr->rangeCount - 1,
 							  &lastLower, &lastUpper);
 
-		result = make_range(typcache->rngtype, &firstLower, &lastUpper, false);
+		result = make_range(typcache->rngtype, &firstLower, &lastUpper,
+							false, NULL);
 	}
 
 	PG_RETURN_RANGE_P(result);

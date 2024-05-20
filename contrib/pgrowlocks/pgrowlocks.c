@@ -75,15 +75,11 @@ pgrowlocks(PG_FUNCTION_ARGS)
 	AclResult	aclresult;
 	char	  **values;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* Access the table */
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
-
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("only heap AM is supported")));
 
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
@@ -96,6 +92,10 @@ pgrowlocks(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table",
 						RelationGetRelationName(rel))));
+	else if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("only heap AM is supported")));
 
 	/*
 	 * check permissions: must have SELECT on table or be in
@@ -200,10 +200,10 @@ pgrowlocks(PG_FUNCTION_ARGS)
 								snprintf(buf, NCHARS, "For No Key Update");
 								break;
 							case MultiXactStatusForShare:
-								snprintf(buf, NCHARS, "Share");
+								snprintf(buf, NCHARS, "For Share");
 								break;
 							case MultiXactStatusForKeyShare:
-								snprintf(buf, NCHARS, "Key Share");
+								snprintf(buf, NCHARS, "For Key Share");
 								break;
 						}
 						strcat(values[Atnum_modes], buf);

@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,19 +26,16 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/typecmds.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "parser/scansup.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-static char *makeUniqueTypeName(const char *typeName, Oid typeNamespace,
-								bool tryOriginal);
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_pg_type_oid = InvalidOid;
@@ -328,14 +325,15 @@ TypeCreate(Oid newTypeOid,
 				 errmsg("fixed-size types must have storage PLAIN")));
 
 	/*
-	 * This is a dependent type if it's an implicitly-created array type, or
-	 * if it's a relation rowtype that's not a composite type.  For such types
-	 * we'll leave the ACL empty, and we'll skip creating some dependency
-	 * records because there will be a dependency already through the
-	 * depended-on type or relation.  (Caution: this is closely intertwined
-	 * with some behavior in GenerateTypeDependencies.)
+	 * This is a dependent type if it's an implicitly-created array type or
+	 * multirange type, or if it's a relation rowtype that's not a composite
+	 * type.  For such types we'll leave the ACL empty, and we'll skip
+	 * creating some dependency records because there will be a dependency
+	 * already through the depended-on type or relation.  (Caution: this is
+	 * closely intertwined with some behavior in GenerateTypeDependencies.)
 	 */
 	isDependentType = isImplicitArray ||
+		typeType == TYPTYPE_MULTIRANGE ||
 		(OidIsValid(relationOid) && relationKind != RELKIND_COMPOSITE_TYPE);
 
 	/*
@@ -536,11 +534,12 @@ TypeCreate(Oid newTypeOid,
  * relationKind and isImplicitArray are likewise somewhat expensive to deduce
  * from the tuple, so we make callers pass those (they're not optional).
  *
- * isDependentType is true if this is an implicit array or relation rowtype;
- * that means it doesn't need its own dependencies on owner etc.
+ * isDependentType is true if this is an implicit array, multirange, or
+ * relation rowtype; that means it doesn't need its own dependencies on owner
+ * etc.
  *
  * We make an extension-membership dependency if we're in an extension
- * script and makeExtensionDep is true (and isDependentType isn't true).
+ * script and makeExtensionDep is true.
  * makeExtensionDep should be true when creating a new type or replacing a
  * shell type, but not for ALTER TYPE on an existing type.  Passing false
  * causes the type's extension membership to be left alone.
@@ -548,8 +547,11 @@ TypeCreate(Oid newTypeOid,
  * rebuild should be true if this is a pre-existing type.  We will remove
  * existing dependencies and rebuild them from scratch.  This is needed for
  * ALTER TYPE, and also when replacing a shell type.  We don't remove any
- * existing extension dependency, though (hence, if makeExtensionDep is also
- * true and the type belongs to some other extension, an error will occur).
+ * existing extension dependency, though; hence, if makeExtensionDep is also
+ * true and we're in an extension script, an error will occur unless the
+ * type already belongs to the current extension.  That's the behavior we
+ * want when replacing a shell type, which is the only case where both flags
+ * are true.
  */
 void
 GenerateTypeDependencies(HeapTuple typeTuple,
@@ -597,30 +599,42 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 	ObjectAddressSet(myself, TypeRelationId, typeObjectId);
 
 	/*
-	 * Make dependencies on namespace, owner, ACL, extension.
+	 * Make dependencies on namespace, owner, ACL.
 	 *
 	 * Skip these for a dependent type, since it will have such dependencies
-	 * indirectly through its depended-on type or relation.
+	 * indirectly through its depended-on type or relation.  An exception is
+	 * that multiranges need their own namespace dependency, since we don't
+	 * force them to be in the same schema as their range type.
 	 */
 
-	/* placeholder for all normal dependencies */
+	/* collects normal dependencies for bulk recording */
 	addrs_normal = new_object_addresses();
 
-	if (!isDependentType)
+	if (!isDependentType || typeForm->typtype == TYPTYPE_MULTIRANGE)
 	{
 		ObjectAddressSet(referenced, NamespaceRelationId,
 						 typeForm->typnamespace);
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		add_exact_object_address(&referenced, addrs_normal);
+	}
 
+	if (!isDependentType)
+	{
 		recordDependencyOnOwner(TypeRelationId, typeObjectId,
 								typeForm->typowner);
 
 		recordDependencyOnNewAcl(TypeRelationId, typeObjectId, 0,
 								 typeForm->typowner, typacl);
-
-		if (makeExtensionDep)
-			recordDependencyOnCurrentExtension(&myself, rebuild);
 	}
+
+	/*
+	 * Make extension dependency if requested.
+	 *
+	 * We used to skip this for dependent types, but it seems better to record
+	 * their extension membership explicitly; otherwise code such as
+	 * postgres_fdw's shippability test will be fooled.
+	 */
+	if (makeExtensionDep)
+		recordDependencyOnCurrentExtension(&myself, rebuild);
 
 	/* Normal dependencies on the I/O and support functions */
 	if (OidIsValid(typeForm->typinput))
@@ -726,6 +740,16 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 		recordDependencyOn(&myself, &referenced,
 						   isImplicitArray ? DEPENDENCY_INTERNAL : DEPENDENCY_NORMAL);
 	}
+
+	/*
+	 * Note: you might expect that we should record an internal dependency of
+	 * a multirange on its range type here, by analogy with the cases above.
+	 * But instead, that is done by RangeCreate(), which also handles
+	 * recording of other range-type-specific dependencies.  That's pretty
+	 * bogus.  It's okay for now, because there are no cases where we need to
+	 * regenerate the dependencies of a range or multirange type.  But someday
+	 * we might need to move that logic here to allow such regeneration.
+	 */
 }
 
 /*
@@ -815,16 +839,41 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 char *
 makeArrayTypeName(const char *typeName, Oid typeNamespace)
 {
-	char	   *arr;
+	char	   *arr_name;
+	int			pass = 0;
+	char		suffix[NAMEDATALEN];
 
-	arr = makeUniqueTypeName(typeName, typeNamespace, false);
-	if (arr == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("could not form array type name for type \"%s\"",
-						typeName)));
+	/*
+	 * Per ancient Postgres tradition, array type names are made by prepending
+	 * an underscore to the base type name.  Much client code knows that
+	 * convention, so don't muck with it.  However, the tradition is less
+	 * clear about what to do in the corner cases where the resulting name is
+	 * too long or conflicts with an existing name.  Our current rules are (1)
+	 * truncate the base name on the right as needed, and (2) if there is a
+	 * conflict, append another underscore and some digits chosen to make it
+	 * unique.  This is similar to what ChooseRelationName() does.
+	 *
+	 * The actual name generation can be farmed out to makeObjectName() by
+	 * giving it an empty first name component.
+	 */
 
-	return arr;
+	/* First, try with no numeric suffix */
+	arr_name = makeObjectName("", typeName, NULL);
+
+	for (;;)
+	{
+		if (!SearchSysCacheExists2(TYPENAMENSP,
+								   CStringGetDatum(arr_name),
+								   ObjectIdGetDatum(typeNamespace)))
+			break;
+
+		/* That attempt conflicted.  Prepare a new name with some digits. */
+		pfree(arr_name);
+		snprintf(suffix, sizeof(suffix), "%d", ++pass);
+		arr_name = makeObjectName("", typeName, suffix);
+	}
+
+	return arr_name;
 }
 
 
@@ -930,49 +979,4 @@ makeMultirangeTypeName(const char *rangeTypeName, Oid typeNamespace)
 				 errhint("You can manually specify a multirange type name using the \"multirange_type_name\" attribute.")));
 
 	return pstrdup(buf);
-}
-
-/*
- * makeUniqueTypeName
- *		Generate a unique name for a prospective new type
- *
- * Given a typeName, return a new palloc'ed name by prepending underscores
- * until a non-conflicting name results.
- *
- * If tryOriginal, first try with zero underscores.
- */
-static char *
-makeUniqueTypeName(const char *typeName, Oid typeNamespace, bool tryOriginal)
-{
-	int			i;
-	int			namelen;
-	char		dest[NAMEDATALEN];
-
-	Assert(strlen(typeName) <= NAMEDATALEN - 1);
-
-	if (tryOriginal &&
-		!SearchSysCacheExists2(TYPENAMENSP,
-							   CStringGetDatum(typeName),
-							   ObjectIdGetDatum(typeNamespace)))
-		return pstrdup(typeName);
-
-	/*
-	 * The idea is to prepend underscores as needed until we make a name that
-	 * doesn't collide with anything ...
-	 */
-	namelen = strlen(typeName);
-	for (i = 1; i < NAMEDATALEN - 1; i++)
-	{
-		dest[i - 1] = '_';
-		strlcpy(dest + i, typeName, NAMEDATALEN - i);
-		if (namelen + i >= NAMEDATALEN)
-			truncate_identifier(dest, NAMEDATALEN, false);
-
-		if (!SearchSysCacheExists2(TYPENAMENSP,
-								   CStringGetDatum(dest),
-								   ObjectIdGetDatum(typeNamespace)))
-			return pstrdup(dest);
-	}
-
-	return NULL;
 }

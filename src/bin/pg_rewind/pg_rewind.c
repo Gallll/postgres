@@ -3,7 +3,7 @@
  * pg_rewind.c
  *	  Synchronizes a PostgreSQL data directory to a new timeline
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -22,6 +22,7 @@
 #include "common/file_perm.h"
 #include "common/restricted_token.h"
 #include "common/string.h"
+#include "fe_utils/option_utils.h"
 #include "fe_utils/recovery_gen.h"
 #include "fe_utils/string_utils.h"
 #include "file_ops.h"
@@ -45,7 +46,13 @@ static void digestControlFile(ControlFileData *ControlFile,
 							  const char *content, size_t size);
 static void getRestoreCommand(const char *argv0);
 static void sanityChecks(void);
-static void findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex);
+static TimeLineHistoryEntry *getTimelineHistory(TimeLineID tli, bool is_source,
+												int *nentries);
+static void findCommonAncestorTimeline(TimeLineHistoryEntry *a_history,
+									   int a_nentries,
+									   TimeLineHistoryEntry *b_history,
+									   int b_nentries,
+									   XLogRecPtr *recptr, int *tliIndex);
 static void ensureCleanShutdown(const char *argv0);
 static void disconnect_atexit(void);
 
@@ -68,6 +75,7 @@ bool		showprogress = false;
 bool		dry_run = false;
 bool		do_sync = true;
 bool		restore_wal = false;
+DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 /* Target history */
 TimeLineHistoryEntry *targetHistory;
@@ -86,7 +94,7 @@ usage(const char *progname)
 	printf(_("%s resynchronizes a PostgreSQL cluster with another copy of the cluster.\n\n"), progname);
 	printf(_("Usage:\n  %s [OPTION]...\n\n"), progname);
 	printf(_("Options:\n"));
-	printf(_("  -c, --restore-target-wal       use restore_command in target configuration to\n"
+	printf(_("  -c, --restore-target-wal       use \"restore_command\" in target configuration to\n"
 			 "                                 retrieve WAL files from archives\n"));
 	printf(_("  -D, --target-pgdata=DIRECTORY  existing data directory to modify\n"));
 	printf(_("      --source-pgdata=DIRECTORY  source data directory to synchronize with\n"));
@@ -101,6 +109,7 @@ usage(const char *progname)
 			 "                                 file when running target cluster\n"));
 	printf(_("      --debug                    write a lot of debug messages\n"));
 	printf(_("      --no-ensure-shutdown       do not automatically fix unclean shutdown\n"));
+	printf(_("      --sync-method=METHOD       set method for syncing files to disk\n"));
 	printf(_("  -V, --version                  output version information, then exit\n"));
 	printf(_("  -?, --help                     show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
@@ -125,6 +134,7 @@ main(int argc, char **argv)
 		{"no-sync", no_argument, NULL, 'N'},
 		{"progress", no_argument, NULL, 'P'},
 		{"debug", no_argument, NULL, 3},
+		{"sync-method", required_argument, NULL, 6},
 		{NULL, 0, NULL, 0}
 	};
 	int			option_index;
@@ -134,6 +144,8 @@ main(int argc, char **argv)
 	XLogRecPtr	chkptrec;
 	TimeLineID	chkpttli;
 	XLogRecPtr	chkptredo;
+	TimeLineID	source_tli;
+	TimeLineID	target_tli;
 	XLogRecPtr	target_wal_endrec;
 	size_t		size;
 	char	   *buffer;
@@ -208,6 +220,11 @@ main(int argc, char **argv)
 
 			case 5:
 				config_file = pg_strdup(optarg);
+				break;
+
+			case 6:
+				if (!parse_sync_method(optarg, &sync_method))
+					exit(1);
 				break;
 
 			default:
@@ -333,13 +350,27 @@ main(int argc, char **argv)
 	sanityChecks();
 
 	/*
+	 * Usually, the TLI can be found in the latest checkpoint record. But if
+	 * the source server is just being promoted (or it's a standby that's
+	 * following a primary that's just being promoted), and the checkpoint
+	 * requested by the promotion hasn't completed yet, the latest timeline is
+	 * in minRecoveryPoint. So we check which is later, the TLI of the
+	 * minRecoveryPoint or the latest checkpoint.
+	 */
+	source_tli = Max(ControlFile_source.minRecoveryPointTLI,
+					 ControlFile_source.checkPointCopy.ThisTimeLineID);
+
+	/* Similarly for the target. */
+	target_tli = Max(ControlFile_target.minRecoveryPointTLI,
+					 ControlFile_target.checkPointCopy.ThisTimeLineID);
+
+	/*
 	 * Find the common ancestor timeline between the clusters.
 	 *
 	 * If both clusters are already on the same timeline, there's nothing to
 	 * do.
 	 */
-	if (ControlFile_target.checkPointCopy.ThisTimeLineID ==
-		ControlFile_source.checkPointCopy.ThisTimeLineID)
+	if (target_tli == source_tli)
 	{
 		pg_log_info("source and target cluster are on the same timeline");
 		rewind_needed = false;
@@ -348,11 +379,30 @@ main(int argc, char **argv)
 	else
 	{
 		XLogRecPtr	chkptendrec;
+		TimeLineHistoryEntry *sourceHistory;
+		int			sourceNentries;
 
-		findCommonAncestorTimeline(&divergerec, &lastcommontliIndex);
+		/*
+		 * Retrieve timelines for both source and target, and find the point
+		 * where they diverged.
+		 */
+		sourceHistory = getTimelineHistory(source_tli, true, &sourceNentries);
+		targetHistory = getTimelineHistory(target_tli, false, &targetNentries);
+
+		findCommonAncestorTimeline(sourceHistory, sourceNentries,
+								   targetHistory, targetNentries,
+								   &divergerec, &lastcommontliIndex);
+
 		pg_log_info("servers diverged at WAL location %X/%X on timeline %u",
 					LSN_FORMAT_ARGS(divergerec),
 					targetHistory[lastcommontliIndex].tli);
+
+		/*
+		 * Don't need the source history anymore. The target history is still
+		 * needed by the routines in parsexlog.c, when we read the target WAL.
+		 */
+		pfree(sourceHistory);
+
 
 		/*
 		 * Determine the end-of-WAL on the target.
@@ -401,7 +451,7 @@ main(int argc, char **argv)
 		pg_log_info("no rewind required");
 		if (writerecoveryconf && !dry_run)
 			WriteRecoveryConfig(conn, datadir_target,
-								GenerateRecoveryConfig(conn, NULL));
+								GenerateRecoveryConfig(conn, NULL, NULL));
 		exit(0);
 	}
 
@@ -475,7 +525,7 @@ main(int argc, char **argv)
 	/* Also update the standby configuration, if requested. */
 	if (writerecoveryconf && !dry_run)
 		WriteRecoveryConfig(conn, datadir_target,
-							GenerateRecoveryConfig(conn, NULL));
+							GenerateRecoveryConfig(conn, NULL, NULL));
 
 	/* don't need the source connection anymore */
 	source->destroy(source);
@@ -654,7 +704,8 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 				pg_fatal("source system was in unexpected state at end of rewind");
 
 			endrec = source->get_current_wal_insert_lsn(source);
-			endtli = ControlFile_source_after.checkPointCopy.ThisTimeLineID;
+			endtli = Max(ControlFile_source_after.checkPointCopy.ThisTimeLineID,
+						 ControlFile_source_after.minRecoveryPointTLI);
 		}
 	}
 	else
@@ -796,16 +847,12 @@ MinXLogRecPtr(XLogRecPtr a, XLogRecPtr b)
 }
 
 /*
- * Retrieve timeline history for given control file which should behold
- * either source or target.
+ * Retrieve timeline history for the source or target system.
  */
 static TimeLineHistoryEntry *
-getTimelineHistory(ControlFileData *controlFile, int *nentries)
+getTimelineHistory(TimeLineID tli, bool is_source, int *nentries)
 {
 	TimeLineHistoryEntry *history;
-	TimeLineID	tli;
-
-	tli = controlFile->checkPointCopy.ThisTimeLineID;
 
 	/*
 	 * Timeline 1 does not have a history file, so there is no need to check
@@ -826,12 +873,10 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 		TLHistoryFilePath(path, tli);
 
 		/* Get history file from appropriate source */
-		if (controlFile == &ControlFile_source)
+		if (is_source)
 			histfile = source->fetch_file(source, path, NULL);
-		else if (controlFile == &ControlFile_target)
-			histfile = slurpFile(datadir_target, path, NULL);
 		else
-			pg_fatal("invalid control file");
+			histfile = slurpFile(datadir_target, path, NULL);
 
 		history = rewind_parseTimeLineHistory(histfile, tli, nentries);
 		pg_free(histfile);
@@ -841,12 +886,10 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 	{
 		int			i;
 
-		if (controlFile == &ControlFile_source)
+		if (is_source)
 			pg_log_debug("Source timeline history:");
-		else if (controlFile == &ControlFile_target)
-			pg_log_debug("Target timeline history:");
 		else
-			Assert(false);
+			pg_log_debug("Target timeline history:");
 
 		/*
 		 * Print the target timeline history.
@@ -866,27 +909,18 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 }
 
 /*
- * Determine the TLI of the last common timeline in the timeline history of the
- * two clusters. targetHistory is filled with target timeline history and
- * targetNentries is number of items in targetHistory. *tliIndex is set to the
- * index of last common timeline in targetHistory array, and *recptr is set to
- * the position where the timeline history diverged (ie. the first WAL record
- * that's not the same in both clusters).
- *
- * Control files of both clusters must be read into ControlFile_target/source
- * before calling this routine.
+ * Determine the TLI of the last common timeline in the timeline history of
+ * two clusters. *tliIndex is set to the index of last common timeline in
+ * the arrays, and *recptr is set to the position where the timeline history
+ * diverged (ie. the first WAL record that's not the same in both clusters).
  */
 static void
-findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex)
+findCommonAncestorTimeline(TimeLineHistoryEntry *a_history, int a_nentries,
+						   TimeLineHistoryEntry *b_history, int b_nentries,
+						   XLogRecPtr *recptr, int *tliIndex)
 {
-	TimeLineHistoryEntry *sourceHistory;
-	int			sourceNentries;
 	int			i,
 				n;
-
-	/* Retrieve timelines for both source and target */
-	sourceHistory = getTimelineHistory(&ControlFile_source, &sourceNentries);
-	targetHistory = getTimelineHistory(&ControlFile_target, &targetNentries);
 
 	/*
 	 * Trace the history forward, until we hit the timeline diverge. It may
@@ -896,21 +930,19 @@ findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex)
 	 * recovery processes. Hence check the start position of the new timeline
 	 * as well and move down by one extra timeline entry if they do not match.
 	 */
-	n = Min(sourceNentries, targetNentries);
+	n = Min(a_nentries, b_nentries);
 	for (i = 0; i < n; i++)
 	{
-		if (sourceHistory[i].tli != targetHistory[i].tli ||
-			sourceHistory[i].begin != targetHistory[i].begin)
+		if (a_history[i].tli != b_history[i].tli ||
+			a_history[i].begin != b_history[i].begin)
 			break;
 	}
 
 	if (i > 0)
 	{
 		i--;
-		*recptr = MinXLogRecPtr(sourceHistory[i].end, targetHistory[i].end);
+		*recptr = MinXLogRecPtr(a_history[i].end, b_history[i].end);
 		*tliIndex = i;
-
-		pg_free(sourceHistory);
 		return;
 	}
 	else
@@ -1000,10 +1032,14 @@ digestControlFile(ControlFileData *ControlFile, const char *content,
 	WalSegSz = ControlFile->xlog_seg_size;
 
 	if (!IsValidWalSegSize(WalSegSz))
-		pg_fatal(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d byte",
-						  "WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d bytes",
-						  WalSegSz),
-				 WalSegSz);
+	{
+		pg_log_error(ngettext("invalid WAL segment size in control file (%d byte)",
+							  "invalid WAL segment size in control file (%d bytes)",
+							  WalSegSz),
+					 WalSegSz);
+		pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
+		exit(1);
+	}
 
 	/* Additional checks on control file */
 	checkControlFile(ControlFile);
@@ -1019,8 +1055,7 @@ static void
 getRestoreCommand(const char *argv0)
 {
 	int			rc;
-	char		postgres_exec_path[MAXPGPATH],
-				cmd_output[MAXPGPATH];
+	char		postgres_exec_path[MAXPGPATH];
 	PQExpBuffer postgres_cmd;
 
 	if (!restore_wal)
@@ -1069,17 +1104,16 @@ getRestoreCommand(const char *argv0)
 	/* add -C switch, for restore_command */
 	appendPQExpBufferStr(postgres_cmd, " -C restore_command");
 
-	if (!pipe_read_line(postgres_cmd->data, cmd_output, sizeof(cmd_output)))
-		exit(1);
+	restore_command = pipe_read_line(postgres_cmd->data);
+	if (restore_command == NULL)
+		pg_fatal("unable to read restore_command from target cluster");
 
-	(void) pg_strip_crlf(cmd_output);
+	(void) pg_strip_crlf(restore_command);
 
-	if (strcmp(cmd_output, "") == 0)
-		pg_fatal("restore_command is not set in the target cluster");
+	if (strcmp(restore_command, "") == 0)
+		pg_fatal("\"restore_command\" is not set in the target cluster");
 
-	restore_command = pg_strdup(cmd_output);
-
-	pg_log_debug("using for rewind restore_command = \'%s\'",
+	pg_log_debug("using for rewind \"restore_command = \'%s\'\"",
 				 restore_command);
 
 	destroyPQExpBuffer(postgres_cmd);
@@ -1094,7 +1128,6 @@ static void
 ensureCleanShutdown(const char *argv0)
 {
 	int			ret;
-#define MAXCMDLEN (2 * MAXPGPATH)
 	char		exec_path[MAXPGPATH];
 	PQExpBuffer postgres_cmd;
 
@@ -1151,6 +1184,7 @@ ensureCleanShutdown(const char *argv0)
 	appendPQExpBufferStr(postgres_cmd, " template1 < ");
 	appendShellString(postgres_cmd, DEVNULL);
 
+	fflush(NULL);
 	if (system(postgres_cmd->data) != 0)
 	{
 		pg_log_error("postgres single-user mode in target cluster failed");

@@ -50,6 +50,8 @@ INSERT INTO TIMESTAMPTZ_TBL VALUES ('-infinity');
 INSERT INTO TIMESTAMPTZ_TBL VALUES ('infinity');
 INSERT INTO TIMESTAMPTZ_TBL VALUES ('epoch');
 
+SELECT timestamptz 'infinity' = timestamptz '+infinity' AS t;
+
 -- Postgres v6.0 standard output format
 INSERT INTO TIMESTAMPTZ_TBL VALUES ('Mon Feb 10 17:32:01 1997 PST');
 
@@ -106,6 +108,13 @@ SELECT '20500110 173201 Europe/Helsinki'::timestamptz; -- non-DST
 
 SELECT '205000-07-10 17:32:01 Europe/Helsinki'::timestamptz; -- DST
 SELECT '205000-01-10 17:32:01 Europe/Helsinki'::timestamptz; -- non-DST
+
+-- Test non-error-throwing API
+SELECT pg_input_is_valid('now', 'timestamptz');
+SELECT pg_input_is_valid('garbage', 'timestamptz');
+SELECT pg_input_is_valid('2001-01-01 00:00 Nehwon/Lankhmar', 'timestamptz');
+SELECT * FROM pg_input_error_info('garbage', 'timestamptz');
+SELECT * FROM pg_input_error_info('2001-01-01 00:00 Nehwon/Lankhmar', 'timestamptz');
 
 -- Check date conversion and date arithmetic
 INSERT INTO TIMESTAMPTZ_TBL VALUES ('1997-06-10 18:32:01 PDT');
@@ -234,6 +243,9 @@ FROM (
 -- shift bins using the origin parameter:
 SELECT date_bin('5 min'::interval, timestamptz '2020-02-01 01:01:01+00', timestamptz '2020-02-01 00:02:30+00');
 
+-- test roundoff edge case when source < origin
+SELECT date_bin('30 minutes'::interval, timestamptz '2024-02-01 15:00:00', timestamptz '2024-02-01 17:00:00');
+
 -- disallow intervals with months or years
 SELECT date_bin('5 months'::interval, timestamp with time zone '2020-02-01 01:01:01+00', timestamp with time zone '2001-01-01+00');
 SELECT date_bin('5 years'::interval,  timestamp with time zone '2020-02-01 01:01:01+00', timestamp with time zone '2001-01-01+00');
@@ -243,6 +255,11 @@ SELECT date_bin('0 days'::interval, timestamp with time zone '1970-01-01 01:00:0
 
 -- disallow negative intervals
 SELECT date_bin('-2 days'::interval, timestamp with time zone '1970-01-01 01:00:00+00' , timestamp with time zone '1970-01-01 00:00:00+00');
+
+-- test overflow cases
+select date_bin('15 minutes'::interval, timestamptz '294276-12-30', timestamptz '4000-12-20 BC');
+select date_bin('200000000 days'::interval, '2024-02-01'::timestamptz, '2024-01-01'::timestamptz);
+select date_bin('365000 days'::interval, '4400-01-01 BC'::timestamptz, '4000-01-01 BC'::timestamptz);
 
 -- Test casting within a BETWEEN qualifier
 SELECT d1 - timestamp with time zone '1997-01-02' AS diff
@@ -296,6 +313,10 @@ SELECT date_part('epoch', '294270-01-01 00:00:00+00'::timestamptz);
 SELECT extract(epoch from '294270-01-01 00:00:00+00'::timestamptz);
 -- another internal overflow test case
 SELECT extract(epoch from '5000-01-01 00:00:00+00'::timestamptz);
+
+-- test edge-case overflow in timestamp subtraction
+SELECT timestamptz '294276-12-31 23:59:59 UTC' - timestamptz '1999-12-23 19:59:04.224193 UTC' AS ok;
+SELECT timestamptz '294276-12-31 23:59:59 UTC' - timestamptz '1999-12-23 19:59:04.224192 UTC' AS overflows;
 
 -- TO_CHAR()
 SELECT to_char(d1, 'DAY Day day DY Dy dy MONTH Month month RM MON Mon mon')
@@ -445,6 +466,27 @@ select generate_series('2022-01-01 00:00'::timestamptz,
 select * from generate_series('2020-01-01 00:00'::timestamptz,
                               '2020-01-02 03:00'::timestamptz,
                               '0 hour'::interval);
+select generate_series(timestamptz '1995-08-06 12:12:12', timestamptz '1996-08-06 12:12:12', interval 'infinity');
+select generate_series(timestamptz '1995-08-06 12:12:12', timestamptz '1996-08-06 12:12:12', interval '-infinity');
+
+-- Interval crossing time shift for Europe/Warsaw timezone (with DST)
+SET TimeZone to 'UTC';
+
+SELECT date_add('2022-10-30 00:00:00+01'::timestamptz,
+                '1 day'::interval);
+SELECT date_add('2021-10-31 00:00:00+02'::timestamptz,
+                '1 day'::interval,
+                'Europe/Warsaw');
+SELECT date_subtract('2022-10-30 00:00:00+01'::timestamptz,
+                     '1 day'::interval);
+SELECT date_subtract('2021-10-31 00:00:00+02'::timestamptz,
+                     '1 day'::interval,
+                     'Europe/Warsaw');
+SELECT * FROM generate_series('2021-12-31 23:00:00+00'::timestamptz,
+                              '2020-12-31 23:00:00+00'::timestamptz,
+                              '-1 month'::interval,
+                              'Europe/Warsaw');
+RESET TimeZone;
 
 --
 -- Test behavior with a dynamic (time-varying) timezone abbreviation.
@@ -580,6 +622,29 @@ SELECT '2014-10-25 22:00:01 UTC'::timestamptz AT TIME ZONE 'MSK';
 SELECT '2014-10-25 23:00:00 UTC'::timestamptz AT TIME ZONE 'MSK';
 
 --
+-- Test LOCAL time zone
+--
+BEGIN;
+SET LOCAL TIME ZONE 'Europe/Paris';
+VALUES (CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE) AT LOCAL);
+VALUES (TIMESTAMP '1978-07-07 19:38' AT LOCAL);
+SET LOCAL TIME ZONE 'Australia/Sydney';
+VALUES (CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE) AT LOCAL);
+VALUES (TIMESTAMP '1978-07-07 19:38' AT LOCAL);
+SET LOCAL TimeZone TO 'UTC';
+CREATE VIEW timestamp_local_view AS
+  SELECT CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE) AT LOCAL AS ttz_at_local,
+         timezone(CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE)) AS ttz_func,
+         TIMESTAMP '1978-07-07 19:38' AT LOCAL AS t_at_local,
+         timezone(TIMESTAMP '1978-07-07 19:38') AS t_func;
+SELECT pg_get_viewdef('timestamp_local_view', true);
+\x
+TABLE timestamp_local_view;
+\x
+DROP VIEW timestamp_local_view;
+COMMIT;
+
+--
 -- Test that AT TIME ZONE isn't misoptimized when using an index (bug #14504)
 --
 create temp table tmptz (f1 timestamptz primary key);
@@ -587,3 +652,19 @@ insert into tmptz values ('2017-01-18 00:00+00');
 explain (costs off)
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
+
+-- test arithmetic with infinite timestamps
+SELECT timestamptz 'infinity' - timestamptz 'infinity';
+SELECT timestamptz 'infinity' - timestamptz '-infinity';
+SELECT timestamptz '-infinity' - timestamptz 'infinity';
+SELECT timestamptz '-infinity' - timestamptz '-infinity';
+SELECT timestamptz 'infinity' - timestamptz '1995-08-06 12:12:12';
+SELECT timestamptz '-infinity' - timestamptz '1995-08-06 12:12:12';
+
+-- test age() with infinite timestamps
+SELECT age(timestamptz 'infinity');
+SELECT age(timestamptz '-infinity');
+SELECT age(timestamptz 'infinity', timestamptz 'infinity');
+SELECT age(timestamptz 'infinity', timestamptz '-infinity');
+SELECT age(timestamptz '-infinity', timestamptz 'infinity');
+SELECT age(timestamptz '-infinity', timestamptz '-infinity');

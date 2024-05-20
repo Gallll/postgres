@@ -9,7 +9,7 @@
  * always use NAMEDATALEN as the symbolic constant!   - jolly 8/21/95
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,7 +38,7 @@
 
 
 /*
- *		namein	- converts "..." to internal representation
+ *		namein	- converts cstring to internal representation
  *
  *		Note:
  *				[Old] Currently if strlen(s) < NAMEDATALEN, the extra chars are nulls
@@ -65,7 +65,7 @@ namein(PG_FUNCTION_ARGS)
 }
 
 /*
- *		nameout - converts internal representation to "..."
+ *		nameout - converts internal representation to cstring
  */
 Datum
 nameout(PG_FUNCTION_ARGS)

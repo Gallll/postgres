@@ -3,7 +3,7 @@
  * toast_compression.c
  *	  Functions for toast compression.
  *
- * Copyright (c) 2021-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2021-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -20,8 +20,7 @@
 #include "access/detoast.h"
 #include "access/toast_compression.h"
 #include "common/pg_lzcompress.h"
-#include "fmgr.h"
-#include "utils/builtins.h"
+#include "varatt.h"
 
 /* GUC */
 int			default_toast_compression = TOAST_PGLZ_COMPRESSION;
@@ -44,7 +43,7 @@ pglz_compress_datum(const struct varlena *value)
 				len;
 	struct varlena *tmp = NULL;
 
-	valsize = VARSIZE_ANY_EXHDR(DatumGetPointer(value));
+	valsize = VARSIZE_ANY_EXHDR(value);
 
 	/*
 	 * No point in wasting a palloc cycle if value size is outside the allowed

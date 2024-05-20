@@ -34,7 +34,7 @@
  * twice as fast as for a simpler design in which a single field doubles as
  * the common prefix length and the minimum ip_bits value.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -49,8 +49,9 @@
 
 #include "access/gist.h"
 #include "access/stratnum.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/inet.h"
+#include "varatt.h"
 
 /*
  * Operator strategy numbers used in the GiST inet_ops opclass

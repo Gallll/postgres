@@ -1,13 +1,12 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use IPC::Run qw(pump finish timer);
 use Data::Dumper;
 
 # Do nothing unless Makefile has told us that the build is --with-readline.
@@ -40,65 +39,46 @@ $node->start;
 
 # set up a few database objects
 $node->safe_psql('postgres',
-	    "CREATE TABLE tab1 (c1 int primary key, c2 text);\n"
+		"CREATE TABLE tab1 (c1 int primary key, c2 text);\n"
 	  . "CREATE TABLE mytab123 (f1 int, f2 text);\n"
 	  . "CREATE TABLE mytab246 (f1 int, f2 text);\n"
 	  . "CREATE TABLE \"mixedName\" (f1 int, f2 text);\n"
 	  . "CREATE TYPE enum1 AS ENUM ('foo', 'bar', 'baz', 'BLACK');\n"
 	  . "CREATE PUBLICATION some_publication;\n");
 
-# Developers would not appreciate this test adding a bunch of junk to
-# their ~/.psql_history, so be sure to redirect history into a temp file.
-# We might as well put it in the test log directory, so that buildfarm runs
-# capture the result for possible debugging purposes.
-my $historyfile = "${PostgreSQL::Test::Utils::log_path}/010_psql_history.txt";
-$ENV{PSQL_HISTORY} = $historyfile;
-
-# Another pitfall for developers is that they might have a ~/.inputrc
-# file that changes readline's behavior enough to affect this test.
-# So ignore any such file.
-$ENV{INPUTRC} = '/dev/null';
-
-# Unset $TERM so that readline/libedit won't use any terminal-dependent
-# escape sequences; that leads to way too many cross-version variations
-# in the output.
-delete $ENV{TERM};
-# Some versions of readline inspect LS_COLORS, so for luck unset that too.
-delete $ENV{LS_COLORS};
-
 # In a VPATH build, we'll be started in the source directory, but we want
 # to run in the build directory so that we can use relative paths to
-# access the tmp_check subdirectory; otherwise the output from filename
+# access the tab_comp_dir subdirectory; otherwise the output from filename
 # completion tests is too variable.
-if ($ENV{TESTDIR})
+if ($ENV{TESTDATADIR})
 {
-	chdir $ENV{TESTDIR} or die "could not chdir to \"$ENV{TESTDIR}\": $!";
+	chdir $ENV{TESTDATADIR}
+	  or die "could not chdir to \"$ENV{TESTDATADIR}\": $!";
 }
 
 # Create some junk files for filename completion testing.
+mkdir "tab_comp_dir";
 my $FH;
-open $FH, ">", "tmp_check/somefile"
-  or die("could not create file \"tmp_check/somefile\": $!");
+open $FH, ">", "tab_comp_dir/somefile"
+  or die("could not create file \"tab_comp_dir/somefile\": $!");
 print $FH "some stuff\n";
 close $FH;
-open $FH, ">", "tmp_check/afile123"
-  or die("could not create file \"tmp_check/afile123\": $!");
+open $FH, ">", "tab_comp_dir/afile123"
+  or die("could not create file \"tab_comp_dir/afile123\": $!");
 print $FH "more stuff\n";
 close $FH;
-open $FH, ">", "tmp_check/afile456"
-  or die("could not create file \"tmp_check/afile456\": $!");
+open $FH, ">", "tab_comp_dir/afile456"
+  or die("could not create file \"tab_comp_dir/afile456\": $!");
 print $FH "other stuff\n";
 close $FH;
 
+# Arrange to capture, not discard, the interactive session's history output.
+# Put it in the test log directory, so that buildfarm runs capture the result
+# for possible debugging purposes.
+my $historyfile = "${PostgreSQL::Test::Utils::log_path}/010_psql_history.txt";
+
 # fire up an interactive psql session
-my $in  = '';
-my $out = '';
-
-my $timer = timer($PostgreSQL::Test::Utils::timeout_default);
-
-my $h = $node->interactive_psql('postgres', \$in, \$out, $timer);
-
-like($out, qr/psql/, "print startup banner");
+my $h = $node->interactive_psql('postgres', history_file => $historyfile);
 
 # Simple test case: type something and see if psql responds as expected
 sub check_completion
@@ -108,15 +88,12 @@ sub check_completion
 	# report test failures from caller location
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 
-	# reset output collector
-	$out = "";
 	# restart per-command timer
-	$timer->start($PostgreSQL::Test::Utils::timeout_default);
-	# send the data to be sent
-	$in .= $send;
-	# wait ...
-	pump $h until ($out =~ $pattern || $timer->is_expired);
-	my $okay = ($out =~ $pattern && !$timer->is_expired);
+	$h->{timeout}->start($PostgreSQL::Test::Utils::timeout_default);
+
+	# send the data to be sent and wait for its result
+	my $out = $h->query_until($pattern, $send);
+	my $okay = ($out =~ $pattern && !$h->{timeout}->is_expired);
 	ok($okay, $annotation);
 	# for debugging, log actual output if it didn't match
 	local $Data::Dumper::Terse = 1;
@@ -272,16 +249,16 @@ clear_query();
 
 # check filename completion
 check_completion(
-	"\\lo_import tmp_check/some\t",
-	qr|tmp_check/somefile |,
+	"\\lo_import tab_comp_dir/some\t",
+	qr|tab_comp_dir/somefile |,
 	"filename completion with one possibility");
 
 clear_query();
 
 # note: readline might print a bell before the completion
 check_completion(
-	"\\lo_import tmp_check/af\t",
-	qr|tmp_check/af\a?ile|,
+	"\\lo_import tab_comp_dir/af\t",
+	qr|tab_comp_dir/af\a?ile|,
 	"filename completion with multiple possibilities");
 
 # broken versions of libedit require clear_line not clear_query here
@@ -291,15 +268,15 @@ clear_line();
 # note: broken versions of libedit want to backslash the closing quote;
 # not much we can do about that
 check_completion(
-	"COPY foo FROM tmp_check/some\t",
-	qr|'tmp_check/somefile\\?' |,
+	"COPY foo FROM tab_comp_dir/some\t",
+	qr|'tab_comp_dir/somefile\\?' |,
 	"quoted filename completion with one possibility");
 
 clear_line();
 
 check_completion(
-	"COPY foo FROM tmp_check/af\t",
-	qr|'tmp_check/afile|,
+	"COPY foo FROM tab_comp_dir/af\t",
+	qr|'tab_comp_dir/afile|,
 	"quoted filename completion with multiple possibilities");
 
 # some versions of readline/libedit require two tabs here, some only need one
@@ -307,7 +284,7 @@ check_completion(
 # the quotes might appear, too
 check_completion(
 	"\t\t",
-	qr|afile123'? +'?(tmp_check/)?afile456|,
+	qr|afile123'? +'?(tab_comp_dir/)?afile456|,
 	"offer multiple file choices");
 
 clear_line();
@@ -341,8 +318,8 @@ clear_line();
 # check completion of a keyword offered in addition to object names;
 # such a keyword should obey COMP_KEYWORD_CASE
 foreach (
-	[ 'lower',          'CO', 'column' ],
-	[ 'upper',          'co', 'COLUMN' ],
+	[ 'lower', 'CO', 'column' ],
+	[ 'upper', 'co', 'COLUMN' ],
 	[ 'preserve-lower', 'co', 'column' ],
 	[ 'preserve-upper', 'CO', 'COLUMN' ],)
 {
@@ -436,16 +413,29 @@ check_completion(
 
 clear_query();
 
+# check completion for psql variable test
+check_completion(
+	"\\echo :{?VERB\t",
+	qr/:\{\?VERBOSITY} /,
+	"complete a psql variable test");
+
+clear_query();
+
 # check no-completions code path
 check_completion("blarg \t\t", qr//, "check completion failure path");
 
 clear_query();
 
+# check COPY FROM with DEFAULT option
+check_completion(
+	"COPY foo FROM stdin WITH ( DEF\t)",
+	qr/DEFAULT /,
+	"COPY FROM with DEFAULT completion");
+
+clear_line();
+
 # send psql an explicit \q to shut it down, else pty won't close properly
-$timer->start($PostgreSQL::Test::Utils::timeout_default);
-$in .= "\\q\n";
-finish $h or die "psql returned $?";
-$timer->reset;
+$h->quit or die "psql returned $?";
 
 # done
 $node->stop;

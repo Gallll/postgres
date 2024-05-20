@@ -3,7 +3,7 @@
  * clauses.c
  *	  routines to manipulate qualification clauses
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,18 +20,16 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "catalog/pg_aggregate.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/functions.h"
-#include "executor/execExpr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/multibitmapset.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/subscripting.h"
 #include "nodes/supportnodes.h"
@@ -41,7 +39,6 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "parser/analyze.h"
-#include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "rewrite/rewriteHandler.h"
@@ -361,6 +358,11 @@ contain_subplans_walker(Node *node, void *context)
  * mistakenly think that something like "WHERE random() < 0.5" can be treated
  * as a constant qualification.
  *
+ * This will give the right answer only for clauses that have been put
+ * through expression preprocessing.  Callers outside the planner typically
+ * should use contain_mutable_functions_after_planning() instead, for the
+ * reasons given there.
+ *
  * We will recursively look into Query nodes (i.e., SubLink sub-selects)
  * but not into SubPlans.  See comments for contain_volatile_functions().
  */
@@ -390,10 +392,16 @@ contain_mutable_functions_walker(Node *node, void *context)
 	{
 		const JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
 		ListCell   *lc;
-		bool		is_jsonb =
-		ctor->returning->format->format_type == JS_FORMAT_JSONB;
+		bool		is_jsonb;
 
-		/* Check argument_type => json[b] conversions */
+		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+
+		/*
+		 * Check argument_type => json[b] conversions specifically.  We still
+		 * recurse to check 'args' below, but here we want to specifically
+		 * check whether or not the emitted clause would fail to be immutable
+		 * because of TimeZone, for example.
+		 */
 		foreach(lc, ctor->args)
 		{
 			Oid			typid = exprType(lfirst(lc));
@@ -421,8 +429,9 @@ contain_mutable_functions_walker(Node *node, void *context)
 		if (cnst->constisnull)
 			return false;
 
-		return jspIsMutable(DatumGetJsonPathP(cnst->constvalue),
-							jexpr->passing_names, jexpr->passing_values);
+		if (jspIsMutable(DatumGetJsonPathP(cnst->constvalue),
+						 jexpr->passing_names, jexpr->passing_values))
+			return true;
 	}
 
 	if (IsA(node, SQLValueFunction))
@@ -459,6 +468,34 @@ contain_mutable_functions_walker(Node *node, void *context)
 								  context);
 }
 
+/*
+ * contain_mutable_functions_after_planning
+ *	  Test whether given expression contains mutable functions.
+ *
+ * This is a wrapper for contain_mutable_functions() that is safe to use from
+ * outside the planner.  The difference is that it first runs the expression
+ * through expression_planner().  There are two key reasons why we need that:
+ *
+ * First, function default arguments will get inserted, which may affect
+ * volatility (consider "default now()").
+ *
+ * Second, inline-able functions will get inlined, which may allow us to
+ * conclude that the function is really less volatile than it's marked.
+ * As an example, polymorphic functions must be marked with the most volatile
+ * behavior that they have for any input type, but once we inline the
+ * function we may be able to conclude that it's not so volatile for the
+ * particular input type we're dealing with.
+ */
+bool
+contain_mutable_functions_after_planning(Expr *expr)
+{
+	/* We assume here that expression_planner() won't scribble on its input */
+	expr = expression_planner(expr);
+
+	/* Now we can search for non-immutable functions */
+	return contain_mutable_functions((Node *) expr);
+}
+
 
 /*****************************************************************************
  *		Check clauses for volatile functions
@@ -471,6 +508,11 @@ contain_mutable_functions_walker(Node *node, void *context)
  * Returns true if any volatile function (or operator implemented by a
  * volatile function) is found. This test prevents, for example,
  * invalid conversions of volatile expressions into indexscan quals.
+ *
+ * This will give the right answer only for clauses that have been put
+ * through expression preprocessing.  Callers outside the planner typically
+ * should use contain_volatile_functions_after_planning() instead, for the
+ * reasons given there.
  *
  * We will recursively look into Query nodes (i.e., SubLink sub-selects)
  * but not into SubPlans.  This is a bit odd, but intentional.  If we are
@@ -593,6 +635,34 @@ contain_volatile_functions_walker(Node *node, void *context)
 	}
 	return expression_tree_walker(node, contain_volatile_functions_walker,
 								  context);
+}
+
+/*
+ * contain_volatile_functions_after_planning
+ *	  Test whether given expression contains volatile functions.
+ *
+ * This is a wrapper for contain_volatile_functions() that is safe to use from
+ * outside the planner.  The difference is that it first runs the expression
+ * through expression_planner().  There are two key reasons why we need that:
+ *
+ * First, function default arguments will get inserted, which may affect
+ * volatility (consider "default random()").
+ *
+ * Second, inline-able functions will get inlined, which may allow us to
+ * conclude that the function is really less volatile than it's marked.
+ * As an example, polymorphic functions must be marked with the most volatile
+ * behavior that they have for any input type, but once we inline the
+ * function we may be able to conclude that it's not so volatile for the
+ * particular input type we're dealing with.
+ */
+bool
+contain_volatile_functions_after_planning(Expr *expr)
+{
+	/* We assume here that expression_planner() won't scribble on its input */
+	expr = expression_planner(expr);
+
+	/* Now we can search for volatile functions */
+	return contain_volatile_functions((Node *) expr);
 }
 
 /*
@@ -894,18 +964,6 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 		return query_tree_walker(query,
 								 max_parallel_hazard_walker,
 								 context, 0);
-	}
-
-	/* JsonExpr is parallel-unsafe if subtransactions can be used. */
-	else if (IsA(node, JsonExpr))
-	{
-		JsonExpr   *jsexpr = (JsonExpr *) node;
-
-		if (ExecEvalJsonNeedsSubTransaction(jsexpr, NULL))
-		{
-			context->max_hazard = PROPARALLEL_UNSAFE;
-			return true;
-		}
 	}
 
 	/* Recurse to check arguments */
@@ -1566,6 +1624,31 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_rels_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/*
+		 * For some types of SubPlan, we can infer strictness from Vars in the
+		 * testexpr (the LHS of the original SubLink).
+		 *
+		 * For ANY_SUBLINK, if the subquery produces zero rows, the result is
+		 * always FALSE.  If the subquery produces more than one row, the
+		 * per-row results of the testexpr are combined using OR semantics.
+		 * Hence ANY_SUBLINK can be strict only at top level, but there it's
+		 * as strict as the testexpr is.
+		 *
+		 * For ROWCOMPARE_SUBLINK, if the subquery produces zero rows, the
+		 * result is always NULL.  Otherwise, the result is as strict as the
+		 * testexpr is.  So we can check regardless of top_level.
+		 *
+		 * We can't prove anything for other sublink types (in particular,
+		 * note that ALL_SUBLINK will return TRUE if the subquery is empty).
+		 */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_rels_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1596,7 +1679,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * find_nonnullable_vars
  *		Determine which Vars are forced nonnullable by given clause.
  *
- * Returns a list of all level-zero Vars that are referenced in the clause in
+ * Returns the set of all level-zero Vars that are referenced in the clause in
  * such a way that the clause cannot possibly return TRUE if any of these Vars
  * is NULL.  (It is OK to err on the side of conservatism; hence the analysis
  * here is simplistic.)
@@ -1608,8 +1691,9 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * the expression to have been AND/OR flattened and converted to implicit-AND
  * format.
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * Attnos of the identified Vars are returned in a multibitmapset (a List of
+ * Bitmapsets).  List indexes correspond to relids (varnos), while the per-rel
+ * Bitmapsets hold varattnos offset by FirstLowInvalidHeapAttributeNumber.
  *
  * top_level is true while scanning top-level AND/OR structure; here, showing
  * the result is either FALSE or NULL is good enough.  top_level is false when
@@ -1638,7 +1722,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		Var		   *var = (Var *) node;
 
 		if (var->varlevelsup == 0)
-			result = list_make1(var);
+			result = mbms_add_member(result,
+									 var->varno,
+									 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	else if (IsA(node, List))
 	{
@@ -1653,9 +1739,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_nonnullable_vars_walker(lfirst(l),
-															  top_level));
+			result = mbms_add_members(result,
+									  find_nonnullable_vars_walker(lfirst(l),
+																   top_level));
 		}
 	}
 	else if (IsA(node, FuncExpr))
@@ -1687,7 +1773,12 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		switch (expr->boolop)
 		{
 			case AND_EXPR:
-				/* At top level we can just recurse (to the List case) */
+
+				/*
+				 * At top level we can just recurse (to the List case), since
+				 * the result should be the union of what we can prove in each
+				 * arm.
+				 */
 				if (top_level)
 				{
 					result = find_nonnullable_vars_walker((Node *) expr->args,
@@ -1719,7 +1810,7 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 					if (result == NIL)	/* first subresult? */
 						result = subresult;
 					else
-						result = list_intersection(result, subresult);
+						result = mbms_int_members(result, subresult);
 
 					/*
 					 * If the intersection is empty, we can stop looking. This
@@ -1791,6 +1882,15 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_vars_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/* See analysis in find_nonnullable_rels_walker */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_vars_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1809,8 +1909,8 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
  * side of conservatism; hence the analysis here is simplistic.  In fact,
  * we only detect simple "var IS NULL" tests at the top level.)
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * As with find_nonnullable_vars, we return the varattnos of the identified
+ * Vars in a multibitmapset.
  */
 List *
 find_forced_null_vars(Node *node)
@@ -1825,7 +1925,9 @@ find_forced_null_vars(Node *node)
 	var = find_forced_null_var(node);
 	if (var)
 	{
-		result = list_make1(var);
+		result = mbms_add_member(result,
+								 var->varno,
+								 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	/* Otherwise, handle AND-conditions */
 	else if (IsA(node, List))
@@ -1836,8 +1938,8 @@ find_forced_null_vars(Node *node)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_forced_null_vars(lfirst(l)));
+			result = mbms_add_members(result,
+									  find_forced_null_vars((Node *) lfirst(l)));
 		}
 	}
 	else if (IsA(node, BoolExpr))
@@ -2022,14 +2124,16 @@ is_pseudo_constant_clause_relids(Node *clause, Relids relids)
  * NumRelids
  *		(formerly clause_relids)
  *
- * Returns the number of different relations referenced in 'clause'.
+ * Returns the number of different base relations referenced in 'clause'.
  */
 int
 NumRelids(PlannerInfo *root, Node *clause)
 {
+	int			result;
 	Relids		varnos = pull_varnos(root, clause);
-	int			result = bms_num_members(varnos);
 
+	varnos = bms_del_members(varnos, root->outer_join_rels);
+	result = bms_num_members(varnos);
 	bms_free(varnos);
 	return result;
 }
@@ -2172,7 +2276,8 @@ eval_const_expressions(PlannerInfo *root, Node *node)
  *
  * We'll use a hash table if all of the following conditions are met:
  * 1. The 2nd argument of the array contain only Consts.
- * 2. useOr is true.
+ * 2. useOr is true or there is a valid negator operator for the
+ *	  ScalarArrayOpExpr's opno.
  * 3. There's valid hash function for both left and righthand operands and
  *	  these hash functions are the same.
  * 4. If the array contains enough elements for us to consider it to be
@@ -2335,6 +2440,10 @@ static Node *
 eval_const_expressions_mutator(Node *node,
 							   eval_const_expressions_context *context)
 {
+
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
 	if (node == NULL)
 		return NULL;
 	switch (nodeTag(node))
@@ -2457,6 +2566,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->inputcollid = expr->inputcollid;
 				newexpr->args = args;
 				newexpr->aggfilter = aggfilter;
+				newexpr->runCondition = expr->runCondition;
 				newexpr->winref = expr->winref;
 				newexpr->winstar = expr->winstar;
 				newexpr->winagg = expr->winagg;
@@ -2801,6 +2911,19 @@ eval_const_expressions_mutator(Node *node,
 				}
 				break;
 			}
+
+		case T_JsonValueExpr:
+			{
+				JsonValueExpr *jve = (JsonValueExpr *) node;
+				Node	   *formatted;
+
+				formatted = eval_const_expressions_mutator((Node *) jve->formatted_expr,
+														   context);
+				if (formatted && IsA(formatted, Const))
+					return formatted;
+				break;
+			}
+
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 
@@ -3261,12 +3384,19 @@ eval_const_expressions_mutator(Node *node,
 											  fselect->resulttype,
 											  fselect->resulttypmod,
 											  fselect->resultcollid))
-						return (Node *) makeVar(((Var *) arg)->varno,
-												fselect->fieldnum,
-												fselect->resulttype,
-												fselect->resulttypmod,
-												fselect->resultcollid,
-												((Var *) arg)->varlevelsup);
+					{
+						Var		   *newvar;
+
+						newvar = makeVar(((Var *) arg)->varno,
+										 fselect->fieldnum,
+										 fselect->resulttype,
+										 fselect->resulttypmod,
+										 fselect->resultcollid,
+										 ((Var *) arg)->varlevelsup);
+						/* New Var is nullable by same rels as the old one */
+						newvar->varnullingrels = ((Var *) arg)->varnullingrels;
+						return (Node *) newvar;
+					}
 				}
 				if (arg && IsA(arg, RowExpr))
 				{
@@ -3566,29 +3696,6 @@ eval_const_expressions_mutator(Node *node,
 				if (arg != NULL && IsA(arg, Const))
 					return ece_evaluate_expr((Node *) newcre);
 				return (Node *) newcre;
-			}
-		case T_JsonValueExpr:
-			{
-				JsonValueExpr *jve = (JsonValueExpr *) node;
-				Node	   *raw = eval_const_expressions_mutator((Node *) jve->raw_expr,
-																 context);
-
-				if (raw && IsA(raw, Const))
-				{
-					Node	   *formatted;
-					Node	   *save_case_val = context->case_val;
-
-					context->case_val = raw;
-
-					formatted = eval_const_expressions_mutator((Node *) jve->formatted_expr,
-															   context);
-
-					context->case_val = save_case_val;
-
-					if (formatted && IsA(formatted, Const))
-						return formatted;
-				}
-				break;
 			}
 		default:
 			break;
@@ -4232,15 +4339,10 @@ fetch_function_defaults(HeapTuple func_tuple)
 {
 	List	   *defaults;
 	Datum		proargdefaults;
-	bool		isnull;
 	char	   *str;
 
-	/* The error cases here shouldn't happen, but check anyway */
-	proargdefaults = SysCacheGetAttr(PROCOID, func_tuple,
-									 Anum_pg_proc_proargdefaults,
-									 &isnull);
-	if (isnull)
-		elog(ERROR, "not enough default arguments");
+	proargdefaults = SysCacheGetAttrNotNull(PROCOID, func_tuple,
+											Anum_pg_proc_proargdefaults);
 	str = TextDatumGetCString(proargdefaults);
 	defaults = castNode(List, stringToNode(str));
 	pfree(str);
@@ -4330,12 +4432,11 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 	 * Can't simplify if it returns RECORD.  The immediate problem is that it
 	 * will be needing an expected tupdesc which we can't supply here.
 	 *
-	 * In the case where it has OUT parameters, it could get by without an
-	 * expected tupdesc, but we still have issues: get_expr_result_type()
-	 * doesn't know how to extract type info from a RECORD constant, and in
-	 * the case of a NULL function result there doesn't seem to be any clean
-	 * way to fix that.  In view of the likelihood of there being still other
-	 * gotchas, seems best to leave the function call unreduced.
+	 * In the case where it has OUT parameters, we could build an expected
+	 * tupdesc from those, but there may be other gotchas lurking.  In
+	 * particular, if the function were to return NULL, we would produce a
+	 * null constant with no remaining indication of which concrete record
+	 * type it is.  For now, seems best to leave the function call unreduced.
 	 */
 	if (funcform->prorettype == RECORDOID)
 		return NULL;
@@ -4479,7 +4580,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -4512,12 +4613,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	fexpr->location = -1;
 
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", funcid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -4540,16 +4636,16 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	if (!isNull)
 	{
 		Node	   *n;
-		List	   *querytree_list;
+		List	   *query_list;
 
 		n = stringToNode(TextDatumGetCString(tmp));
 		if (IsA(n, List))
-			querytree_list = linitial_node(List, castNode(List, n));
+			query_list = linitial_node(List, castNode(List, n));
 		else
-			querytree_list = list_make1(n);
-		if (list_length(querytree_list) != 1)
+			query_list = list_make1(n);
+		if (list_length(query_list) != 1)
 			goto fail;
-		querytree = linitial(querytree_list);
+		querytree = linitial(query_list);
 
 		/*
 		 * Because we'll insist below that the querytree have an empty rtable
@@ -4631,6 +4727,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	querytree_list = list_make1(querytree);
 	if (check_sql_fn_retval(list_make1(querytree_list),
 							result_type, rettupdesc,
+							funcform->prokind,
 							false, NULL))
 		goto fail;				/* reject whole-tuple-result cases */
 
@@ -5021,7 +5118,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -5070,12 +5167,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", func_oid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -5145,16 +5237,20 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	}
 
 	/*
-	 * Also resolve the actual function result tupdesc, if composite.  If the
-	 * function is just declared to return RECORD, dig the info out of the AS
-	 * clause.
+	 * Also resolve the actual function result tupdesc, if composite.  If we
+	 * have a coldeflist, believe that; otherwise use get_expr_result_type.
+	 * (This logic should match ExecInitFunctionScan.)
 	 */
-	functypclass = get_expr_result_type((Node *) fexpr, NULL, &rettupdesc);
-	if (functypclass == TYPEFUNC_RECORD)
+	if (rtfunc->funccolnames != NIL)
+	{
+		functypclass = TYPEFUNC_RECORD;
 		rettupdesc = BuildDescFromLists(rtfunc->funccolnames,
 										rtfunc->funccoltypes,
 										rtfunc->funccoltypmods,
 										rtfunc->funccolcollations);
+	}
+	else
+		functypclass = get_expr_result_type((Node *) fexpr, NULL, &rettupdesc);
 
 	/*
 	 * The single command must be a plain SELECT.
@@ -5178,6 +5274,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	 */
 	if (!check_sql_fn_retval(list_make1(querytree_list),
 							 fexpr->funcresulttype, rettupdesc,
+							 funcform->prokind,
 							 true, NULL) &&
 		(functypclass == TYPEFUNC_COMPOSITE ||
 		 functypclass == TYPEFUNC_COMPOSITE_DOMAIN ||
@@ -5219,6 +5316,13 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	 * explicitly record the plan's dependency on the function.
 	 */
 	record_plan_function_dependency(root, func_oid);
+
+	/*
+	 * We must also notice if the inserted query adds a dependency on the
+	 * calling role due to RLS quals.
+	 */
+	if (querytree->hasRowSecurity)
+		root->glob->dependsOnRole = true;
 
 	return querytree;
 

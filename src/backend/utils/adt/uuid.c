@@ -3,7 +3,7 @@
  * uuid.c
  *	  Functions for the built-in type "uuid".
  *
- * Copyright (c) 2007-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/uuid.c
@@ -17,9 +17,10 @@
 #include "lib/hyperloglog.h"
 #include "libpq/pqformat.h"
 #include "port/pg_bswap.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/sortsupport.h"
+#include "utils/timestamp.h"
 #include "utils/uuid.h"
 
 /* sortsupport for uuid */
@@ -31,7 +32,7 @@ typedef struct
 	hyperLogLogState abbr_card; /* cardinality estimator */
 } uuid_sortsupport_state;
 
-static void string_to_uuid(const char *source, pg_uuid_t *uuid);
+static void string_to_uuid(const char *source, pg_uuid_t *uuid, Node *escontext);
 static int	uuid_internal_cmp(const pg_uuid_t *arg1, const pg_uuid_t *arg2);
 static int	uuid_fast_cmp(Datum x, Datum y, SortSupport ssup);
 static bool uuid_abbrev_abort(int memtupcount, SortSupport ssup);
@@ -44,7 +45,7 @@ uuid_in(PG_FUNCTION_ARGS)
 	pg_uuid_t  *uuid;
 
 	uuid = (pg_uuid_t *) palloc(sizeof(*uuid));
-	string_to_uuid(uuid_str, uuid);
+	string_to_uuid(uuid_str, uuid, fcinfo->context);
 	PG_RETURN_UUID_P(uuid);
 }
 
@@ -53,10 +54,13 @@ uuid_out(PG_FUNCTION_ARGS)
 {
 	pg_uuid_t  *uuid = PG_GETARG_UUID_P(0);
 	static const char hex_chars[] = "0123456789abcdef";
-	StringInfoData buf;
+	char	   *buf,
+			   *p;
 	int			i;
 
-	initStringInfo(&buf);
+	/* counts for the four hyphens and the zero-terminator */
+	buf = palloc(2 * UUID_LEN + 5);
+	p = buf;
 	for (i = 0; i < UUID_LEN; i++)
 	{
 		int			hi;
@@ -68,16 +72,17 @@ uuid_out(PG_FUNCTION_ARGS)
 		 * ("-"). Therefore, add the hyphens at the appropriate places here.
 		 */
 		if (i == 4 || i == 6 || i == 8 || i == 10)
-			appendStringInfoChar(&buf, '-');
+			*p++ = '-';
 
 		hi = uuid->data[i] >> 4;
 		lo = uuid->data[i] & 0x0F;
 
-		appendStringInfoChar(&buf, hex_chars[hi]);
-		appendStringInfoChar(&buf, hex_chars[lo]);
+		*p++ = hex_chars[hi];
+		*p++ = hex_chars[lo];
 	}
+	*p = '\0';
 
-	PG_RETURN_CSTRING(buf.data);
+	PG_RETURN_CSTRING(buf);
 }
 
 /*
@@ -87,7 +92,7 @@ uuid_out(PG_FUNCTION_ARGS)
  * digits, is the only one used for output.)
  */
 static void
-string_to_uuid(const char *source, pg_uuid_t *uuid)
+string_to_uuid(const char *source, pg_uuid_t *uuid, Node *escontext)
 {
 	const char *src = source;
 	bool		braces = false;
@@ -130,7 +135,7 @@ string_to_uuid(const char *source, pg_uuid_t *uuid)
 	return;
 
 syntax_error:
-	ereport(ERROR,
+	ereturn(escontext,,
 			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 			 errmsg("invalid input syntax for type %s: \"%s\"",
 					"uuid", source)));
@@ -154,7 +159,7 @@ uuid_send(PG_FUNCTION_ARGS)
 	StringInfoData buffer;
 
 	pq_begintypsend(&buffer);
-	pq_sendbytes(&buffer, (char *) uuid->data, UUID_LEN);
+	pq_sendbytes(&buffer, uuid->data, UUID_LEN);
 	PG_RETURN_BYTEA_P(pq_endtypsend(&buffer));
 }
 
@@ -420,4 +425,67 @@ gen_random_uuid(PG_FUNCTION_ARGS)
 	uuid->data[8] = (uuid->data[8] & 0x3f) | 0x80;	/* clock_seq_hi_and_reserved */
 
 	PG_RETURN_UUID_P(uuid);
+}
+
+#define UUIDV1_EPOCH_JDATE  2299161 /* == date2j(1582,10,15) */
+
+/*
+ * Extract timestamp from UUID.
+ *
+ * Returns null if not RFC 4122 variant or not a version that has a timestamp.
+ */
+Datum
+uuid_extract_timestamp(PG_FUNCTION_ARGS)
+{
+	pg_uuid_t  *uuid = PG_GETARG_UUID_P(0);
+	int			version;
+	uint64		tms;
+	TimestampTz ts;
+
+	/* check if RFC 4122 variant */
+	if ((uuid->data[8] & 0xc0) != 0x80)
+		PG_RETURN_NULL();
+
+	version = uuid->data[6] >> 4;
+
+	if (version == 1)
+	{
+		tms = ((uint64) uuid->data[0] << 24)
+			+ ((uint64) uuid->data[1] << 16)
+			+ ((uint64) uuid->data[2] << 8)
+			+ ((uint64) uuid->data[3])
+			+ ((uint64) uuid->data[4] << 40)
+			+ ((uint64) uuid->data[5] << 32)
+			+ (((uint64) uuid->data[6] & 0xf) << 56)
+			+ ((uint64) uuid->data[7] << 48);
+
+		/* convert 100-ns intervals to us, then adjust */
+		ts = (TimestampTz) (tms / 10) -
+			((uint64) POSTGRES_EPOCH_JDATE - UUIDV1_EPOCH_JDATE) * SECS_PER_DAY * USECS_PER_SEC;
+
+		PG_RETURN_TIMESTAMPTZ(ts);
+	}
+
+	/* not a timestamp-containing UUID version */
+	PG_RETURN_NULL();
+}
+
+/*
+ * Extract UUID version.
+ *
+ * Returns null if not RFC 4122 variant.
+ */
+Datum
+uuid_extract_version(PG_FUNCTION_ARGS)
+{
+	pg_uuid_t  *uuid = PG_GETARG_UUID_P(0);
+	uint16		version;
+
+	/* check if RFC 4122 variant */
+	if ((uuid->data[8] & 0xc0) != 0x80)
+		PG_RETURN_NULL();
+
+	version = uuid->data[6] >> 4;
+
+	PG_RETURN_UINT16(version);
 }

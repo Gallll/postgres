@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Checks for recovery_min_apply_delay and recovery pause
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -24,7 +24,7 @@ $node_primary->backup($backup_name);
 
 # Create streaming standby from backup
 my $node_standby = PostgreSQL::Test::Cluster->new('standby');
-my $delay        = 3;
+my $delay = 3;
 $node_standby->init_from_backup($node_primary, $backup_name,
 	has_streaming => 1);
 $node_standby->append_conf(

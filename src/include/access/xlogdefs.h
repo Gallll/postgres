@@ -4,7 +4,7 @@
  * Postgres write-ahead log manager record pointer and
  * timeline number definitions
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlogdefs.h
@@ -67,19 +67,16 @@ typedef uint16 RepOriginId;
 /*
  * This chunk of hackery attempts to determine which file sync methods
  * are available on the current platform, and to choose an appropriate
- * default method.  We assume that fsync() is always available, and that
- * configure determined whether fdatasync() is.
+ * default method.
  *
  * Note that we define our own O_DSYNC on Windows, but not O_SYNC.
  */
-#if defined(PLATFORM_DEFAULT_SYNC_METHOD)
-#define DEFAULT_SYNC_METHOD		PLATFORM_DEFAULT_SYNC_METHOD
+#if defined(PLATFORM_DEFAULT_WAL_SYNC_METHOD)
+#define DEFAULT_WAL_SYNC_METHOD		PLATFORM_DEFAULT_WAL_SYNC_METHOD
 #elif defined(O_DSYNC) && (!defined(O_SYNC) || O_DSYNC != O_SYNC)
-#define DEFAULT_SYNC_METHOD		SYNC_METHOD_OPEN_DSYNC
-#elif defined(HAVE_FDATASYNC)
-#define DEFAULT_SYNC_METHOD		SYNC_METHOD_FDATASYNC
+#define DEFAULT_WAL_SYNC_METHOD		WAL_SYNC_METHOD_OPEN_DSYNC
 #else
-#define DEFAULT_SYNC_METHOD		SYNC_METHOD_FSYNC
+#define DEFAULT_WAL_SYNC_METHOD		WAL_SYNC_METHOD_FDATASYNC
 #endif
 
 #endif							/* XLOG_DEFS_H */

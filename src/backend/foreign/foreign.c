@@ -3,7 +3,7 @@
  * foreign.c
  *		  support for foreign-data wrappers, servers and user mappings.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
@@ -21,12 +21,12 @@
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
-#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 
 
 /*
@@ -216,10 +216,14 @@ GetUserMapping(Oid userid, Oid serverid)
 	}
 
 	if (!HeapTupleIsValid(tp))
+	{
+		ForeignServer *server = GetForeignServer(serverid);
+
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("user mapping not found for \"%s\"",
-						MappingUserName(userid))));
+				 errmsg("user mapping not found for user \"%s\", server \"%s\"",
+						MappingUserName(userid), server->servername)));
+	}
 
 	um = (UserMapping *) palloc(sizeof(UserMapping));
 	um->umid = ((Form_pg_user_mapping) GETSTRUCT(tp))->oid;
@@ -516,7 +520,7 @@ pg_options_to_table(PG_FUNCTION_ARGS)
 	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	/* prepare the result set */
-	SetSingleFuncCall(fcinfo, SRF_SINGLE_USE_EXPECTED);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 
 	foreach(cell, options)
 	{
@@ -573,6 +577,7 @@ static const struct ConnectionOption libpq_conninfo_options[] = {
 	{"requiressl", ForeignServerRelationId},
 	{"sslmode", ForeignServerRelationId},
 	{"gsslib", ForeignServerRelationId},
+	{"gssdelegation", ForeignServerRelationId},
 	{NULL, InvalidOid}
 };
 
@@ -621,25 +626,32 @@ postgresql_fdw_validator(PG_FUNCTION_ARGS)
 		if (!is_conninfo_option(def->defname, catalog))
 		{
 			const struct ConnectionOption *opt;
-			StringInfoData buf;
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
 
 			/*
 			 * Unknown option specified, complain about it. Provide a hint
-			 * with list of valid options for the object.
+			 * with a valid option that looks similar, if there is one.
 			 */
-			initStringInfo(&buf);
+			initClosestMatch(&match_state, def->defname, 4);
 			for (opt = libpq_conninfo_options; opt->optname; opt++)
+			{
 				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->optname);
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->optname);
+				}
+			}
 
+			closest_match = getClosestMatch(&match_state);
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 buf.len > 0
-					 ? errhint("Valid options in this context are: %s",
-							   buf.data)
-					 : errhint("There are no valid options in this context.")));
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
 
 			PG_RETURN_BOOL(false);
 		}

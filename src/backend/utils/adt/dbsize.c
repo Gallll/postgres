@@ -2,7 +2,7 @@
  * dbsize.c
  *		Database object size functions, and related inquiries
  *
- * Copyright (c) 2002-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/dbsize.c
@@ -15,9 +15,9 @@
 
 #include "access/htup_details.h"
 #include "access/relation.h"
-#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/tablespace.h"
@@ -45,7 +45,7 @@ struct size_pretty_unit
 								 * unit */
 };
 
-/* When adding units here also update the error message in pg_size_bytes */
+/* When adding units here also update the docs and the error message in pg_size_bytes */
 static const struct size_pretty_unit size_pretty_units[] = {
 	{"bytes", 10 * 1024, false, 0},
 	{"kB", 20 * 1024 - 1, true, 10},
@@ -54,6 +54,19 @@ static const struct size_pretty_unit size_pretty_units[] = {
 	{"TB", 20 * 1024 - 1, true, 40},
 	{"PB", 20 * 1024 - 1, true, 50},
 	{NULL, 0, false, 0}
+};
+
+/* Additional unit aliases accepted by pg_size_bytes */
+struct size_bytes_unit_alias
+{
+	const char *alias;
+	int			unit_index;		/* corresponding size_pretty_units element */
+};
+
+/* When adding units here also update the docs and the error message in pg_size_bytes */
+static const struct size_bytes_unit_alias size_bytes_aliases[] = {
+	{"B", 0},
+	{NULL}
 };
 
 /* Return physical size of directory contents, or 0 if dir doesn't exist */
@@ -115,7 +128,7 @@ calculate_database_size(Oid dbOid)
 	 * User must have connect privilege for target database or have privileges
 	 * of pg_read_all_stats
 	 */
-	aclresult = pg_database_aclcheck(dbOid, GetUserId(), ACL_CONNECT);
+	aclresult = object_aclcheck(DatabaseRelationId, dbOid, GetUserId(), ACL_CONNECT);
 	if (aclresult != ACLCHECK_OK &&
 		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
 	{
@@ -203,7 +216,7 @@ calculate_tablespace_size(Oid tblspcOid)
 	if (tblspcOid != MyDatabaseTableSpace &&
 		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
 	{
-		aclresult = pg_tablespace_aclcheck(tblspcOid, GetUserId(), ACL_CREATE);
+		aclresult = object_aclcheck(TableSpaceRelationId, tblspcOid, GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   get_tablespace_name(tblspcOid));
@@ -292,7 +305,7 @@ pg_tablespace_size_name(PG_FUNCTION_ARGS)
  * is no check here or at the call sites for that.
  */
 static int64
-calculate_relation_size(RelFileLocator *rfn, BackendId backend, ForkNumber forknum)
+calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber forknum)
 {
 	int64		totalsize = 0;
 	char	   *relationpath;
@@ -564,7 +577,7 @@ pg_size_pretty(PG_FUNCTION_ARGS)
 		uint8		bits;
 
 		/* use this unit if there are no more units or we're below the limit */
-		if (unit[1].name == NULL || Abs(size) < unit->limit)
+		if (unit[1].name == NULL || i64abs(size) < unit->limit)
 		{
 			if (unit->round)
 				size = half_rounded(size);
@@ -800,9 +813,19 @@ pg_size_bytes(PG_FUNCTION_ARGS)
 		{
 			/* Parse the unit case-insensitively */
 			if (pg_strcasecmp(strptr, unit->name) == 0)
-			{
-				multiplier = ((int64) 1) << unit->unitbits;
 				break;
+		}
+
+		/* If not found, look in table of aliases */
+		if (unit->name == NULL)
+		{
+			for (const struct size_bytes_unit_alias *a = size_bytes_aliases; a->alias != NULL; a++)
+			{
+				if (pg_strcasecmp(strptr, a->alias) == 0)
+				{
+					unit = &size_pretty_units[a->unit_index];
+					break;
+				}
 			}
 		}
 
@@ -812,7 +835,9 @@ pg_size_bytes(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid size: \"%s\"", text_to_cstring(arg)),
 					 errdetail("Invalid size unit: \"%s\".", strptr),
-					 errhint("Valid units are \"bytes\", \"kB\", \"MB\", \"GB\", \"TB\", and \"PB\".")));
+					 errhint("Valid units are \"bytes\", \"B\", \"kB\", \"MB\", \"GB\", \"TB\", and \"PB\".")));
+
+		multiplier = ((int64) 1) << unit->unitbits;
 
 		if (multiplier > 1)
 		{
@@ -925,7 +950,7 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 	HeapTuple	tuple;
 	Form_pg_class relform;
 	RelFileLocator rlocator;
-	BackendId	backend;
+	ProcNumber	backend;
 	char	   *path;
 
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
@@ -970,21 +995,21 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-			backend = InvalidBackendId;
+			backend = INVALID_PROC_NUMBER;
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relform->relnamespace))
-				backend = BackendIdForTempRelations();
+				backend = ProcNumberForTempRelations();
 			else
 			{
 				/* Do it the hard way. */
-				backend = GetTempNamespaceBackendId(relform->relnamespace);
-				Assert(backend != InvalidBackendId);
+				backend = GetTempNamespaceProcNumber(relform->relnamespace);
+				Assert(backend != INVALID_PROC_NUMBER);
 			}
 			break;
 		default:
 			elog(ERROR, "invalid relpersistence: %c", relform->relpersistence);
-			backend = InvalidBackendId; /* placate compiler */
+			backend = INVALID_PROC_NUMBER;	/* placate compiler */
 			break;
 	}
 

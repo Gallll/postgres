@@ -16,7 +16,7 @@
  *		relevant database in turn.  The former keeps running after the
  *		initial prewarm is complete to update the dump file periodically.
  *
- *	Copyright (c) 2016-2022, PostgreSQL Global Development Group
+ *	Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  *	IDENTIFICATION
  *		contrib/pg_prewarm/autoprewarm.c
@@ -32,12 +32,12 @@
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
-#include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
 #include "storage/dsm.h"
+#include "storage/dsm_registry.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -82,8 +82,8 @@ typedef struct AutoPrewarmSharedState
 	int			prewarmed_blocks;
 } AutoPrewarmSharedState;
 
-void		autoprewarm_main(Datum main_arg);
-void		autoprewarm_database_main(Datum main_arg);
+PGDLLEXPORT void autoprewarm_main(Datum main_arg);
+PGDLLEXPORT void autoprewarm_database_main(Datum main_arg);
 
 PG_FUNCTION_INFO_V1(autoprewarm_start_worker);
 PG_FUNCTION_INFO_V1(autoprewarm_dump_now);
@@ -95,15 +95,13 @@ static void apw_start_database_worker(void);
 static bool apw_init_shmem(void);
 static void apw_detach_shmem(int code, Datum arg);
 static int	apw_compare_blockinfo(const void *p, const void *q);
-static void autoprewarm_shmem_request(void);
-static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
 /* Pointer to shared-memory state. */
 static AutoPrewarmSharedState *apw_state = NULL;
 
 /* GUC variables. */
 static bool autoprewarm = true; /* start worker? */
-static int	autoprewarm_interval;	/* dump interval */
+static int	autoprewarm_interval = 300; /* dump interval */
 
 /*
  * Module load callback.
@@ -140,24 +138,9 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("pg_prewarm");
 
-	prev_shmem_request_hook = shmem_request_hook;
-	shmem_request_hook = autoprewarm_shmem_request;
-
 	/* Register autoprewarm worker, if enabled. */
 	if (autoprewarm)
 		apw_start_leader_worker();
-}
-
-/*
- * Requests any additional shared memory required for autoprewarm.
- */
-static void
-autoprewarm_shmem_request(void)
-{
-	if (prev_shmem_request_hook)
-		prev_shmem_request_hook();
-
-	RequestAddinShmemSpace(MAXALIGN(sizeof(AutoPrewarmSharedState)));
 }
 
 /*
@@ -181,8 +164,14 @@ autoprewarm_main(Datum main_arg)
 	if (apw_init_shmem())
 		first_time = false;
 
-	/* Set on-detach hook so that our PID will be cleared on exit. */
-	on_shmem_exit(apw_detach_shmem, 0);
+	/*
+	 * Set on-detach hook so that our PID will be cleared on exit.
+	 *
+	 * NB: Autoprewarm's state is stored in a DSM segment, and DSM segments
+	 * are detached before calling the on_shmem_exit callbacks, so we must put
+	 * apw_detach_shmem in the before_shmem_exit callback list.
+	 */
+	before_shmem_exit(apw_detach_shmem, 0);
 
 	/*
 	 * Store our PID in the shared memory area --- unless there's already
@@ -193,8 +182,8 @@ autoprewarm_main(Datum main_arg)
 	{
 		LWLockRelease(&apw_state->lock);
 		ereport(LOG,
-				(errmsg("autoprewarm worker is already running under PID %lu",
-						(unsigned long) apw_state->bgworker_pid)));
+				(errmsg("autoprewarm worker is already running under PID %d",
+						(int) apw_state->bgworker_pid)));
 		return;
 	}
 	apw_state->bgworker_pid = MyProcPid;
@@ -303,8 +292,8 @@ apw_load_buffers(void)
 	{
 		LWLockRelease(&apw_state->lock);
 		ereport(LOG,
-				(errmsg("skipping prewarm because block dump file is being written by PID %lu",
-						(unsigned long) apw_state->pid_using_dumpfile)));
+				(errmsg("skipping prewarm because block dump file is being written by PID %d",
+						(int) apw_state->pid_using_dumpfile)));
 		return;
 	}
 	LWLockRelease(&apw_state->lock);
@@ -357,8 +346,8 @@ apw_load_buffers(void)
 	FreeFile(file);
 
 	/* Sort the blocks to be loaded. */
-	pg_qsort(blkinfo, num_elements, sizeof(BlockInfoRecord),
-			 apw_compare_blockinfo);
+	qsort(blkinfo, num_elements, sizeof(BlockInfoRecord),
+		  apw_compare_blockinfo);
 
 	/* Populate shared memory state. */
 	apw_state->block_info_handle = dsm_segment_handle(seg);
@@ -599,12 +588,12 @@ apw_dump_now(bool is_bgworker, bool dump_unlogged)
 	{
 		if (!is_bgworker)
 			ereport(ERROR,
-					(errmsg("could not perform block dump because dump file is being used by PID %lu",
-							(unsigned long) apw_state->pid_using_dumpfile)));
+					(errmsg("could not perform block dump because dump file is being used by PID %d",
+							(int) apw_state->pid_using_dumpfile)));
 
 		ereport(LOG,
-				(errmsg("skipping block dump because it is already being performed by PID %lu",
-						(unsigned long) apw_state->pid_using_dumpfile)));
+				(errmsg("skipping block dump because it is already being performed by PID %d",
+						(int) apw_state->pid_using_dumpfile)));
 		return 0;
 	}
 
@@ -630,10 +619,12 @@ apw_dump_now(bool is_bgworker, bool dump_unlogged)
 		if (buf_state & BM_TAG_VALID &&
 			((buf_state & BM_PERMANENT) || dump_unlogged))
 		{
-			block_info_array[num_blocks].database = bufHdr->tag.rlocator.dbOid;
-			block_info_array[num_blocks].tablespace = bufHdr->tag.rlocator.spcOid;
-			block_info_array[num_blocks].filenumber = bufHdr->tag.rlocator.relNumber;
-			block_info_array[num_blocks].forknum = bufHdr->tag.forkNum;
+			block_info_array[num_blocks].database = bufHdr->tag.dbOid;
+			block_info_array[num_blocks].tablespace = bufHdr->tag.spcOid;
+			block_info_array[num_blocks].filenumber =
+				BufTagGetRelNumber(&bufHdr->tag);
+			block_info_array[num_blocks].forknum =
+				BufTagGetForkNum(&bufHdr->tag);
 			block_info_array[num_blocks].blocknum = bufHdr->tag.blockNum;
 			++num_blocks;
 		}
@@ -735,8 +726,8 @@ autoprewarm_start_worker(PG_FUNCTION_ARGS)
 	if (pid != InvalidPid)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("autoprewarm worker is already running under PID %lu",
-						(unsigned long) pid)));
+				 errmsg("autoprewarm worker is already running under PID %d",
+						(int) pid)));
 
 	apw_start_leader_worker();
 
@@ -765,6 +756,16 @@ autoprewarm_dump_now(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) num_blocks);
 }
 
+static void
+apw_init_state(void *ptr)
+{
+	AutoPrewarmSharedState *state = (AutoPrewarmSharedState *) ptr;
+
+	LWLockInitialize(&state->lock, LWLockNewTrancheId());
+	state->bgworker_pid = InvalidPid;
+	state->pid_using_dumpfile = InvalidPid;
+}
+
 /*
  * Allocate and initialize autoprewarm related shared memory, if not already
  * done, and set up backend-local pointer to that state.  Returns true if an
@@ -775,19 +776,10 @@ apw_init_shmem(void)
 {
 	bool		found;
 
-	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-	apw_state = ShmemInitStruct("autoprewarm",
-								sizeof(AutoPrewarmSharedState),
-								&found);
-	if (!found)
-	{
-		/* First time through ... */
-		LWLockInitialize(&apw_state->lock, LWLockNewTrancheId());
-		apw_state->bgworker_pid = InvalidPid;
-		apw_state->pid_using_dumpfile = InvalidPid;
-	}
-	LWLockRelease(AddinShmemInitLock);
-
+	apw_state = GetNamedDSMSegment("autoprewarm",
+								   sizeof(AutoPrewarmSharedState),
+								   apw_init_state,
+								   &found);
 	LWLockRegisterTranche(apw_state->lock.tranche, "autoprewarm");
 
 	return found;
@@ -839,7 +831,7 @@ apw_start_leader_worker(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("could not register background process"),
-				 errhint("You may need to increase max_worker_processes.")));
+				 errhint("You may need to increase \"max_worker_processes\".")));
 
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
 	if (status != BGWH_STARTED)

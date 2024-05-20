@@ -53,9 +53,10 @@ PostgreSQL documentation
    Backup verification proceeds in four stages. First,
    <literal>pg_verifybackup</literal> reads the
    <literal>backup_manifest</literal> file. If that file
-   does not exist, cannot be read, is malformed, or fails verification
-   against its own internal checksum, <literal>pg_verifybackup</literal>
-   will terminate with a fatal error.
+   does not exist, cannot be read, is malformed, fails to match the system
+   identifier with <filename>pg_control</filename> of the backup directory or
+   fails verification against its own internal checksum,
+   <literal>pg_verifybackup</literal> will terminate with a fatal error.
   </para>
 
   <para>
@@ -174,6 +175,21 @@ PostgreSQL documentation
        <para>
         Don't attempt to parse write-ahead log data that will be needed
         to recover from this backup.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-P</option></term>
+      <term><option>--progress</option></term>
+      <listitem>
+       <para>
+        Enable progress reporting. Turning this on will deliver a progress
+        report while verifying checksums.
+       </para>
+       <para>
+        This option cannot be used together with the option
+        <option>--quiet</option>.
        </para>
       </listitem>
      </varlistentry>

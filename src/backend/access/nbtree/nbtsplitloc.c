@@ -3,7 +3,7 @@
  * nbtsplitloc.c
  *	  Choose split point code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,14 +15,14 @@
 #include "postgres.h"
 
 #include "access/nbtree.h"
-#include "storage/lmgr.h"
+#include "common/int.h"
 
 typedef enum
 {
 	/* strategy for searching through materialized list of split points */
 	SPLIT_DEFAULT,				/* give some weight to truncation */
 	SPLIT_MANY_DUPLICATES,		/* find minimally distinguishing point */
-	SPLIT_SINGLE_VALUE			/* leave left page almost full */
+	SPLIT_SINGLE_VALUE,			/* leave left page almost full */
 } FindSplitStrat;
 
 typedef struct
@@ -119,7 +119,7 @@ static inline IndexTuple _bt_split_firstright(FindSplitData *state,
  * righthand page (which is called firstrightoff), plus a boolean
  * indicating whether the new tuple goes on the left or right page.  You
  * can think of the returned state as a point _between_ two adjacent data
- * items (laftleft and firstright data items) on an imaginary version of
+ * items (lastleft and firstright data items) on an imaginary version of
  * origpage that already includes newitem.  The bool is necessary to
  * disambiguate the case where firstrightoff == newitemoff (i.e. it is
  * sometimes needed to determine if the firstright tuple for the split is
@@ -596,12 +596,7 @@ _bt_splitcmp(const void *arg1, const void *arg2)
 	SplitPoint *split1 = (SplitPoint *) arg1;
 	SplitPoint *split2 = (SplitPoint *) arg2;
 
-	if (split1->curdelta > split2->curdelta)
-		return 1;
-	if (split1->curdelta < split2->curdelta)
-		return -1;
-
-	return 0;
+	return pg_cmp_s16(split1->curdelta, split2->curdelta);
 }
 
 /*

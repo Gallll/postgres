@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -13,7 +13,6 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -24,7 +23,8 @@
 
 /*
  * This must match enum LockTagType!  Also, be sure to document any changes
- * in the docs for the pg_locks view and for wait event types.
+ * in the docs for the pg_locks view and update the WaitEventLOCK section in
+ * src/backend/utils/activity/wait_event_names.txt.
  */
 const char *const LockTagTypeNames[] = {
 	"relation",
@@ -37,10 +37,11 @@ const char *const LockTagTypeNames[] = {
 	"spectoken",
 	"object",
 	"userlock",
-	"advisory"
+	"advisory",
+	"applytransaction"
 };
 
-StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_ADVISORY + 1),
+StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_LAST_TYPE + 1),
 				 "array length mismatch");
 
 /* This must match enum PredicateLockTargetType (predicate_internals.h) */
@@ -71,15 +72,16 @@ typedef struct
  * This is currently only used in pg_lock_status, so we put it here.
  */
 static Datum
-VXIDGetDatum(BackendId bid, LocalTransactionId lxid)
+VXIDGetDatum(ProcNumber procNumber, LocalTransactionId lxid)
 {
 	/*
-	 * The representation is "<bid>/<lxid>", decimal and unsigned decimal
-	 * respectively.  Note that elog.c also knows how to format a vxid.
+	 * The representation is "<procNumber>/<lxid>", decimal and unsigned
+	 * decimal respectively.  Note that elog.c also knows how to format a
+	 * vxid.
 	 */
 	char		vxidstr[32];
 
-	snprintf(vxidstr, sizeof(vxidstr), "%d/%u", bid, lxid);
+	snprintf(vxidstr, sizeof(vxidstr), "%d/%u", procNumber, lxid);
 
 	return CStringGetTextDatum(vxidstr);
 }
@@ -312,6 +314,29 @@ pg_lock_status(PG_FUNCTION_ARGS)
 				nulls[8] = true;
 				nulls[9] = true;
 				break;
+			case LOCKTAG_SPECULATIVE_TOKEN:
+				values[6] =
+					TransactionIdGetDatum(instance->locktag.locktag_field1);
+				values[8] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				nulls[1] = true;
+				nulls[2] = true;
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[7] = true;
+				nulls[9] = true;
+				break;
+			case LOCKTAG_APPLY_TRANSACTION:
+				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+				values[8] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				values[6] = ObjectIdGetDatum(instance->locktag.locktag_field3);
+				values[9] = Int16GetDatum(instance->locktag.locktag_field4);
+				nulls[2] = true;
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[7] = true;
+				break;
 			case LOCKTAG_OBJECT:
 			case LOCKTAG_USERLOCK:
 			case LOCKTAG_ADVISORY:
@@ -328,7 +353,7 @@ pg_lock_status(PG_FUNCTION_ARGS)
 				break;
 		}
 
-		values[10] = VXIDGetDatum(instance->backend, instance->lxid);
+		values[10] = VXIDGetDatum(instance->vxid.procNumber, instance->vxid.localTransactionId);
 		if (instance->pid != 0)
 			values[11] = Int32GetDatum(instance->pid);
 		else
@@ -394,7 +419,7 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		nulls[9] = true;		/* objsubid */
 
 		/* lock holder */
-		values[10] = VXIDGetDatum(xact->vxid.backendId,
+		values[10] = VXIDGetDatum(xact->vxid.procNumber,
 								  xact->vxid.localTransactionId);
 		if (xact->pid != 0)
 			values[11] = Int32GetDatum(xact->pid);

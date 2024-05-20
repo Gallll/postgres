@@ -3,7 +3,7 @@
  * gindesc.c
  *	  rmgr descriptor routines for access/transam/gin/ginxlog.c
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,9 +15,7 @@
 #include "postgres.h"
 
 #include "access/ginxlog.h"
-#include "access/xlogutils.h"
 #include "lib/stringinfo.h"
-#include "storage/relfilelocator.h"
 
 static void
 desc_recompress_leaf(StringInfo buf, ginxlogRecompressDataLeaf *insertData)
@@ -120,7 +118,7 @@ gin_desc(StringInfo buf, XLogReaderState *record)
 					else
 					{
 						ginxlogInsertDataInternal *insertData =
-						(ginxlogInsertDataInternal *) payload;
+							(ginxlogInsertDataInternal *) payload;
 
 						appendStringInfo(buf, " pitem: %u-%u/%u",
 										 PostingItemGetBlockNumber(&insertData->newitem),
@@ -156,7 +154,7 @@ gin_desc(StringInfo buf, XLogReaderState *record)
 				else
 				{
 					ginxlogVacuumDataLeafPage *xlrec =
-					(ginxlogVacuumDataLeafPage *) XLogRecGetBlockData(record, 0, NULL);
+						(ginxlogVacuumDataLeafPage *) XLogRecGetBlockData(record, 0, NULL);
 
 					desc_recompress_leaf(buf, &xlrec->data);
 				}

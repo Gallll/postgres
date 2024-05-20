@@ -3,7 +3,7 @@
  * nodeTidrangescan.c
  *	  Routines to support TID range scans of relations
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,23 +18,27 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/pg_operator.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeTidrangescan.h"
 #include "nodes/nodeFuncs.h"
-#include "storage/bufmgr.h"
 #include "utils/rel.h"
 
 
+/*
+ * It's sufficient to check varattno to identify the CTID variable, as any
+ * Var in the relation scan qual must be for our table.  (Even if it's a
+ * parameterized scan referencing some other table's CTID, the other table's
+ * Var would have become a Param by the time it gets here.)
+ */
 #define IsCTIDVar(node)  \
 	((node) != NULL && \
 	 IsA((node), Var) && \
-	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber && \
-	 ((Var *) (node))->varlevelsup == 0)
+	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber)
 
 typedef enum
 {
 	TIDEXPR_UPPER_BOUND,
-	TIDEXPR_LOWER_BOUND
+	TIDEXPR_LOWER_BOUND,
 } TidExprType;
 
 /* Upper or lower range bound for scan */
@@ -326,18 +330,6 @@ ExecEndTidRangeScan(TidRangeScanState *node)
 
 	if (scan != NULL)
 		table_endscan(scan);
-
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

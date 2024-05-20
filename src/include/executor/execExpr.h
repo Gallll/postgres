@@ -4,7 +4,7 @@
  *	  Low level infrastructure related to expression evaluation
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execExpr.h
@@ -16,13 +16,12 @@
 
 #include "executor/nodeAgg.h"
 #include "nodes/execnodes.h"
+#include "nodes/miscnodes.h"
 
 /* forward references to avoid circularity */
 struct ExprEvalStep;
 struct SubscriptingRefState;
 struct ScalarArrayOpExprHashTable;
-struct JsonbValue;
-struct JsonExprState;
 struct JsonConstructorExprState;
 
 /* Bits in ExprState->flags (see also execnodes.h for public flag bits): */
@@ -170,6 +169,7 @@ typedef enum ExprEvalOp
 
 	/* evaluate assorted special-purpose expression types */
 	EEOP_IOCOERCE,
+	EEOP_IOCOERCE_SAFE,
 	EEOP_DISTINCT,
 	EEOP_NOT_DISTINCT,
 	EEOP_NULLIF,
@@ -238,13 +238,16 @@ typedef enum ExprEvalOp
 	EEOP_SCALARARRAYOP,
 	EEOP_HASHED_SCALARARRAYOP,
 	EEOP_XMLEXPR,
+	EEOP_JSON_CONSTRUCTOR,
+	EEOP_IS_JSON,
+	EEOP_JSONEXPR_PATH,
+	EEOP_JSONEXPR_COERCION,
+	EEOP_JSONEXPR_COERCION_FINISH,
 	EEOP_AGGREF,
 	EEOP_GROUPING_FUNC,
 	EEOP_WINDOW_FUNC,
+	EEOP_MERGE_SUPPORT_FUNC,
 	EEOP_SUBPLAN,
-	EEOP_JSON_CONSTRUCTOR,
-	EEOP_IS_JSON,
-	EEOP_JSONEXPR,
 
 	/* aggregation related nodes */
 	EEOP_AGG_STRICT_DESERIALIZE,
@@ -258,6 +261,8 @@ typedef enum ExprEvalOp
 	EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF,
 	EEOP_AGG_PLAIN_TRANS_STRICT_BYREF,
 	EEOP_AGG_PLAIN_TRANS_BYREF,
+	EEOP_AGG_PRESORTED_DISTINCT_SINGLE,
+	EEOP_AGG_PRESORTED_DISTINCT_MULTI,
 	EEOP_AGG_ORDERED_TRANS_DATUM,
 	EEOP_AGG_ORDERED_TRANS_TUPLE,
 
@@ -548,6 +553,7 @@ typedef struct ExprEvalStep
 			bool	   *checknull;
 			/* OID of domain type */
 			Oid			resulttype;
+			ErrorSaveContext *escontext;
 		}			domaincheck;
 
 		/* for EEOP_CONVERT_ROWTYPE */
@@ -598,6 +604,12 @@ typedef struct ExprEvalStep
 			Datum	   *argvalue;
 			bool	   *argnull;
 		}			xmlexpr;
+
+		/* for EEOP_JSON_CONSTRUCTOR */
+		struct
+		{
+			struct JsonConstructorExprState *jcstate;
+		}			json_constructor;
 
 		/* for EEOP_AGGREF */
 		struct
@@ -659,6 +671,14 @@ typedef struct ExprEvalStep
 			int			jumpnull;
 		}			agg_plain_pergroup_nullcheck;
 
+		/* for EEOP_AGG_PRESORTED_DISTINCT_{SINGLE,MULTI} */
+		struct
+		{
+			AggStatePerTrans pertrans;
+			ExprContext *aggcontext;
+			int			jumpdistinct;
+		}			agg_presorted_distinctcheck;
+
 		/* for EEOP_AGG_PLAIN_TRANS_[INIT_][STRICT_]{BYVAL,BYREF} */
 		/* for EEOP_AGG_ORDERED_TRANS_{DATUM,TUPLE} */
 		struct
@@ -670,26 +690,32 @@ typedef struct ExprEvalStep
 			int			setoff;
 		}			agg_trans;
 
-		/* for EEOP_JSON_CONSTRUCTOR */
-		struct
-		{
-			struct JsonConstructorExprState *jcstate;
-		}			json_constructor;
-
 		/* for EEOP_IS_JSON */
 		struct
 		{
 			JsonIsPredicate *pred;	/* original expression node */
 		}			is_json;
 
-		/* for EEOP_JSONEXPR */
+		/* for EEOP_JSONEXPR_PATH */
 		struct
 		{
 			struct JsonExprState *jsestate;
 		}			jsonexpr;
 
+		/* for EEOP_JSONEXPR_COERCION */
+		struct
+		{
+			Oid			targettype;
+			int32		targettypmod;
+			void	   *json_populate_type_cache;
+			ErrorSaveContext *escontext;
+		}			jsonexpr_coercion;
 	}			d;
 } ExprEvalStep;
+
+/* Enforce the size rule given in the comment above */
+StaticAssertDecl(sizeof(ExprEvalStep) <= 64,
+				 "size of ExprEvalStep exceeds 64 bytes");
 
 
 /* Non-inline data for container operations */
@@ -747,49 +773,6 @@ typedef struct JsonConstructorExprState
 	int			nargs;
 } JsonConstructorExprState;
 
-/* EEOP_JSONEXPR state, too big to inline */
-typedef struct JsonExprState
-{
-	JsonExpr   *jsexpr;			/* original expression node */
-
-	struct
-	{
-		FmgrInfo	func;		/* typinput function for output type */
-		Oid			typioparam;
-	}			input;			/* I/O info for output type */
-
-	NullableDatum
-			   *formatted_expr, /* formatted context item value */
-			   *res_expr,		/* result item */
-			   *coercion_expr,	/* input for JSON item coercion */
-			   *pathspec;		/* path specification value */
-
-	ExprState  *result_expr;	/* coerced to output type */
-	ExprState  *default_on_empty;	/* ON EMPTY DEFAULT expression */
-	ExprState  *default_on_error;	/* ON ERROR DEFAULT expression */
-	List	   *args;			/* passing arguments */
-
-	void	   *cache;			/* cache for json_populate_type() */
-
-	struct JsonCoercionsState
-	{
-		struct JsonCoercionState
-		{
-			JsonCoercion *coercion; /* coercion expression */
-			ExprState  *estate; /* coercion expression state */
-		}			null,
-					string,
-		numeric    ,
-					boolean,
-					date,
-					time,
-					timetz,
-					timestamp,
-					timestamptz,
-					composite;
-	}			coercions;		/* states for coercion from SQL/JSON item
-								 * types directly to the output type */
-} JsonExprState;
 
 /* functions in execExpr.c */
 extern void ExprEvalPushStep(ExprState *es, const ExprEvalStep *s);
@@ -814,6 +797,7 @@ extern void ExecEvalParamExec(ExprState *state, ExprEvalStep *op,
 							  ExprContext *econtext);
 extern void ExecEvalParamExtern(ExprState *state, ExprEvalStep *op,
 								ExprContext *econtext);
+extern void ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalSQLValueFunction(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op);
@@ -840,34 +824,33 @@ extern void ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op,
 extern void ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op);
+extern void ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+									ExprContext *econtext);
 extern void ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op);
+extern int	ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
+								 ExprContext *econtext);
+extern void ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
+								 ExprContext *econtext);
+extern void ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op);
+extern void ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
+									 ExprContext *econtext);
 extern void ExecEvalSubPlan(ExprState *state, ExprEvalStep *op,
 							ExprContext *econtext);
 extern void ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op,
 								ExprContext *econtext);
 extern void ExecEvalSysVar(ExprState *state, ExprEvalStep *op,
 						   ExprContext *econtext, TupleTableSlot *slot);
-extern void ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
-									ExprContext *econtext);
-extern void ExecEvalJson(ExprState *state, ExprEvalStep *op,
-						 ExprContext *econtext);
-extern Datum ExecPrepareJsonItemCoercion(struct JsonbValue *item,
-										 JsonReturning *returning,
-										 struct JsonCoercionsState *coercions,
-										 struct JsonCoercionState **pjcstate);
-extern bool ExecEvalJsonNeedsSubTransaction(JsonExpr *jsexpr,
-											struct JsonCoercionsState *);
-extern Datum ExecEvalExprPassingCaseValue(ExprState *estate,
-										  ExprContext *econtext, bool *isnull,
-										  Datum caseval_datum,
-										  bool caseval_isnull);
 
 extern void ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup,
 							 ExprContext *aggcontext);
-extern Datum ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
-								  Datum newValue, bool newValueIsNull,
-								  Datum oldValue, bool oldValueIsNull);
+extern Datum ExecAggCopyTransValue(AggState *aggstate, AggStatePerTrans pertrans,
+								   Datum newValue, bool newValueIsNull,
+								   Datum oldValue, bool oldValueIsNull);
+extern bool ExecEvalPreOrderedDistinctSingle(AggState *aggstate,
+											 AggStatePerTrans pertrans);
+extern bool ExecEvalPreOrderedDistinctMulti(AggState *aggstate,
+											AggStatePerTrans pertrans);
 extern void ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op,
 										 ExprContext *econtext);
 extern void ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,

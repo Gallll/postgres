@@ -2047,11 +2047,9 @@ begin
 end $$ language plpgsql;
 select namedparmcursor_test7();
 
--- check that line comments work correctly within the argument list (there
--- is some special handling of this case in the code: the newline after the
--- comment must be preserved when the argument-evaluating query is
--- constructed, otherwise the comment effectively comments out the next
--- argument, too)
+-- check that line comments work correctly within the argument list
+-- (this used to require a special hack in the code; it no longer does,
+-- but let's keep the test anyway)
 create function namedparmcursor_test8() returns int4 as $$
 declare
   c1 cursor (p1 int, p2 int) for
@@ -2877,7 +2875,7 @@ create type record_type as (x text, y int, z boolean);
 
 create or replace function ret_query2(lim int) returns setof record_type as $$
 begin
-    return query select md5(s.x::text), s.x, s.x > 0
+    return query select fipshash(s.x::text), s.x, s.x > 0
                  from generate_series(-8, lim) s (x) where s.x % 2 = 0;
 end;
 $$ language plpgsql;
@@ -2929,6 +2927,9 @@ declare
   c2 cursor
        for select * from generate_series(41,43) i;
 begin
+  -- assign portal names to cursors to get stable output
+  c := 'c';
+  c2 := 'c2';
   for r in c(5,7) loop
     raise notice '% from %', r.i, c;
   end loop;
@@ -3001,6 +3002,23 @@ select forc01();
 select * from forc_test;
 
 drop function forc01();
+
+-- it's okay to re-use a cursor variable name, even when bound
+
+do $$
+declare cnt int := 0;
+  c1 cursor for select * from forc_test;
+begin
+  for r1 in c1 loop
+    declare c1 cursor for select * from forc_test;
+    begin
+      for r2 in c1 loop
+        cnt := cnt + 1;
+      end loop;
+    end;
+  end loop;
+  raise notice 'cnt = %', cnt;
+end $$;
 
 -- fail because cursor has no query bound to it
 
@@ -3336,7 +3354,7 @@ declare v int := 0;
 begin
   return 10 / v;
 end;
-$$ language plpgsql;
+$$ language plpgsql parallel safe;
 
 create or replace function raise_test() returns void as $$
 begin
@@ -3397,8 +3415,28 @@ $$ language plpgsql;
 
 select stacked_diagnostics_test();
 
-drop function zero_divide();
 drop function stacked_diagnostics_test();
+
+-- Test that an error recovery subtransaction is parallel safe
+
+create function error_trap_test() returns text as $$
+begin
+  perform zero_divide();
+  return 'no error detected!';
+exception when division_by_zero then
+  return 'division_by_zero detected';
+end;
+$$ language plpgsql parallel safe;
+
+set debug_parallel_query to on;
+
+explain (verbose, costs off) select error_trap_test();
+select error_trap_test();
+
+reset debug_parallel_query;
+
+drop function error_trap_test();
+drop function zero_divide();
 
 -- check cases where implicit SQLSTATE variable could be confused with
 -- SQLSTATE as a keyword, cf bug #5524
@@ -4186,7 +4224,7 @@ end;
 $$ language plpgsql;
 
 select outer_outer_func(10);
--- repeated call should to work
+-- repeated call should work
 select outer_outer_func(20);
 
 drop function outer_outer_func(int);
@@ -4241,12 +4279,37 @@ end;
 $$ language plpgsql;
 
 select outer_outer_func(10);
--- repeated call should to work
+-- repeated call should work
 select outer_outer_func(20);
 
 drop function outer_outer_func(int);
 drop function outer_func(int);
 drop function inner_func(int);
+
+-- Test pg_routine_oid
+create function current_function(text)
+returns regprocedure as $$
+declare
+  fn_oid regprocedure;
+begin
+  get diagnostics fn_oid = pg_routine_oid;
+  return fn_oid;
+end;
+$$ language plpgsql;
+
+select current_function('foo');
+
+drop function current_function(text);
+
+-- shouldn't fail in DO, even though there's no useful data
+do $$
+declare
+  fn_oid oid;
+begin
+  get diagnostics fn_oid = pg_routine_oid;
+  raise notice 'pg_routine_oid = %', fn_oid;
+end;
+$$;
 
 --
 -- Test ASSERT
@@ -4689,12 +4752,12 @@ END; $$ LANGUAGE plpgsql;
 SELECT * FROM get_from_partitioned_table(1) AS t;
 
 CREATE OR REPLACE FUNCTION list_partitioned_table()
-RETURNS SETOF partitioned_table.a%TYPE AS $$
+RETURNS SETOF public.partitioned_table.a%TYPE AS $$
 DECLARE
-    row partitioned_table%ROWTYPE;
-    a_val partitioned_table.a%TYPE;
+    row public.partitioned_table%ROWTYPE;
+    a_val public.partitioned_table.a%TYPE;
 BEGIN
-    FOR row IN SELECT * FROM partitioned_table ORDER BY a LOOP
+    FOR row IN SELECT * FROM public.partitioned_table ORDER BY a LOOP
         a_val := row.a;
         RETURN NEXT a_val;
     END LOOP;

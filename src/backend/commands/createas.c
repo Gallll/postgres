@@ -13,7 +13,7 @@
  * we must return a tuples-processed count in the QueryCompletion.  (We no
  * longer do that for CTAS ... WITH NO DATA, however.)
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,12 +25,9 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
@@ -41,9 +38,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parse_clause.h"
 #include "rewrite/rewriteHandler.h"
-#include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -333,7 +328,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		ExecutorStart(queryDesc, GetIntoRelEFlags(into));
 
 		/* run the plan to completion */
-		ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);
+		ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
 
 		/* save the rowcount if we're given a qc to fill */
 		if (qc)
@@ -393,11 +388,14 @@ bool
 CreateTableAsRelExists(CreateTableAsStmt *ctas)
 {
 	Oid			nspid;
+	Oid			oldrelid;
+	ObjectAddress address;
 	IntoClause *into = ctas->into;
 
 	nspid = RangeVarGetCreationNamespace(into->rel);
 
-	if (get_relname_relid(into->rel->relname, nspid))
+	oldrelid = get_relname_relid(into->rel->relname, nspid);
+	if (OidIsValid(oldrelid))
 	{
 		if (!ctas->if_not_exists)
 			ereport(ERROR,
@@ -405,7 +403,16 @@ CreateTableAsRelExists(CreateTableAsStmt *ctas)
 					 errmsg("relation \"%s\" already exists",
 							into->rel->relname)));
 
-		/* The relation exists and IF NOT EXISTS has been specified */
+		/*
+		 * The relation exists and IF NOT EXISTS has been specified.
+		 *
+		 * If we are in an extension script, insist that the pre-existing
+		 * object be a member of the extension, to avoid security risks.
+		 */
+		ObjectAddressSet(address, RelationRelationId, oldrelid);
+		checkMembershipInCurrentExtension(&address);
+
+		/* OK to skip */
 		ereport(NOTICE,
 				(errcode(ERRCODE_DUPLICATE_TABLE),
 				 errmsg("relation \"%s\" already exists, skipping",

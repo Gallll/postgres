@@ -37,6 +37,13 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     ATTACH PARTITION <replaceable class="parameter">partition_name</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT }
 ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     DETACH PARTITION <replaceable class="parameter">partition_name</replaceable> [ CONCURRENTLY | FINALIZE ]
+ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
+    SPLIT PARTITION <replaceable class="parameter">partition_name</replaceable> INTO
+        (PARTITION <replaceable class="parameter">partition_name1</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT },
+         PARTITION <replaceable class="parameter">partition_name2</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT } [, ...])
+ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
+    MERGE PARTITIONS (<replaceable class="parameter">partition_name1</replaceable>, <replaceable class="parameter">partition_name2</replaceable> [, ...])
+        INTO <replaceable class="parameter">partition_name</replaceable>
 
 <phrase>where <replaceable class="parameter">action</replaceable> is one of:</phrase>
 
@@ -46,14 +53,15 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET DEFAULT <replaceable class="parameter">expression</replaceable>
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> DROP DEFAULT
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> { SET | DROP } NOT NULL
+    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET EXPRESSION AS ( <replaceable class="parameter">expression</replaceable> )
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> DROP EXPRESSION [ IF EXISTS ]
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( <replaceable>sequence_options</replaceable> ) ]
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> { SET GENERATED { ALWAYS | BY DEFAULT } | SET <replaceable>sequence_option</replaceable> | RESTART [ [ WITH ] <replaceable class="parameter">restart</replaceable> ] } [...]
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> DROP IDENTITY [ IF EXISTS ]
-    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STATISTICS <replaceable class="parameter">integer</replaceable>
+    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STATISTICS { <replaceable class="parameter">integer</replaceable> | DEFAULT }
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET ( <replaceable class="parameter">attribute_option</replaceable> = <replaceable class="parameter">value</replaceable> [, ... ] )
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> RESET ( <replaceable class="parameter">attribute_option</replaceable> [, ... ] )
-    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN }
+    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN | DEFAULT }
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET COMPRESSION <replaceable class="parameter">compression_method</replaceable>
     ADD <replaceable class="parameter">table_constraint</replaceable> [ NOT VALID ]
     ADD <replaceable class="parameter">table_constraint_using_index</replaceable>
@@ -75,7 +83,7 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     CLUSTER ON <replaceable class="parameter">index_name</replaceable>
     SET WITHOUT CLUSTER
     SET WITHOUT OIDS
-    SET ACCESS METHOD <replaceable class="parameter">new_access_method</replaceable>
+    SET ACCESS METHOD { <replaceable class="parameter">new_access_method</replaceable> | DEFAULT }
     SET TABLESPACE <replaceable class="parameter">new_tablespace</replaceable>
     SET { LOGGED | UNLOGGED }
     SET ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] )
@@ -134,7 +142,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
 <phrase><replaceable class="parameter">exclude_element</replaceable> in an <literal>EXCLUDE</literal> constraint is:</phrase>
 
-{ <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ <replaceable class="parameter">opclass</replaceable> ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ]
+{ <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> [ ( <replaceable class="parameter">opclass_parameter</replaceable> = <replaceable class="parameter">value</replaceable> [, ... ] ) ] ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ]
 
 <phrase><replaceable class="parameter">referential_action</replaceable> in a <literal>FOREIGN KEY</literal>/<literal>REFERENCES</literal> constraint is:</phrase>
 
@@ -153,7 +161,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
    lock acquired will be the strictest one required by any subcommand.
 
   <variablelist>
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-add-column">
     <term><literal>ADD COLUMN [ IF NOT EXISTS ]</literal></term>
     <listitem>
      <para>
@@ -165,7 +173,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-drop-column">
     <term><literal>DROP COLUMN [ IF EXISTS ]</literal></term>
     <listitem>
      <para>
@@ -184,7 +192,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-data-type">
     <term><literal>SET DATA TYPE</literal></term>
     <listitem>
      <para>
@@ -211,7 +219,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-drop-default">
     <term><literal>SET</literal>/<literal>DROP DEFAULT</literal></term>
     <listitem>
      <para>
@@ -224,7 +232,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-drop-not-null">
     <term><literal>SET</literal>/<literal>DROP NOT NULL</literal></term>
     <listitem>
      <para>
@@ -255,7 +263,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-expression">
+    <term><literal>SET EXPRESSION AS</literal></term>
+    <listitem>
+     <para>
+      This form replaces the expression of a generated column.  Existing data
+      in the column is rewritten and all the future changes will apply the new
+      generation expression.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="sql-altertable-desc-drop-expression">
     <term><literal>DROP EXPRESSION [ IF EXISTS ]</literal></term>
     <listitem>
      <para>
@@ -272,7 +291,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-generated-identity">
     <term><literal>ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY</literal></term>
     <term><literal>SET GENERATED { ALWAYS | BY DEFAULT }</literal></term>
     <term><literal>DROP IDENTITY [ IF EXISTS ]</literal></term>
@@ -295,7 +314,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-sequence-option">
     <term><literal>SET <replaceable>sequence_option</replaceable></literal></term>
     <term><literal>RESTART</literal></term>
     <listitem>
@@ -308,16 +327,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-statistics">
     <term><literal>SET STATISTICS</literal></term>
     <listitem>
      <para>
       This form
       sets the per-column statistics-gathering target for subsequent
       <link linkend="sql-analyze"><command>ANALYZE</command></link> operations.
-      The target can be set in the range 0 to 10000; alternatively, set it
-      to -1 to revert to using the system default statistics
-      target (<xref linkend="guc-default-statistics-target"/>).
+      The target can be set in the range 0 to 10000.  Set it
+      to <literal>DEFAULT</literal> to revert to using the system default
+      statistics target (<xref linkend="guc-default-statistics-target"/>).
+      (Setting to a value of -1 is an obsolete way spelling to get the same
+      outcome.)
       For more information on the use of statistics by the
       <productname>PostgreSQL</productname> query planner, refer to
       <xref linkend="planner-stats"/>.
@@ -329,7 +350,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-attribute-option">
     <term><literal>SET ( <replaceable class="parameter">attribute_option</replaceable> = <replaceable class="parameter">value</replaceable> [, ... ] )</literal></term>
     <term><literal>RESET ( <replaceable class="parameter">attribute_option</replaceable> [, ... ] )</literal></term>
     <listitem>
@@ -365,9 +386,9 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-storage">
     <term>
-     <literal>SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN }</literal>
+     <literal>SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN | DEFAULT }</literal>
      <indexterm>
       <primary>TOAST</primary>
       <secondary>per-column storage settings</secondary>
@@ -376,26 +397,30 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <listitem>
      <para>
       This form sets the storage mode for a column. This controls whether this
-      column is held inline or in a secondary <acronym>TOAST</acronym> table, and
-      whether the data
+      column is held inline or in a secondary <acronym>TOAST</acronym> table,
+      and whether the data
       should be compressed or not. <literal>PLAIN</literal> must be used
       for fixed-length values such as <type>integer</type> and is
       inline, uncompressed. <literal>MAIN</literal> is for inline,
       compressible data. <literal>EXTERNAL</literal> is for external,
       uncompressed data, and <literal>EXTENDED</literal> is for external,
-      compressed data.  <literal>EXTENDED</literal> is the default for most
-      data types that support non-<literal>PLAIN</literal> storage.
+      compressed data.
+      Writing <literal>DEFAULT</literal> sets the storage mode to the default
+      mode for the column's data type.  <literal>EXTENDED</literal> is the
+      default for most data types that support non-<literal>PLAIN</literal>
+      storage.
       Use of <literal>EXTERNAL</literal> will make substring operations on
       very large <type>text</type> and <type>bytea</type> values run faster,
-      at the penalty of increased storage space.  Note that
-      <literal>SET STORAGE</literal> doesn't itself change anything in the table,
-      it just sets the strategy to be pursued during future table updates.
+      at the penalty of increased storage space.
+      Note that <literal>ALTER TABLE ... SET STORAGE</literal> doesn't itself
+      change anything in the table; it just sets the strategy to be pursued
+      during future table updates.
       See <xref linkend="storage-toast"/> for more information.
      </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-compression">
     <term>
      <literal>SET COMPRESSION <replaceable class="parameter">compression_method</replaceable></literal>
     </term>
@@ -425,7 +450,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-add-table-constraint">
     <term><literal>ADD <replaceable class="parameter">table_constraint</replaceable> [ NOT VALID ]</literal></term>
     <listitem>
      <para>
@@ -472,7 +497,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-add-table-constraint-using-index">
     <term><literal>ADD <replaceable class="parameter">table_constraint_using_index</replaceable></literal></term>
     <listitem>
      <para>
@@ -520,14 +545,14 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
        Adding a constraint using an existing index can be helpful in
        situations where a new constraint needs to be added without blocking
        table updates for a long time.  To do that, create the index using
-       <command>CREATE INDEX CONCURRENTLY</command>, and then install it as an
-       official constraint using this syntax.  See the example below.
+       <command>CREATE UNIQUE INDEX CONCURRENTLY</command>, and then convert it to a
+       constraint using this syntax.  See the example below.
       </para>
      </note>
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-alter-constraint">
     <term><literal>ALTER CONSTRAINT</literal></term>
     <listitem>
      <para>
@@ -537,7 +562,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-validate-constraint">
     <term><literal>VALIDATE CONSTRAINT</literal></term>
     <listitem>
      <para>
@@ -554,7 +579,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-drop-constraint">
     <term><literal>DROP CONSTRAINT [ IF EXISTS ]</literal></term>
     <listitem>
      <para>
@@ -566,18 +591,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-disable-enable-trigger">
     <term><literal>DISABLE</literal>/<literal>ENABLE [ REPLICA | ALWAYS ] TRIGGER</literal></term>
     <listitem>
      <para>
       These forms configure the firing of trigger(s) belonging to the table.
       A disabled trigger is still known to the system, but is not executed
-      when its triggering event occurs.  For a deferred trigger, the enable
+      when its triggering event occurs.  (For a deferred trigger, the enable
       status is checked when the event occurs, not when the trigger function
-      is actually executed.  One can disable or enable a single
+      is actually executed.)  One can disable or enable a single
       trigger specified by name, or all triggers on the table, or only
       user triggers (this option excludes internally generated constraint
-      triggers such as those that are used to implement foreign key
+      triggers, such as those that are used to implement foreign key
       constraints or deferrable uniqueness and exclusion constraints).
       Disabling or enabling internally generated constraint triggers
       requires superuser privileges; it should be done with caution since
@@ -599,7 +624,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       The effect of this mechanism is that in the default configuration,
       triggers do not fire on replicas.  This is useful because if a trigger
       is used on the origin to propagate data between tables, then the
-      replication system will also replicate the propagated data, and the
+      replication system will also replicate the propagated data; so the
       trigger should not fire a second time on the replica, because that would
       lead to duplication.  However, if a trigger is used for another purpose
       such as creating external alerts, then it might be appropriate to set it
@@ -608,12 +633,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
+      When this command is applied to a partitioned table, the states of
+      corresponding clone triggers in the partitions are updated too,
+      unless <literal>ONLY</literal> is specified.
+     </para>
+
+     <para>
       This command acquires a <literal>SHARE ROW EXCLUSIVE</literal> lock.
      </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-disable-enable-rule">
     <term><literal>DISABLE</literal>/<literal>ENABLE [ REPLICA | ALWAYS ] RULE</literal></term>
     <listitem>
      <para>
@@ -633,7 +664,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-disable-enable-row-level-security">
     <term><literal>DISABLE</literal>/<literal>ENABLE ROW LEVEL SECURITY</literal></term>
     <listitem>
      <para>
@@ -648,7 +679,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-force-row-level-security">
     <term><literal>NO FORCE</literal>/<literal>FORCE ROW LEVEL SECURITY</literal></term>
     <listitem>
      <para>
@@ -663,7 +694,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-cluster-on">
     <term><literal>CLUSTER ON</literal></term>
     <listitem>
      <para>
@@ -677,7 +708,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-without-cluster">
     <term><literal>SET WITHOUT CLUSTER</literal></term>
     <listitem>
      <para>
@@ -692,7 +723,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-without-oids">
     <term><literal>SET WITHOUT OIDS</literal></term>
     <listitem>
      <para>
@@ -703,17 +734,29 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-access-method">
     <term><literal>SET ACCESS METHOD</literal></term>
     <listitem>
      <para>
-      This form changes the access method of the table by rewriting it. See
-      <xref linkend="tableam"/> for more information.
+      This form changes the access method of the table by rewriting it
+      using the indicated access method; specifying
+      <literal>DEFAULT</literal> selects the access method set as the
+      <xref linkend="guc-default-table-access-method"/> configuration
+      parameter.
+      See <xref linkend="tableam"/> for more information.
+     </para>
+     <para>
+      When applied to a partitioned table, there is no data to rewrite,
+      but partitions created afterwards will default to the given access
+      method unless overridden by a <literal>USING</literal> clause.
+      Specifying <varname>DEFAULT</varname> removes a previous value,
+      causing future partitions to default to
+      <varname>default_table_access_method</varname>.
      </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-tablespace">
     <term><literal>SET TABLESPACE</literal></term>
     <listitem>
      <para>
@@ -745,7 +788,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-logged-unlogged">
     <term><literal>SET { LOGGED | UNLOGGED }</literal></term>
     <listitem>
      <para>
@@ -762,7 +805,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-storage-parameter">
     <term><literal>SET ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] )</literal></term>
     <listitem>
      <para>
@@ -788,7 +831,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-reset-storage-parameter">
     <term><literal>RESET ( <replaceable class="parameter">storage_parameter</replaceable> [, ... ] )</literal></term>
     <listitem>
      <para>
@@ -799,7 +842,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-inherit">
     <term><literal>INHERIT <replaceable class="parameter">parent_table</replaceable></literal></term>
     <listitem>
      <para>
@@ -827,7 +870,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-no-inherit">
     <term><literal>NO INHERIT <replaceable class="parameter">parent_table</replaceable></literal></term>
     <listitem>
      <para>
@@ -839,7 +882,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-of">
     <term><literal>OF <replaceable class="parameter">type_name</replaceable></literal></term>
     <listitem>
      <para>
@@ -853,7 +896,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-not-of">
     <term><literal>NOT OF</literal></term>
     <listitem>
      <para>
@@ -862,7 +905,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-owner-to">
     <term><literal>OWNER TO</literal></term>
     <listitem>
      <para>
@@ -883,7 +926,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       always logged regardless of whether it changed.
       This option has no effect except when logical replication is in use.
      <variablelist>
-      <varlistentry>
+      <varlistentry id="sql-altertable-replica-identity-default">
        <term><literal>DEFAULT</literal></term>
        <listitem>
         <para>
@@ -893,7 +936,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
        </listitem>
       </varlistentry>
 
-      <varlistentry>
+      <varlistentry id="sql-altertable-replica-identity-using-index">
        <term><literal>USING INDEX <replaceable class="parameter">index_name</replaceable></literal></term>
        <listitem>
         <para>
@@ -905,7 +948,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
        </listitem>
       </varlistentry>
 
-      <varlistentry>
+      <varlistentry id="sql-altertable-replica-identity-full">
        <term><literal>FULL</literal></term>
        <listitem>
         <para>
@@ -914,7 +957,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
        </listitem>
       </varlistentry>
 
-      <varlistentry>
+      <varlistentry id="sql-altertable-replica-identity-nothing">
        <term><literal>NOTHING</literal></term>
        <listitem>
         <para>
@@ -927,7 +970,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-rename">
     <term><literal>RENAME</literal></term>
     <listitem>
      <para>
@@ -941,7 +984,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-altertable-desc-set-schema">
     <term><literal>SET SCHEMA</literal></term>
     <listitem>
      <para>
@@ -1001,7 +1044,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       constraint. This does not work, however, if any of the partition keys
       is an expression and the partition does not accept
       <literal>NULL</literal> values. If attaching a list partition that will
-      not accept <literal>NULL</literal> values, also add
+      not accept <literal>NULL</literal> values, also add a
       <literal>NOT NULL</literal> constraint to the partition key column,
       unless it's an expression.
      </para>
@@ -1081,14 +1124,133 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
+   <varlistentry id="sql-altertable-split-partition">
+    <term><literal>SPLIT PARTITION <replaceable class="parameter">partition_name</replaceable> INTO (PARTITION <replaceable class="parameter">partition_name1</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT }, PARTITION <replaceable class="parameter">partition_name2</replaceable> { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT } [, ...])</literal></term>
+
+    <listitem>
+     <para>
+      This form splits a single partition of the target table. Hash-partitioning
+      is not supported. Bounds of new partitions should not overlap with new and
+      existing partitions (except <replaceable class="parameter">partition_name</replaceable>).
+      If the split partition is a DEFAULT partition, one of the new partitions must be DEFAULT.
+      In case one of the new partitions or one of existing partitions is DEFAULT,
+      new partitions <replaceable class="parameter">partition_name1</replaceable>,
+      <replaceable class="parameter">partition_name2</replaceable>, ... can have spaces
+      between partitions bounds.  If the partitioned table does not have a DEFAULT
+      partition, the DEFAULT partition can be defined as one of the new partitions.
+     </para>
+     <para>
+      In case new partitions do not contain a DEFAULT partition and the partitioned table
+      does not have a DEFAULT partition, the following must be true: sum bounds of
+      new partitions <replaceable class="parameter">partition_name1</replaceable>,
+      <replaceable class="parameter">partition_name2</replaceable>, ... should be
+      equal to bound of split partition <replaceable class="parameter">partition_name</replaceable>.
+      One of the new partitions <replaceable class="parameter">partition_name1</replaceable>,
+      <replaceable class="parameter">partition_name2</replaceable>, ... can have
+      the same name as split partition <replaceable class="parameter">partition_name</replaceable>
+      (this is suitable in case of splitting a DEFAULT partition: we split it, but after
+      splitting we have a partition with the same name).
+      Only simple, non-partitioned partition can be split.
+     </para>
+     <para>
+      The new partitions will be created the same as tables created with the
+      SQL command <literal>CREATE TABLE <replaceable class="parameter">partition_nameN</replaceable> (LIKE <replaceable class="parameter">name</replaceable> INCLUDING ALL EXCLUDING INDEXES EXCLUDING IDENTITY)</literal>.
+      The indexes and identity are created later, after moving the data
+      into the new partitions.
+      New partitions will have the same table access method as the parent.
+      If the parent table is persistent then new partitions are created
+      persistent.  If the parent table is temporary then new partitions
+      are also created temporary.
+     </para>
+     <note>
+      <para>
+       This command acquires an <literal>ACCESS EXCLUSIVE</literal> lock.
+       This is a significant limitation, which limits the usage of this
+       command with large partitioned tables under a high load.
+      </para>
+     </note>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="sql-altertable-merge-partitions">
+    <term><literal>MERGE PARTITIONS (<replaceable class="parameter">partition_name1</replaceable>, <replaceable class="parameter">partition_name2</replaceable> [, ...]) INTO <replaceable class="parameter">partition_name</replaceable></literal></term>
+
+    <listitem>
+     <para>
+      This form merges several partitions into the one partition of the target table.
+      Hash-partitioning is not supported.  If DEFAULT partition is not in the
+      list of partitions <replaceable class="parameter">partition_name1</replaceable>,
+      <replaceable class="parameter">partition_name2</replaceable> [, ...]:
+      <itemizedlist>
+       <listitem>
+        <para>
+         For range-partitioned tables it is necessary that the ranges
+         of the partitions <replaceable class="parameter">partition_name1</replaceable>,
+         <replaceable class="parameter">partition_name2</replaceable> [, ...] can
+         be merged into one range without spaces and overlaps (otherwise an error
+         will be generated).  The combined range will be the range for the partition
+         <replaceable class="parameter">partition_name</replaceable>.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         For list-partitioned tables the value lists of all partitions
+         <replaceable class="parameter">partition_name1</replaceable>,
+         <replaceable class="parameter">partition_name2</replaceable> [, ...] are
+         combined and form the list of values of partition
+         <replaceable class="parameter">partition_name</replaceable>.
+        </para>
+       </listitem>
+      </itemizedlist>
+      If DEFAULT partition is in the list of partitions <replaceable class="parameter">partition_name1</replaceable>,
+      <replaceable class="parameter">partition_name2</replaceable> [, ...]:
+      <itemizedlist>
+       <listitem>
+        <para>
+         The partition <replaceable class="parameter">partition_name</replaceable>
+         will be the DEFAULT partition.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         For range- and list-partitioned tables the ranges and lists of values
+         of the merged partitions can be any.
+        </para>
+       </listitem>
+      </itemizedlist>
+      The new partition <replaceable class="parameter">partition_name</replaceable>
+      can have the same name as one of the merged partitions.  Only simple,
+      non-partitioned partitions can be merged.
+     </para>
+     <para>
+      The new partition will be created the same as a table created with the
+      SQL command <literal>CREATE TABLE <replaceable class="parameter">partition_name</replaceable> (LIKE <replaceable class="parameter">name</replaceable> INCLUDING ALL EXCLUDING INDEXES EXCLUDING IDENTITY)</literal>.
+      The indexes and identity are created later, after moving the data
+      into the new partition.
+      The new partition will have the same table access method as the parent.
+      If the parent table is persistent then the new partition is created
+      persistent.  If the parent table is temporary then the new partition
+      is also created temporary.
+     </para>
+     <note>
+      <para>
+       This command acquires an <literal>ACCESS EXCLUSIVE</literal> lock.
+       This is a significant limitation, which limits the usage of this
+       command with large partitioned tables under a high load.
+      </para>
+     </note>
+    </listitem>
+   </varlistentry>
+
   </variablelist>
   </para>
 
   <para>
    All the forms of ALTER TABLE that act on a single table, except
    <literal>RENAME</literal>, <literal>SET SCHEMA</literal>,
-   <literal>ATTACH PARTITION</literal>, and
-   <literal>DETACH PARTITION</literal> can be combined into
+   <literal>ATTACH PARTITION</literal>, <literal>DETACH PARTITION</literal>,
+   <literal>SPLIT PARTITION</literal>, and <literal>MERGE PARTITIONS</literal>
+   can be combined into
    a list of multiple alterations to be applied together.  For example, it
    is possible to add several columns and/or alter the type of several
    columns in a single command.  This is particularly useful with large
@@ -1102,9 +1264,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
    To add the table as a new child of a parent table, you must own the parent
    table as well.  Also, to attach a table as a new partition of the table,
    you must own the table being attached.
-   To alter the owner, you must also be a direct or indirect member of the new
-   owning role, and that role must have <literal>CREATE</literal> privilege on
-   the table's schema.  (These restrictions enforce that altering the owner
+   To alter the owner, you must be able to <literal>SET ROLE</literal> to the
+   new owning role, and that role must have <literal>CREATE</literal>
+   privilege on the table's schema.
+   (These restrictions enforce that altering the owner
    doesn't do anything you couldn't do by dropping and recreating the table.
    However, a superuser can alter ownership of any table anyway.)
    To add a column or alter a column type or use the <literal>OF</literal>
@@ -1118,7 +1281,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
     <variablelist>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-if-exists">
       <term><literal>IF EXISTS</literal></term>
       <listitem>
        <para>
@@ -1128,7 +1291,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-name">
       <term><replaceable class="parameter">name</replaceable></term>
       <listitem>
        <para>
@@ -1142,7 +1305,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-column-name">
       <term><replaceable class="parameter">column_name</replaceable></term>
       <listitem>
        <para>
@@ -1151,7 +1314,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-column-name">
       <term><replaceable class="parameter">new_column_name</replaceable></term>
       <listitem>
        <para>
@@ -1160,7 +1323,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-name">
       <term><replaceable class="parameter">new_name</replaceable></term>
       <listitem>
        <para>
@@ -1169,7 +1332,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-data-type">
       <term><replaceable class="parameter">data_type</replaceable></term>
       <listitem>
        <para>
@@ -1179,7 +1342,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-table-constraint">
       <term><replaceable class="parameter">table_constraint</replaceable></term>
       <listitem>
        <para>
@@ -1188,7 +1351,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-constraint-name">
       <term><replaceable class="parameter">constraint_name</replaceable></term>
       <listitem>
        <para>
@@ -1197,7 +1360,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-cascade">
       <term><literal>CASCADE</literal></term>
       <listitem>
        <para>
@@ -1209,7 +1372,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-restrict">
       <term><literal>RESTRICT</literal></term>
       <listitem>
        <para>
@@ -1219,7 +1382,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-trigger-name">
       <term><replaceable class="parameter">trigger_name</replaceable></term>
       <listitem>
        <para>
@@ -1228,32 +1391,32 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-all">
       <term><literal>ALL</literal></term>
       <listitem>
        <para>
         Disable or enable all triggers belonging to the table.
         (This requires superuser privilege if any of the triggers are
-        internally generated constraint triggers such as those that are used
+        internally generated constraint triggers, such as those that are used
         to implement foreign key constraints or deferrable uniqueness and
         exclusion constraints.)
        </para>
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-user">
       <term><literal>USER</literal></term>
       <listitem>
        <para>
         Disable or enable all triggers belonging to the table except for
-        internally generated constraint triggers such as those that are used
+        internally generated constraint triggers, such as those that are used
         to implement foreign key constraints or deferrable uniqueness and
         exclusion constraints.
        </para>
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-index-name">
       <term><replaceable class="parameter">index_name</replaceable></term>
       <listitem>
        <para>
@@ -1262,7 +1425,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-storage-parameter">
       <term><replaceable class="parameter">storage_parameter</replaceable></term>
       <listitem>
        <para>
@@ -1271,7 +1434,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-value">
       <term><replaceable class="parameter">value</replaceable></term>
       <listitem>
        <para>
@@ -1281,7 +1444,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-parent-table">
       <term><replaceable class="parameter">parent_table</replaceable></term>
       <listitem>
        <para>
@@ -1290,7 +1453,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-owner">
       <term><replaceable class="parameter">new_owner</replaceable></term>
       <listitem>
        <para>
@@ -1299,7 +1462,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-access-method">
       <term><replaceable class="parameter">new_access_method</replaceable></term>
       <listitem>
        <para>
@@ -1308,7 +1471,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-tablespace">
       <term><replaceable class="parameter">new_tablespace</replaceable></term>
       <listitem>
        <para>
@@ -1317,7 +1480,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-new-schema">
       <term><replaceable class="parameter">new_schema</replaceable></term>
       <listitem>
        <para>
@@ -1326,16 +1489,17 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-partition-name">
       <term><replaceable class="parameter">partition_name</replaceable></term>
       <listitem>
        <para>
-        The name of the table to attach as a new partition or to detach from this table.
+        The name of the table to attach as a new partition or to detach from this table,
+        or the name of split partition, or the name of the new merged partition.
        </para>
       </listitem>
      </varlistentry>
 
-     <varlistentry>
+     <varlistentry id="sql-altertable-parms-partition-bound-spec">
       <term><replaceable class="parameter">partition_bound_spec</replaceable></term>
       <listitem>
        <para>
@@ -1373,7 +1537,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     type or an unconstrained domain over the new type, a table rewrite is not
     needed. However, indexes must always be rebuilt unless the system can
     verify that the new index would be logically equivalent to the existing
-    one.  For example, if the collation for a column has been changed an index
+    one.  For example, if the collation for a column has been changed, an index
     rebuild is always required because the new sort order might be different.
     However, in the absence of a collation change, a column can be changed
     from <type>text</type> to <type>varchar</type> (or vice versa) without
@@ -1499,9 +1663,12 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     The actions for identity columns (<literal>ADD
     GENERATED</literal>, <literal>SET</literal> etc., <literal>DROP
     IDENTITY</literal>), as well as the actions
-    <literal>TRIGGER</literal>, <literal>CLUSTER</literal>, <literal>OWNER</literal>,
+    <literal>CLUSTER</literal>, <literal>OWNER</literal>,
     and <literal>TABLESPACE</literal> never recurse to descendant tables;
     that is, they always act as though <literal>ONLY</literal> were specified.
+    Actions affecting trigger states recurse to partitions of partitioned
+    tables (unless <literal>ONLY</literal> is specified), but never to
+    traditional-inheritance descendants.
     Adding a constraint recurses only for <literal>CHECK</literal> constraints
     that are not marked <literal>NO INHERIT</literal>.
    </para>
@@ -1741,6 +1908,31 @@ ALTER TABLE cities
 <programlisting>
 ALTER TABLE measurement
     DETACH PARTITION measurement_y2015m12;
+</programlisting></para>
+
+  <para>
+   To split a single partition of the range-partitioned table:
+<programlisting>
+ALTER TABLE sales_range SPLIT PARTITION sales_feb_mar_apr2023 INTO
+   (PARTITION sales_feb2023 FOR VALUES FROM ('2023-02-01') TO ('2023-03-01'),
+    PARTITION sales_mar2023 FOR VALUES FROM ('2023-03-01') TO ('2023-04-01'),
+    PARTITION sales_apr2023 FOR VALUES FROM ('2023-04-01') TO ('2023-05-01'));
+</programlisting></para>
+
+  <para>
+   To split a single partition of the list-partitioned table:
+<programlisting>
+ALTER TABLE sales_list SPLIT PARTITION sales_all INTO
+   (PARTITION sales_west FOR VALUES IN ('Lisbon', 'New York', 'Madrid'),
+    PARTITION sales_east FOR VALUES IN ('Bejing', 'Delhi', 'Vladivostok'),
+    PARTITION sales_central FOR VALUES IN ('Warsaw', 'Berlin', 'Kyiv'));
+</programlisting></para>
+
+  <para>
+   To merge several partitions into one partition of the target table:
+<programlisting>
+ALTER TABLE sales_list MERGE PARTITIONS (sales_west, sales_east, sales_central)
+    INTO sales_all;
 </programlisting></para>
 
  </refsect1>

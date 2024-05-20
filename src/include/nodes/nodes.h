@@ -4,7 +4,7 @@
  *	  Definitions for tagged nodes.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodes.h
@@ -53,16 +53,20 @@ typedef enum NodeTag
  * - custom_read_write: Has custom implementations in outfuncs.c and
  *   readfuncs.c.
  *
+ * - custom_query_jumble: Has custom implementation in queryjumblefuncs.c.
+ *
  * - no_copy: Does not support copyObject() at all.
  *
  * - no_equal: Does not support equal() at all.
  *
  * - no_copy_equal: Shorthand for both no_copy and no_equal.
  *
+ * - no_query_jumble: Does not support JumbleQuery() at all.
+ *
  * - no_read: Does not support nodeRead() at all.
  *
- * - nodetag_only: Does not support copyObject(), equal(), outNode(),
- *   or nodeRead().
+ * - nodetag_only: Does not support copyObject(), equal(), jumbleQuery()
+ *   outNode() or nodeRead().
  *
  * - special_read_write: Has special treatment in outNode() and nodeRead().
  *
@@ -73,10 +77,10 @@ typedef enum NodeTag
  *
  * Node types can be supertypes of other types whether or not they are marked
  * abstract: if a node struct appears as the first field of another struct
- * type, then it is the supertype of that type.  The no_copy, no_equal, and
- * no_read node attributes are automatically inherited from the supertype.
- * (Notice that nodetag_only does not inherit, so it's not quite equivalent
- * to a combination of other attributes.)
+ * type, then it is the supertype of that type.  The no_copy, no_equal,
+ * no_query_jumble and no_read node attributes are automatically inherited
+ * from the supertype.  (Notice that nodetag_only does not inherit, so it's
+ * not quite equivalent to a combination of other attributes.)
  *
  * Valid node field attributes:
  *
@@ -86,10 +90,23 @@ typedef enum NodeTag
  *
  * - copy_as(VALUE): In copyObject(), replace the field's value with VALUE.
  *
+ * - copy_as_scalar: In copyObject(), copy the field as a scalar value
+ *   (e.g. a pointer) even if it is a node-type pointer.
+ *
+ * - equal_as_scalar: In equal(), compare the field as a scalar value
+ *   even if it is a node-type pointer.
+ *
  * - equal_ignore: Ignore the field for equality.
  *
  * - equal_ignore_if_zero: Ignore the field for equality if it is zero.
  *   (Otherwise, compare normally.)
+ *
+ * - query_jumble_ignore: Ignore the field for the query jumbling.  Note
+ *   that typmod and collation information are usually irrelevant for the
+ *   query jumbling.
+ *
+ * - query_jumble_location: Mark the field as a location to track.  This is
+ *   only allowed for integer fields that include "location" in their name.
  *
  * - read_as(VALUE): In nodeRead(), replace the field's value with VALUE.
  *
@@ -122,39 +139,18 @@ typedef struct Node
  *
  * !WARNING!: Avoid using newNode directly. You should be using the
  *	  macro makeNode.  eg. to create a Query node, use makeNode(Query)
- *
- * Note: the size argument should always be a compile-time constant, so the
- * apparent risk of multiple evaluation doesn't matter in practice.
  */
-#ifdef __GNUC__
+static inline Node *
+newNode(size_t size, NodeTag tag)
+{
+	Node	   *result;
 
-/* With GCC, we can use a compound statement within an expression */
-#define newNode(size, tag) \
-({	Node   *_result; \
-	AssertMacro((size) >= sizeof(Node));		/* need the tag, at least */ \
-	_result = (Node *) palloc0fast(size); \
-	_result->type = (tag); \
-	_result; \
-})
-#else
+	Assert(size >= sizeof(Node));	/* need the tag, at least */
+	result = (Node *) palloc0(size);
+	result->type = tag;
 
-/*
- *	There is no way to dereference the palloc'ed pointer to assign the
- *	tag, and also return the pointer itself, so we need a holder variable.
- *	Fortunately, this macro isn't recursive so we just define
- *	a global variable for this purpose.
- */
-extern PGDLLIMPORT Node *newNodeMacroHolder;
-
-#define newNode(size, tag) \
-( \
-	AssertMacro((size) >= sizeof(Node)),		/* need the tag, at least */ \
-	newNodeMacroHolder = (Node *) palloc0fast(size), \
-	newNodeMacroHolder->type = (tag), \
-	newNodeMacroHolder \
-)
-#endif							/* __GNUC__ */
-
+	return result;
+}
 
 #define makeNode(_type_)		((_type_ *) newNode(sizeof(_type_),T_##_type_))
 #define NodeSetTag(nodeptr,t)	(((Node*)(nodeptr))->type = (t))
@@ -199,6 +195,7 @@ extern void outBitmapset(struct StringInfoData *str,
 extern void outDatum(struct StringInfoData *str, uintptr_t value,
 					 int typlen, bool typbyval);
 extern char *nodeToString(const void *obj);
+extern char *nodeToStringWithLocations(const void *obj);
 extern char *bmsToString(const struct Bitmapset *bms);
 
 /*
@@ -218,7 +215,7 @@ extern int16 *readAttrNumberCols(int numCols);
 /*
  * nodes/copyfuncs.c
  */
-extern void *copyObjectImpl(const void *obj);
+extern void *copyObjectImpl(const void *from);
 
 /* cast result back to argument type, if supported by compiler */
 #ifdef HAVE_TYPEOF
@@ -234,9 +231,18 @@ extern bool equal(const void *a, const void *b);
 
 
 /*
- * Typedefs for identifying qualifier selectivities and plan costs as such.
- * These are just plain "double"s, but declaring a variable as Selectivity
- * or Cost makes the intent more obvious.
+ * Typedef for parse location.  This is just an int, but this way
+ * gen_node_support.pl knows which fields should get special treatment for
+ * location values.
+ *
+ * -1 is used for unknown.
+ */
+typedef int ParseLoc;
+
+/*
+ * Typedefs for identifying qualifier selectivities, plan costs, and row
+ * counts as such.  These are just plain "double"s, but declaring a variable
+ * as Selectivity, Cost, or Cardinality makes the intent more obvious.
  *
  * These could have gone into plannodes.h or some such, but many files
  * depend on them...
@@ -263,7 +269,7 @@ typedef enum CmdType
 	CMD_MERGE,					/* merge stmt */
 	CMD_UTILITY,				/* cmds like create, destroy, copy, vacuum,
 								 * etc. */
-	CMD_NOTHING					/* dummy command for instead nothing rules
+	CMD_NOTHING,				/* dummy command for instead nothing rules
 								 * with qual */
 } CmdType;
 
@@ -300,13 +306,14 @@ typedef enum JoinType
 	 */
 	JOIN_SEMI,					/* 1 copy of each LHS row that has match(es) */
 	JOIN_ANTI,					/* 1 copy of each LHS row that has no match */
+	JOIN_RIGHT_ANTI,			/* 1 copy of each RHS row that has no match */
 
 	/*
 	 * These codes are used internally in the planner, but are not supported
 	 * by the executor (nor, indeed, by most of the planner).
 	 */
 	JOIN_UNIQUE_OUTER,			/* LHS path must be made unique */
-	JOIN_UNIQUE_INNER			/* RHS path must be made unique */
+	JOIN_UNIQUE_INNER,			/* RHS path must be made unique */
 
 	/*
 	 * We might need additional join types someday.
@@ -332,7 +339,8 @@ typedef enum JoinType
 	  ((1 << JOIN_LEFT) | \
 	   (1 << JOIN_FULL) | \
 	   (1 << JOIN_RIGHT) | \
-	   (1 << JOIN_ANTI))) != 0)
+	   (1 << JOIN_ANTI) | \
+	   (1 << JOIN_RIGHT_ANTI))) != 0)
 
 /*
  * AggStrategy -
@@ -345,7 +353,7 @@ typedef enum AggStrategy
 	AGG_PLAIN,					/* simple agg across all input rows */
 	AGG_SORTED,					/* grouped agg, input must be sorted */
 	AGG_HASHED,					/* grouped agg, use internal hashtable */
-	AGG_MIXED					/* grouped agg, hash and sort both used */
+	AGG_MIXED,					/* grouped agg, hash and sort both used */
 } AggStrategy;
 
 /*
@@ -369,7 +377,7 @@ typedef enum AggSplit
 	/* Initial phase of partial aggregation, with serialization: */
 	AGGSPLIT_INITIAL_SERIAL = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE,
 	/* Final phase of partial aggregation, with deserialization: */
-	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE
+	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE,
 } AggSplit;
 
 /* Test whether an AggSplit value selects each primitive option: */
@@ -389,13 +397,13 @@ typedef enum SetOpCmd
 	SETOPCMD_INTERSECT,
 	SETOPCMD_INTERSECT_ALL,
 	SETOPCMD_EXCEPT,
-	SETOPCMD_EXCEPT_ALL
+	SETOPCMD_EXCEPT_ALL,
 } SetOpCmd;
 
 typedef enum SetOpStrategy
 {
 	SETOP_SORTED,				/* input must be sorted */
-	SETOP_HASHED				/* use internal hashtable */
+	SETOP_HASHED,				/* use internal hashtable */
 } SetOpStrategy;
 
 /*
@@ -408,7 +416,7 @@ typedef enum OnConflictAction
 {
 	ONCONFLICT_NONE,			/* No "ON CONFLICT" clause */
 	ONCONFLICT_NOTHING,			/* ON CONFLICT ... DO NOTHING */
-	ONCONFLICT_UPDATE			/* ON CONFLICT ... DO UPDATE */
+	ONCONFLICT_UPDATE,			/* ON CONFLICT ... DO UPDATE */
 } OnConflictAction;
 
 /*
@@ -421,7 +429,6 @@ typedef enum LimitOption
 {
 	LIMIT_OPTION_COUNT,			/* FETCH FIRST... ONLY */
 	LIMIT_OPTION_WITH_TIES,		/* FETCH FIRST... WITH TIES */
-	LIMIT_OPTION_DEFAULT,		/* No limit present */
 } LimitOption;
 
 #endif							/* NODES_H */

@@ -4,7 +4,7 @@
  *	  Implement PGSemaphores using SysV semaphore facilities
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,13 +17,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/file.h>
-#include <sys/stat.h>
-#ifdef HAVE_SYS_IPC_H
 #include <sys/ipc.h>
-#endif
-#ifdef HAVE_SYS_SEM_H
 #include <sys/sem.h>
-#endif
+#include <sys/stat.h>
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -131,7 +127,7 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
 						 "semaphore sets (SEMMNI), or the system wide maximum number of "
 						 "semaphores (SEMMNS), would be exceeded.  You need to raise the "
 						 "respective kernel parameter.  Alternatively, reduce PostgreSQL's "
-						 "consumption of semaphores by reducing its max_connections parameter.\n"
+						 "consumption of semaphores by reducing its \"max_connections\" parameter.\n"
 						 "The PostgreSQL documentation contains more information about "
 						 "configuring your system for PostgreSQL.") : 0));
 	}

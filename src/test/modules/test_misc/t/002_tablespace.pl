@@ -1,9 +1,12 @@
+
+# Copyright (c) 2024, PostgreSQL Global Development Group
+
 # Simple tablespace tests that can't be replicated on the same host
 # due to the use of absolute paths, so we keep them out of the regular
 # regression tests.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -13,7 +16,7 @@ $node->init;
 $node->start;
 
 # Create a couple of directories to use as tablespaces.
-my $basedir      = $node->basedir();
+my $basedir = $node->basedir();
 my $TS1_LOCATION = "$basedir/ts1";
 $TS1_LOCATION =~ s/\/\.\//\//g;    # collapse foo/./bar to foo/bar
 mkdir($TS1_LOCATION);

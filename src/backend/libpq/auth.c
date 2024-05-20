@@ -3,7 +3,7 @@
  * auth.c
  *	  Routines to handle network authentication
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,13 +16,12 @@
 #include "postgres.h"
 
 #include <sys/param.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <pwd.h>
 #include <unistd.h>
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
 
 #include "commands/user.h"
 #include "common/ip.h"
@@ -38,9 +37,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/timestamp.h"
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -136,14 +133,6 @@ static int	CheckBSDAuth(Port *port, char *user);
 #else
 #include <winldap.h>
 
-/* Correct header from the Platform SDK */
-typedef
-ULONG		(*__ldap_start_tls_sA) (IN PLDAP ExternalHandle,
-									OUT PULONG ServerReturnValue,
-									OUT LDAPMessage **result,
-									IN PLDAPControlA * ServerControls,
-									IN PLDAPControlA * ClientControls
-);
 #endif
 
 static int	CheckLDAPAuth(Port *port);
@@ -152,6 +141,10 @@ static int	CheckLDAPAuth(Port *port);
 #ifndef LDAP_OPT_DIAGNOSTIC_MESSAGE
 #define LDAP_OPT_DIAGNOSTIC_MESSAGE LDAP_OPT_ERROR_STRING
 #endif
+
+/* Default LDAP password mutator hook, can be overridden by a shared library */
+static char *dummy_ldap_password_mutator(char *input);
+auth_password_hook_typ ldap_password_hook = dummy_ldap_password_mutator;
 
 #endif							/* USE_LDAP */
 
@@ -170,6 +163,7 @@ static int	CheckCertAuth(Port *port);
  */
 char	   *pg_krb_server_keyfile;
 bool		pg_krb_caseins_users;
+bool		pg_gss_accept_delegation;
 
 
 /*----------------------------------------------------------------
@@ -316,8 +310,9 @@ auth_failed(Port *port, int status, const char *logdetail)
 			break;
 	}
 
-	cdetail = psprintf(_("Connection matched pg_hba.conf line %d: \"%s\""),
-					   port->hba->linenumber, port->hba->rawline);
+	cdetail = psprintf(_("Connection matched file \"%s\" line %d: \"%s\""),
+					   port->hba->sourcefile, port->hba->linenumber,
+					   port->hba->rawline);
 	if (logdetail)
 		logdetail = psprintf("%s\n%s", logdetail, cdetail);
 	else
@@ -334,23 +329,23 @@ auth_failed(Port *port, int status, const char *logdetail)
 
 /*
  * Sets the authenticated identity for the current user.  The provided string
- * will be copied into the TopMemoryContext.  The ID will be logged if
- * log_connections is enabled.
+ * will be stored into MyClientConnectionInfo, alongside the current HBA
+ * method in use.  The ID will be logged if log_connections is enabled.
  *
  * Auth methods should call this routine exactly once, as soon as the user is
  * successfully authenticated, even if they have reasons to know that
  * authorization will fail later.
  *
  * The provided string will be copied into TopMemoryContext, to match the
- * lifetime of the Port, so it is safe to pass a string that is managed by an
- * external library.
+ * lifetime of MyClientConnectionInfo, so it is safe to pass a string that is
+ * managed by an external library.
  */
 static void
 set_authn_id(Port *port, const char *id)
 {
 	Assert(id);
 
-	if (port->authn_id)
+	if (MyClientConnectionInfo.authn_id)
 	{
 		/*
 		 * An existing authn_id should never be overwritten; that means two
@@ -361,18 +356,20 @@ set_authn_id(Port *port, const char *id)
 		ereport(FATAL,
 				(errmsg("authentication identifier set more than once"),
 				 errdetail_log("previous identifier: \"%s\"; new identifier: \"%s\"",
-							   port->authn_id, id)));
+							   MyClientConnectionInfo.authn_id, id)));
 	}
 
-	port->authn_id = MemoryContextStrdup(TopMemoryContext, id);
+	MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
+	MyClientConnectionInfo.auth_method = port->hba->auth_method;
 
 	if (Log_connections)
 	{
 		ereport(LOG,
 				errmsg("connection authenticated: identity=\"%s\" method=%s "
 					   "(%s:%d)",
-					   port->authn_id, hba_authname(port->hba->auth_method), HbaFileName,
-					   port->hba->linenumber));
+					   MyClientConnectionInfo.authn_id,
+					   hba_authname(MyClientConnectionInfo.auth_method),
+					   port->hba->sourcefile, port->hba->linenumber));
 	}
 }
 
@@ -646,6 +643,22 @@ ClientAuthentication(Port *port)
 #endif
 	}
 
+	if (Log_connections && status == STATUS_OK &&
+		!MyClientConnectionInfo.authn_id)
+	{
+		/*
+		 * Normally, if log_connections is set, the call to set_authn_id()
+		 * will log the connection.  However, if that function is never
+		 * called, perhaps because the trust method is in use, then we handle
+		 * the logging here instead.
+		 */
+		ereport(LOG,
+				errmsg("connection authenticated: user=\"%s\" method=%s "
+					   "(%s:%d)",
+					   port->user_name, hba_authname(port->hba->auth_method),
+					   port->hba->sourcefile, port->hba->linenumber));
+	}
+
 	if (ClientAuthentication_hook)
 		(*ClientAuthentication_hook) (port, status);
 
@@ -666,7 +679,7 @@ sendAuthRequest(Port *port, AuthRequest areq, const char *extradata, int extrale
 
 	CHECK_FOR_INTERRUPTS();
 
-	pq_beginmessage(&buf, 'R');
+	pq_beginmessage(&buf, PqMsg_AuthenticationRequest);
 	pq_sendint32(&buf, (int32) areq);
 	if (extralen > 0)
 		pq_sendbytes(&buf, extradata, extralen);
@@ -699,7 +712,7 @@ recv_password_packet(Port *port)
 
 	/* Expect 'p' message type */
 	mtype = pq_getbyte();
-	if (mtype != 'p')
+	if (mtype != PqMsg_PasswordMessage)
 	{
 		/*
 		 * If the client just disconnects without offering a password, don't
@@ -850,15 +863,13 @@ CheckPWChallengeAuth(Port *port, const char **logdetail)
 
 	if (shadow_pass)
 		pfree(shadow_pass);
-
-	/*
-	 * If get_role_password() returned error, return error, even if the
-	 * authentication succeeded.
-	 */
-	if (!shadow_pass)
+	else
 	{
+		/*
+		 * If get_role_password() returned error, authentication better not
+		 * have succeeded.
+		 */
 		Assert(auth_result != STATUS_OK);
-		return STATUS_ERROR;
 	}
 
 	if (auth_result == STATUS_OK)
@@ -873,11 +884,6 @@ CheckMD5Auth(Port *port, char *shadow_pass, const char **logdetail)
 	char		md5Salt[4];		/* Password salt */
 	char	   *passwd;
 	int			result;
-
-	if (Db_user_namespace)
-		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				 errmsg("MD5 authentication is not supported when \"db_user_namespace\" is enabled")));
 
 	/* include the salt to use for computing the response */
 	if (!pg_strong_random(md5Salt, 4))
@@ -920,10 +926,12 @@ pg_GSS_recvauth(Port *port)
 	int			mtype;
 	StringInfoData buf;
 	gss_buffer_desc gbuf;
+	gss_cred_id_t delegated_creds;
 
 	/*
-	 * Use the configured keytab, if there is one.  Unfortunately, Heimdal
-	 * doesn't support the cred store extensions, so use the env var.
+	 * Use the configured keytab, if there is one.  As we now require MIT
+	 * Kerberos, we might consider using the credential store extensions in
+	 * the future instead of the environment variable.
 	 */
 	if (pg_krb_server_keyfile != NULL && pg_krb_server_keyfile[0] != '\0')
 	{
@@ -949,6 +957,9 @@ pg_GSS_recvauth(Port *port)
 	 */
 	port->gss->ctx = GSS_C_NO_CONTEXT;
 
+	delegated_creds = GSS_C_NO_CREDENTIAL;
+	port->gss->delegated_creds = false;
+
 	/*
 	 * Loop through GSSAPI message exchange. This exchange can consist of
 	 * multiple messages sent in both directions. First message is always from
@@ -962,7 +973,7 @@ pg_GSS_recvauth(Port *port)
 		CHECK_FOR_INTERRUPTS();
 
 		mtype = pq_getbyte();
-		if (mtype != 'p')
+		if (mtype != PqMsg_GSSResponse)
 		{
 			/* Only log error if client didn't disconnect. */
 			if (mtype != EOF)
@@ -999,7 +1010,7 @@ pg_GSS_recvauth(Port *port)
 										  &port->gss->outbuf,
 										  &gflags,
 										  NULL,
-										  NULL);
+										  pg_gss_accept_delegation ? &delegated_creds : NULL);
 
 		/* gbuf no longer used */
 		pfree(buf.data);
@@ -1010,6 +1021,12 @@ pg_GSS_recvauth(Port *port)
 			 (unsigned int) port->gss->outbuf.length, gflags);
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (delegated_creds != GSS_C_NO_CREDENTIAL && gflags & GSS_C_DELEG_FLAG)
+		{
+			pg_store_delegated_credential(delegated_creds);
+			port->gss->delegated_creds = true;
+		}
 
 		if (port->gss->outbuf.length != 0)
 		{
@@ -1200,10 +1217,7 @@ pg_SSPI_recvauth(Port *port)
 	DWORD		accountnamesize = sizeof(accountname);
 	DWORD		domainnamesize = sizeof(domainname);
 	SID_NAME_USE accountnameuse;
-	HMODULE		secur32;
 	char	   *authn_id;
-
-	QUERY_SECURITY_CONTEXT_TOKEN_FN _QuerySecurityContextToken;
 
 	/*
 	 * Acquire a handle to the server credentials.
@@ -1230,7 +1244,7 @@ pg_SSPI_recvauth(Port *port)
 	{
 		pq_startmsgread();
 		mtype = pq_getbyte();
-		if (mtype != 'p')
+		if (mtype != PqMsg_GSSResponse)
 		{
 			if (sspictx != NULL)
 			{
@@ -1357,36 +1371,12 @@ pg_SSPI_recvauth(Port *port)
 	 *
 	 * Get the name of the user that authenticated, and compare it to the pg
 	 * username that was specified for the connection.
-	 *
-	 * MingW is missing the export for QuerySecurityContextToken in the
-	 * secur32 library, so we have to load it dynamically.
 	 */
 
-	secur32 = LoadLibrary("SECUR32.DLL");
-	if (secur32 == NULL)
-		ereport(ERROR,
-				(errmsg("could not load library \"%s\": error code %lu",
-						"SECUR32.DLL", GetLastError())));
-
-	_QuerySecurityContextToken = (QUERY_SECURITY_CONTEXT_TOKEN_FN) (pg_funcptr_t)
-		GetProcAddress(secur32, "QuerySecurityContextToken");
-	if (_QuerySecurityContextToken == NULL)
-	{
-		FreeLibrary(secur32);
-		ereport(ERROR,
-				(errmsg_internal("could not locate QuerySecurityContextToken in secur32.dll: error code %lu",
-								 GetLastError())));
-	}
-
-	r = (_QuerySecurityContextToken) (sspictx, &token);
+	r = QuerySecurityContextToken(sspictx, &token);
 	if (r != SEC_E_OK)
-	{
-		FreeLibrary(secur32);
 		pg_SSPI_error(ERROR,
 					  _("could not get token from SSPI security context"), r);
-	}
-
-	FreeLibrary(secur32);
 
 	/*
 	 * No longer need the security context, everything from here on uses the
@@ -1651,8 +1641,6 @@ interpret_ident_response(const char *ident_response,
 						return false;
 					else
 					{
-						int			i;	/* Index into *ident_user */
-
 						cursor++;	/* Go over colon */
 						while (pg_isblank(*cursor))
 							cursor++;	/* skip blanks */
@@ -1908,7 +1896,8 @@ auth_peer(hbaPort *port)
 	 */
 	set_authn_id(port, pw->pw_name);
 
-	ret = check_usermap(port->hba->usermap, port->user_name, port->authn_id, false);
+	ret = check_usermap(port->hba->usermap, port->user_name,
+						MyClientConnectionInfo.authn_id, false);
 
 	return ret;
 #else
@@ -2375,48 +2364,7 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 #ifndef WIN32
 		if ((r = ldap_start_tls_s(*ldap, NULL, NULL)) != LDAP_SUCCESS)
 #else
-		static __ldap_start_tls_sA _ldap_start_tls_sA = NULL;
-
-		if (_ldap_start_tls_sA == NULL)
-		{
-			/*
-			 * Need to load this function dynamically because it may not exist
-			 * on Windows, and causes a load error for the whole exe if
-			 * referenced.
-			 */
-			HANDLE		ldaphandle;
-
-			ldaphandle = LoadLibrary("WLDAP32.DLL");
-			if (ldaphandle == NULL)
-			{
-				/*
-				 * should never happen since we import other files from
-				 * wldap32, but check anyway
-				 */
-				ereport(LOG,
-						(errmsg("could not load library \"%s\": error code %lu",
-								"WLDAP32.DLL", GetLastError())));
-				ldap_unbind(*ldap);
-				return STATUS_ERROR;
-			}
-			_ldap_start_tls_sA = (__ldap_start_tls_sA) (pg_funcptr_t) GetProcAddress(ldaphandle, "ldap_start_tls_sA");
-			if (_ldap_start_tls_sA == NULL)
-			{
-				ereport(LOG,
-						(errmsg("could not load function _ldap_start_tls_sA in wldap32.dll"),
-						 errdetail("LDAP over SSL is not supported on this platform.")));
-				ldap_unbind(*ldap);
-				FreeLibrary(ldaphandle);
-				return STATUS_ERROR;
-			}
-
-			/*
-			 * Leak LDAP handle on purpose, because we need the library to
-			 * stay open. This is ok because it will only ever be leaked once
-			 * per process and is automatically cleaned up on process exit.
-			 */
-		}
-		if ((r = _ldap_start_tls_sA(*ldap, NULL, NULL, NULL, NULL)) != LDAP_SUCCESS)
+		if ((r = ldap_start_tls_s(*ldap, NULL, NULL, NULL, NULL)) != LDAP_SUCCESS)
 #endif
 		{
 			ereport(LOG,
@@ -2444,6 +2392,12 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 #ifndef LDAPS_PORT
 #define LDAPS_PORT 636
 #endif
+
+static char *
+dummy_ldap_password_mutator(char *input)
+{
+	return input;
+}
 
 /*
  * Return a newly allocated C string copied from "pattern" with all
@@ -2573,7 +2527,7 @@ CheckLDAPAuth(Port *port)
 		 */
 		r = ldap_simple_bind_s(ldap,
 							   port->hba->ldapbinddn ? port->hba->ldapbinddn : "",
-							   port->hba->ldapbindpasswd ? port->hba->ldapbindpasswd : "");
+							   port->hba->ldapbindpasswd ? ldap_password_hook(port->hba->ldapbindpasswd) : "");
 		if (r != LDAP_SUCCESS)
 		{
 			ereport(LOG,
@@ -2595,6 +2549,7 @@ CheckLDAPAuth(Port *port)
 		else
 			filter = psprintf("(uid=%s)", port->user_name);
 
+		search_message = NULL;
 		r = ldap_search_s(ldap,
 						  port->hba->ldapbasedn,
 						  port->hba->ldapscope,
@@ -2609,6 +2564,8 @@ CheckLDAPAuth(Port *port)
 					(errmsg("could not search LDAP for filter \"%s\" on server \"%s\": %s",
 							filter, server_name, ldap_err2string(r)),
 					 errdetail_for_ldap(ldap)));
+			if (search_message != NULL)
+				ldap_msgfree(search_message);
 			ldap_unbind(ldap);
 			pfree(passwd);
 			pfree(filter);
@@ -2661,31 +2618,6 @@ CheckLDAPAuth(Port *port)
 		pfree(filter);
 		ldap_memfree(dn);
 		ldap_msgfree(search_message);
-
-		/* Unbind and disconnect from the LDAP server */
-		r = ldap_unbind_s(ldap);
-		if (r != LDAP_SUCCESS)
-		{
-			ereport(LOG,
-					(errmsg("could not unbind after searching for user \"%s\" on server \"%s\"",
-							fulluser, server_name)));
-			pfree(passwd);
-			pfree(fulluser);
-			return STATUS_ERROR;
-		}
-
-		/*
-		 * Need to re-initialize the LDAP connection, so that we can bind to
-		 * it with a different username.
-		 */
-		if (InitializeLDAPConnection(port, &ldap) == STATUS_ERROR)
-		{
-			pfree(passwd);
-			pfree(fulluser);
-
-			/* Error message already sent */
-			return STATUS_ERROR;
-		}
 	}
 	else
 		fulluser = psprintf("%s%s%s",
@@ -2916,14 +2848,14 @@ CheckRADIUSAuth(Port *port)
 	Assert(offsetof(radius_packet, vector) == 4);
 
 	/* Verify parameters */
-	if (list_length(port->hba->radiusservers) < 1)
+	if (port->hba->radiusservers == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS server not specified")));
 		return STATUS_ERROR;
 	}
 
-	if (list_length(port->hba->radiussecrets) < 1)
+	if (port->hba->radiussecrets == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS secret not specified")));
@@ -3015,13 +2947,8 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 	int			packetlength;
 	pgsocket	sock;
 
-#ifdef HAVE_IPV6
 	struct sockaddr_in6 localaddr;
 	struct sockaddr_in6 remoteaddr;
-#else
-	struct sockaddr_in localaddr;
-	struct sockaddr_in remoteaddr;
-#endif
 	struct addrinfo hint;
 	struct addrinfo *serveraddrs;
 	int			port;
@@ -3131,18 +3058,12 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 	}
 
 	memset(&localaddr, 0, sizeof(localaddr));
-#ifdef HAVE_IPV6
 	localaddr.sin6_family = serveraddrs[0].ai_family;
 	localaddr.sin6_addr = in6addr_any;
 	if (localaddr.sin6_family == AF_INET6)
 		addrsize = sizeof(struct sockaddr_in6);
 	else
 		addrsize = sizeof(struct sockaddr_in);
-#else
-	localaddr.sin_family = serveraddrs[0].ai_family;
-	localaddr.sin_addr.s_addr = INADDR_ANY;
-	addrsize = sizeof(struct sockaddr_in);
-#endif
 
 	if (bind(sock, (struct sockaddr *) &localaddr, addrsize))
 	{
@@ -3245,21 +3166,11 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 			return STATUS_ERROR;
 		}
 
-#ifdef HAVE_IPV6
 		if (remoteaddr.sin6_port != pg_hton16(port))
-#else
-		if (remoteaddr.sin_port != pg_hton16(port))
-#endif
 		{
-#ifdef HAVE_IPV6
 			ereport(LOG,
 					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
 							server, pg_ntoh16(remoteaddr.sin6_port))));
-#else
-			ereport(LOG,
-					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
-							server, pg_ntoh16(remoteaddr.sin_port))));
-#endif
 			continue;
 		}
 

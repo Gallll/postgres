@@ -6,7 +6,7 @@
  * gram.y
  *	  POSTGRESQL BISON rules/actions
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -55,9 +55,9 @@
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
+#include "gramparse.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/gramparse.h"
 #include "parser/parser.h"
 #include "storage/lmgr.h"
 #include "utils/date.h"
@@ -103,10 +103,7 @@
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
  * so we can easily have it use palloc instead of malloc.  This prevents
- * memory leaks if we error out during parsing.  Note this only works with
- * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
- * if possible, so there's not really much problem anyhow, at least if
- * you're building with gcc.
+ * memory leaks if we error out during parsing.
  */
 #define YYMALLOC palloc
 #define YYFREE   pfree
@@ -173,7 +170,6 @@ static void updateRawStmtEnd(RawStmt *rs, int end_location);
 static Node *makeColumnRef(char *colname, List *indirection,
 						   int location, core_yyscan_t yyscanner);
 static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
-static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static Node *makeIntConst(int val, int location);
 static Node *makeFloatConst(char *str, int location);
@@ -208,8 +204,7 @@ static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
 static List *mergeTableFuncParameters(List *func_args, List *columns);
 static TypeName *TableFuncTypeName(List *columns);
 static RangeVar *makeRangeVarFromAnyName(List *names, int position, core_yyscan_t yyscanner);
-static RangeVar *makeRangeVarFromQualifiedName(char *name, List *rels,
-											   int location,
+static RangeVar *makeRangeVarFromQualifiedName(char *name, List *namelist, int location,
 											   core_yyscan_t yyscanner);
 static void SplitColQualList(List *qualList,
 							 List **constraintList, CollateClause **collClause,
@@ -217,6 +212,7 @@ static void SplitColQualList(List *qualList,
 static void processCASbits(int cas_bits, int location, const char *constrType,
 			   bool *deferrable, bool *initdeferred, bool *not_valid,
 			   bool *no_inherit, core_yyscan_t yyscanner);
+static PartitionStrategy parsePartitionStrategy(char *strategy);
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
@@ -273,21 +269,16 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PartitionElem *partelem;
 	PartitionSpec *partspec;
 	PartitionBoundSpec *partboundspec;
+	SinglePartitionSpec *singlepartspec;
 	RoleSpec   *rolespec;
 	PublicationObjSpec *publicationobjectspec;
 	struct SelectLimit *selectlimit;
 	SetQuantifier setquantifier;
 	struct GroupClause *groupclause;
+	MergeMatchKind mergematch;
 	MergeWhenClause *mergewhen;
 	struct KeyActions *keyactions;
 	struct KeyAction *keyaction;
-	JsonBehavior *jsbehavior;
-	struct
-	{
-		JsonBehavior *on_empty;
-		JsonBehavior *on_error;
-	}			on_behavior;
-	JsonQuotes	js_quotes;
 }
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
@@ -347,6 +338,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>	alter_table_cmds alter_type_cmds
 %type <list>    alter_identity_column_option_list
 %type <defelt>  alter_identity_column_option
+%type <node>	set_statistics_value
+%type <str>		set_access_method_name
 
 %type <list>	createdb_opt_list createdb_opt_items copy_opt_list
 				transaction_mode_list
@@ -362,9 +355,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	utility_option_arg
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
-				opt_grant_grant_option opt_grant_admin_option
+				opt_grant_grant_option
 				opt_nowait opt_if_exists opt_with_data
 				opt_transaction_chain
+%type <list>	grant_role_opt_list
+%type <defelt>	grant_role_opt
+%type <node>	grant_role_opt_value
 %type <ival>	opt_nowait_or_skip
 
 %type <list>	OptRoleList AlterOptRoleList
@@ -521,13 +517,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <onconflict> opt_on_conflict
 %type <mergewhen>	merge_insert merge_update merge_delete
 
+%type <mergematch> merge_when_tgt_matched merge_when_tgt_not_matched
 %type <node>	merge_when_clause opt_merge_when_condition
 %type <list>	merge_when_list
 
 %type <vsetstmt> generic_set set_rest set_rest_more generic_reset reset_rest
 				 SetResetClause FunctionSetResetClause
 
-%type <node>	TableElement TypedTableElement ConstraintElem TableFuncElement
+%type <node>	TableElement TypedTableElement ConstraintElem DomainConstraintElem TableFuncElement
 %type <node>	columnDef columnOptions
 %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
 %type <node>	def_arg columnElem where_clause where_or_current_clause
@@ -564,7 +561,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	generic_option_elem alter_generic_option_elem
 %type <list>	generic_option_list alter_generic_option_list
 
-%type <ival>	reindex_target_type
+%type <ival>	reindex_target_relation reindex_target_all
 %type <list>	opt_reindex_option_list
 
 %type <node>	copy_generic_opt_arg copy_generic_opt_arg_list_item
@@ -598,7 +595,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <keyword> col_name_keyword reserved_keyword
 %type <keyword> bare_label_keyword
 
-%type <node>	TableConstraint TableLikeClause
+%type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
 %type <list>	ColQualList
@@ -622,7 +619,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	xml_root_version opt_xml_root_standalone
 %type <node>	xmlexists_argument
 %type <ival>	document_or_content
-%type <boolean> xml_whitespace_option
+%type <boolean>	xml_indent_option xml_whitespace_option
 %type <list>	xmltable_column_list xmltable_column_option_list
 %type <node>	xmltable_column_el
 %type <defelt>	xmltable_column_option_el
@@ -649,104 +646,39 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
+%type <singlepartspec>	SinglePartitionSpec
+%type <list>		partitions_list
 %type <list>		hash_partbound
 %type <defelt>		hash_partbound_elem
 
+%type <node>	json_format_clause
+				json_format_clause_opt
+				json_value_expr
+				json_returning_clause_opt
+				json_name_and_value
+				json_aggregate_func
+				json_argument
+				json_behavior
+				json_on_error_clause_opt
+				json_table
+				json_table_column_definition
+				json_table_column_path_clause_opt
+%type <list>	json_name_and_value_list
+				json_value_expr_list
+				json_array_aggregate_order_by_clause_opt
+				json_arguments
+				json_behavior_clause_opt
+				json_passing_clause_opt
+				json_table_column_definition_list
+%type <str>		json_table_path_name_opt
+%type <ival>	json_behavior_type
+				json_predicate_type_constraint
+				json_quotes_clause_opt
+				json_wrapper_behavior
+%type <boolean>	json_key_uniqueness_constraint_opt
+				json_object_constructor_null_clause_opt
+				json_array_constructor_null_clause_opt
 
-%type <node>		json_format_clause_opt
-					json_representation
-					json_value_expr
-					json_func_expr
-					json_value_func_expr
-					json_query_expr
-					json_exists_predicate
-					json_parse_expr
-					json_scalar_expr
-					json_serialize_expr
-					json_api_common_syntax
-					json_context_item
-					json_argument
-					json_output_clause_opt
-					json_returning_clause_opt
-					json_value_constructor
-					json_object_constructor
-					json_object_constructor_args
-					json_object_constructor_args_opt
-					json_object_args
-					json_object_func_args
-					json_array_constructor
-					json_name_and_value
-					json_aggregate_func
-					json_object_aggregate_constructor
-					json_array_aggregate_constructor
-					json_path_specification
-					json_table
-					json_table_column_definition
-					json_table_ordinality_column_definition
-					json_table_regular_column_definition
-					json_table_formatted_column_definition
-					json_table_exists_column_definition
-					json_table_nested_columns
-					json_table_plan_clause_opt
-					json_table_specific_plan
-					json_table_plan
-					json_table_plan_simple
-					json_table_plan_parent_child
-					json_table_plan_outer
-					json_table_plan_inner
-					json_table_plan_sibling
-					json_table_plan_union
-					json_table_plan_cross
-					json_table_plan_primary
-					json_table_default_plan
-
-%type <list>		json_name_and_value_list
-					json_value_expr_list
-					json_array_aggregate_order_by_clause_opt
-					json_arguments
-					json_passing_clause_opt
-					json_table_columns_clause
-					json_table_column_definition_list
-
-%type <str>			json_table_path_name
-					json_as_path_name_clause_opt
-					json_table_column_path_specification_clause_opt
-
-%type <ival>		json_encoding
-					json_encoding_clause_opt
-					json_table_default_plan_choices
-					json_table_default_plan_inner_outer
-					json_table_default_plan_union_cross
-					json_wrapper_clause_opt
-					json_wrapper_behavior
-					json_conditional_or_unconditional_opt
-					json_predicate_type_constraint_opt
-
-%type <jsbehavior>	json_behavior_error
-					json_behavior_null
-					json_behavior_true
-					json_behavior_false
-					json_behavior_unknown
-					json_behavior_empty
-					json_behavior_empty_array
-					json_behavior_empty_object
-					json_behavior_default
-					json_value_behavior
-					json_query_behavior
-					json_exists_error_behavior
-					json_exists_error_clause_opt
-					json_table_error_behavior
-					json_table_error_clause_opt
-
-%type <on_behavior> json_value_on_behavior_clause_opt
-					json_query_on_behavior_clause_opt
-
-%type <js_quotes>	json_quotes_behavior
-					json_quotes_clause_opt
-
-%type <boolean>		json_key_uniqueness_constraint_opt
-					json_object_constructor_null_clause_opt
-					json_array_constructor_null_clause_opt
 
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
@@ -806,20 +738,20 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
 	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
-	INCLUDING INCREMENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
+	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
 
 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_EXISTS JSON_OBJECT JSON_OBJECTAGG
 	JSON_QUERY JSON_SCALAR JSON_SERIALIZE JSON_TABLE JSON_VALUE
 
-	KEY KEYS KEEP
+	KEEP KEY KEYS
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE METHOD
+	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
@@ -831,25 +763,26 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
+	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PATH
 	PLACING PLAN PLANS POLICY
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
 	QUOTE QUOTES
 
-	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
+	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
-	SEQUENCE SEQUENCES SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF
-	SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
-	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING STRIP_P
-	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P
+	SEQUENCE SEQUENCES
+	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
+	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
+	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
-	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN
+	TABLE TABLES TABLESAMPLE TABLESPACE TARGET TEMP TEMPLATE TEMPORARY TEXT_P THEN
 	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
@@ -877,9 +810,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * NOT_LA exists so that productions such as NOT LIKE can be given the same
  * precedence as LIKE; otherwise they'd effectively have the same precedence
  * as NOT, at least with respect to their left-hand subexpression.
- * NULLS_LA and WITH_LA are needed to make the grammar LALR(1).
+ * FORMAT_LA, NULLS_LA, WITH_LA, and WITHOUT_LA are needed to make the grammar
+ * LALR(1).
  */
-%token		NOT_LA NULLS_LA WITH_LA WITH_LA_UNIQUE WITHOUT_LA
+%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITHOUT_LA
 
 /*
  * The grammar likewise thinks these tokens are keywords, but they are never
@@ -896,8 +830,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 
 /* Precedence: lowest to highest */
-%nonassoc	SET				/* see relation_expr_opt_alias */
-%right		FORMAT
 %left		UNION EXCEPT
 %left		INTERSECT
 %left		OR
@@ -907,13 +839,24 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %nonassoc	'<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
 %nonassoc	BETWEEN IN_P LIKE ILIKE SIMILAR NOT_LA
 %nonassoc	ESCAPE			/* ESCAPE must be just above LIKE/ILIKE/SIMILAR */
+
 /*
- * To support target_el without AS, it used to be necessary to assign IDENT an
- * explicit precedence just less than Op.  While that's not really necessary
- * since we removed postfix operators, it's still helpful to do so because
- * there are some other unreserved keywords that need precedence assignments.
- * If those keywords have the same precedence as IDENT then they clearly act
- * the same as non-keywords, reducing the risk of unwanted precedence effects.
+ * Sometimes it is necessary to assign precedence to keywords that are not
+ * really part of the operator hierarchy, in order to resolve grammar
+ * ambiguities.  It's best to avoid doing so whenever possible, because such
+ * assignments have global effect and may hide ambiguities besides the one
+ * you intended to solve.  (Attaching a precedence to a single rule with
+ * %prec is far safer and should be preferred.)  If you must give precedence
+ * to a new keyword, try very hard to give it the same precedence as IDENT.
+ * If the keyword has IDENT's precedence then it clearly acts the same as
+ * non-keywords and other similar keywords, thus reducing the risk of
+ * unexpected precedence effects.
+ *
+ * We used to need to assign IDENT an explicit precedence just less than Op,
+ * to support target_el without AS.  While that's not really necessary since
+ * we removed postfix operators, we continue to do so because it provides a
+ * reference point for a precedence level that we can assign to other
+ * keywords that lack a natural precedence level.
  *
  * We need to do this for PARTITION, RANGE, ROWS, and GROUPS to support
  * opt_existing_window_name (see comment there).
@@ -931,19 +874,27 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * an explicit priority lower than '(', so that a rule with CUBE '(' will shift
  * rather than reducing a conflicting rule that takes CUBE as a function name.
  * Using the same precedence as IDENT seems right for the reasons given above.
+ *
+ * SET is likewise assigned the same precedence as IDENT, to support the
+ * relation_expr_opt_alias production (see comment there).
+ *
+ * KEYS, OBJECT_P, SCALAR, VALUE_P, WITH, and WITHOUT are similarly assigned
+ * the same precedence as IDENT.  This allows resolving conflicts in the
+ * json_predicate_type_constraint and json_key_uniqueness_constraint_opt
+ * productions (see comments there).
+ *
+ * Like the UNBOUNDED PRECEDING/FOLLOWING case, NESTED is assigned a lower
+ * precedence than PATH to fix ambiguity in the json_table production.
  */
-%nonassoc	UNBOUNDED		/* ideally would have same precedence as IDENT */
-%nonassoc	ERROR_P EMPTY_P DEFAULT ABSENT /* JSON error/empty behavior */
-%nonassoc	FALSE_P KEEP OMIT PASSING TRUE_P UNKNOWN UNIQUE JSON COLUMNS
+%nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
+			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH
 %left		Op OPERATOR		/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
 %left		'^'
-%left		KEYS						/* UNIQUE [ KEYS ] */
-%left		OBJECT_P SCALAR VALUE_P		/* JSON [ OBJECT | SCALAR | VALUE ] */
 /* Unary Operators */
-%left		AT				/* sets precedence for AT TIME ZONE */
+%left		AT				/* sets precedence for AT TIME ZONE, AT LOCAL */
 %left		COLLATE
 %right		UMINUS
 %left		'[' ']'
@@ -959,13 +910,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  */
 %left		JOIN CROSS LEFT FULL RIGHT INNER_P NATURAL
 
-%nonassoc	json_table_column
-%nonassoc	NESTED
-%left		PATH
-
-%nonassoc	empty_json_unique
-%left		WITHOUT WITH_LA_UNIQUE
-
 %%
 
 /*
@@ -979,6 +923,7 @@ parse_toplevel:
 			stmtmulti
 			{
 				pg_yyget_extra(yyscanner)->parsetree = $1;
+				(void) yynerrs;		/* suppress compiler warning */
 			}
 			| MODE_TYPE_NAME Typename
 			{
@@ -1048,7 +993,7 @@ stmtmulti:	stmtmulti ';' toplevel_stmt
 
 /*
  * toplevel_stmt includes BEGIN and END.  stmt does not include them, because
- * those words have different meanings in function bodys.
+ * those words have different meanings in function bodies.
  */
 toplevel_stmt:
 			stmt
@@ -2366,6 +2311,23 @@ alter_table_cmds:
 			| alter_table_cmds ',' alter_table_cmd	{ $$ = lappend($1, $3); }
 		;
 
+partitions_list:
+			SinglePartitionSpec							{ $$ = list_make1($1); }
+			| partitions_list ',' SinglePartitionSpec	{ $$ = lappend($1, $3); }
+		;
+
+SinglePartitionSpec:
+			PARTITION qualified_name PartitionBoundSpec
+				{
+					SinglePartitionSpec *n = makeNode(SinglePartitionSpec);
+
+					n->name = $2;
+					n->bound = $3;
+
+					$$ = n;
+				}
+		;
+
 partition_cmd:
 			/* ALTER TABLE <name> ATTACH PARTITION <table_name> FOR VALUES */
 			ATTACH PARTITION qualified_name PartitionBoundSpec
@@ -2376,6 +2338,7 @@ partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = $4;
+					cmd->partlist = NULL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -2390,6 +2353,7 @@ partition_cmd:
 					n->subtype = AT_DetachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NULL;
 					cmd->concurrent = $4;
 					n->def = (Node *) cmd;
 
@@ -2403,6 +2367,35 @@ partition_cmd:
 					n->subtype = AT_DetachPartitionFinalize;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NULL;
+					cmd->concurrent = false;
+					n->def = (Node *) cmd;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> SPLIT PARTITION <partition_name> INTO () */
+			| SPLIT PARTITION qualified_name INTO '(' partitions_list ')'
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					PartitionCmd *cmd = makeNode(PartitionCmd);
+
+					n->subtype = AT_SplitPartition;
+					cmd->name = $3;
+					cmd->bound = NULL;
+					cmd->partlist = $6;
+					cmd->concurrent = false;
+					n->def = (Node *) cmd;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> MERGE PARTITIONS () INTO <partition_name> */
+			| MERGE PARTITIONS '(' qualified_name_list ')' INTO qualified_name
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					PartitionCmd *cmd = makeNode(PartitionCmd);
+
+					n->subtype = AT_MergePartitions;
+					cmd->name = $7;
+					cmd->bound = NULL;
+					cmd->partlist = $4;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 					$$ = (Node *) n;
@@ -2419,6 +2412,7 @@ index_partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
+					cmd->partlist = NULL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -2495,6 +2489,16 @@ alter_table_cmd:
 					n->name = $3;
 					$$ = (Node *) n;
 				}
+			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET EXPRESSION AS <expr> */
+			| ALTER opt_column ColId SET EXPRESSION AS '(' a_expr ')'
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_SetExpression;
+					n->name = $3;
+					n->def = $8;
+					$$ = (Node *) n;
+				}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> DROP EXPRESSION */
 			| ALTER opt_column ColId DROP EXPRESSION
 				{
@@ -2514,18 +2518,18 @@ alter_table_cmd:
 					n->missing_ok = true;
 					$$ = (Node *) n;
 				}
-			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET STATISTICS <SignedIconst> */
-			| ALTER opt_column ColId SET STATISTICS SignedIconst
+			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET STATISTICS */
+			| ALTER opt_column ColId SET STATISTICS set_statistics_value
 				{
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_SetStatistics;
 					n->name = $3;
-					n->def = (Node *) makeInteger($6);
+					n->def = $6;
 					$$ = (Node *) n;
 				}
-			/* ALTER TABLE <name> ALTER [COLUMN] <colnum> SET STATISTICS <SignedIconst> */
-			| ALTER opt_column Iconst SET STATISTICS SignedIconst
+			/* ALTER TABLE <name> ALTER [COLUMN] <colnum> SET STATISTICS */
+			| ALTER opt_column Iconst SET STATISTICS set_statistics_value
 				{
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
@@ -2537,7 +2541,7 @@ alter_table_cmd:
 
 					n->subtype = AT_SetStatistics;
 					n->num = (int16) $3;
-					n->def = (Node *) makeInteger($6);
+					n->def = $6;
 					$$ = (Node *) n;
 				}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET ( column_parameter = value [, ... ] ) */
@@ -2926,8 +2930,8 @@ alter_table_cmd:
 					n->newowner = $3;
 					$$ = (Node *) n;
 				}
-			/* ALTER TABLE <name> SET ACCESS METHOD <amname> */
-			| SET ACCESS METHOD name
+			/* ALTER TABLE <name> SET ACCESS METHOD { <amname> | DEFAULT } */
+			| SET ACCESS METHOD set_access_method_name
 				{
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
@@ -3136,6 +3140,16 @@ alter_identity_column_option:
 				{
 					$$ = makeDefElem("generated", (Node *) makeInteger($3), @1);
 				}
+		;
+
+set_statistics_value:
+			SignedIconst					{ $$ = (Node *) makeInteger($1); }
+			| DEFAULT						{ $$ = NULL; }
+		;
+
+set_access_method_name:
+			ColId							{ $$ = $1; }
+			| DEFAULT						{ $$ = NULL; }
 		;
 
 PartitionBoundSpec:
@@ -3510,9 +3524,17 @@ copy_opt_item:
 				{
 					$$ = makeDefElem("force_not_null", (Node *) $4, @1);
 				}
+			| FORCE NOT NULL_P '*'
+				{
+					$$ = makeDefElem("force_not_null", (Node *) makeNode(A_Star), @1);
+				}
 			| FORCE NULL_P columnList
 				{
 					$$ = makeDefElem("force_null", (Node *) $3, @1);
+				}
+			| FORCE NULL_P '*'
+				{
+					$$ = makeDefElem("force_null", (Node *) makeNode(A_Star), @1);
 				}
 			| ENCODING Sconst
 				{
@@ -3566,6 +3588,7 @@ copy_generic_opt_arg:
 			opt_boolean_or_string			{ $$ = (Node *) makeString($1); }
 			| NumericOnly					{ $$ = (Node *) $1; }
 			| '*'							{ $$ = (Node *) makeNode(A_Star); }
+			| DEFAULT                       { $$ = (Node *) makeString("default"); }
 			| '(' copy_generic_opt_arg_list ')'		{ $$ = (Node *) $2; }
 			| /* EMPTY */					{ $$ = NULL; }
 		;
@@ -3872,6 +3895,7 @@ opt_column_compression:
 
 column_storage:
 			STORAGE ColId							{ $$ = $2; }
+			| STORAGE DEFAULT						{ $$ = pstrdup("default"); }
 		;
 
 opt_column_storage:
@@ -4279,6 +4303,60 @@ ConstraintElem:
 				}
 		;
 
+/*
+ * DomainConstraint is separate from TableConstraint because the syntax for
+ * NOT NULL constraints is different.  For table constraints, we need to
+ * accept a column name, but for domain constraints, we don't.  (We could
+ * accept something like NOT NULL VALUE, but that seems weird.)  CREATE DOMAIN
+ * (which uses ColQualList) has for a long time accepted NOT NULL without a
+ * column name, so it makes sense that ALTER DOMAIN (which uses
+ * DomainConstraint) does as well.  None of these syntaxes are per SQL
+ * standard; we are just living with the bits of inconsistency that have built
+ * up over time.
+ */
+DomainConstraint:
+			CONSTRAINT name DomainConstraintElem
+				{
+					Constraint *n = castNode(Constraint, $3);
+
+					n->conname = $2;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| DomainConstraintElem					{ $$ = $1; }
+		;
+
+DomainConstraintElem:
+			CHECK '(' a_expr ')' ConstraintAttributeSpec
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_CHECK;
+					n->location = @1;
+					n->raw_expr = $3;
+					n->cooked_expr = NULL;
+					processCASbits($5, @5, "CHECK",
+								   NULL, NULL, &n->skip_validation,
+								   &n->is_no_inherit, yyscanner);
+					n->initially_valid = !n->skip_validation;
+					$$ = (Node *) n;
+				}
+			| NOT NULL_P ConstraintAttributeSpec
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_NOTNULL;
+					n->location = @1;
+					n->keys = list_make1(makeString("value"));
+					/* no NOT VALID support yet */
+					processCASbits($3, @3, "NOT NULL",
+								   NULL, NULL, NULL,
+								   &n->is_no_inherit, yyscanner);
+					n->initially_valid = true;
+					$$ = (Node *) n;
+				}
+		;
+
 opt_no_inherit:	NO INHERIT							{  $$ = true; }
 			| /* EMPTY */							{  $$ = false; }
 		;
@@ -4472,7 +4550,7 @@ PartitionSpec: PARTITION BY ColId '(' part_params ')'
 				{
 					PartitionSpec *n = makeNode(PartitionSpec);
 
-					n->strategy = $3;
+					n->strategy = parsePartitionStrategy($3);
 					n->partParams = $5;
 					n->location = @1;
 
@@ -4633,7 +4711,7 @@ stats_param:	ColId
  *****************************************************************************/
 
 AlterStatsStmt:
-			ALTER STATISTICS any_name SET STATISTICS SignedIconst
+			ALTER STATISTICS any_name SET STATISTICS set_statistics_value
 				{
 					AlterStatsStmt *n = makeNode(AlterStatsStmt);
 
@@ -4642,7 +4720,7 @@ AlterStatsStmt:
 					n->stxstattarget = $6;
 					$$ = (Node *) n;
 				}
-			| ALTER STATISTICS IF_P EXISTS any_name SET STATISTICS SignedIconst
+			| ALTER STATISTICS IF_P EXISTS any_name SET STATISTICS set_statistics_value
 				{
 					AlterStatsStmt *n = makeNode(AlterStatsStmt);
 
@@ -6477,6 +6555,33 @@ AlterEnumStmt:
 				n->skipIfNewValExists = false;
 				$$ = (Node *) n;
 			}
+		 | ALTER TYPE_P any_name DROP VALUE_P Sconst
+			{
+				/*
+				 * The following problems must be solved before this can be
+				 * implemented:
+				 *
+				 * - There must be no instance of the target value in
+				 *   any table.
+				 *
+				 * - The value must not appear in any catalog metadata,
+				 *   such as stored view expressions or column defaults.
+				 *
+				 * - The value must not appear in any non-leaf page of a
+				 *   btree (and similar issues with other index types).
+				 *   This is problematic because a value could persist
+				 *   there long after it's gone from user-visible data.
+				 *
+				 * - Concurrent sessions must not be able to insert the
+				 *   value while the preceding conditions are being checked.
+				 *
+				 * - Possibly more...
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("dropping an enum value is not implemented"),
+						 parser_errposition(@4)));
+			}
 		 ;
 
 opt_if_not_exists: IF_P NOT EXISTS              { $$ = true; }
@@ -7848,15 +7953,26 @@ opt_grant_grant_option:
  *****************************************************************************/
 
 GrantRoleStmt:
-			GRANT privilege_list TO role_list opt_grant_admin_option opt_granted_by
+			GRANT privilege_list TO role_list opt_granted_by
 				{
 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
 
 					n->is_grant = true;
 					n->granted_roles = $2;
 					n->grantee_roles = $4;
-					n->admin_opt = $5;
-					n->grantor = $6;
+					n->opt = NIL;
+					n->grantor = $5;
+					$$ = (Node *) n;
+				}
+		  | GRANT privilege_list TO role_list WITH grant_role_opt_list opt_granted_by
+				{
+					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+
+					n->is_grant = true;
+					n->granted_roles = $2;
+					n->grantee_roles = $4;
+					n->opt = $6;
+					n->grantor = $7;
 					$$ = (Node *) n;
 				}
 		;
@@ -7867,27 +7983,46 @@ RevokeRoleStmt:
 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
 
 					n->is_grant = false;
-					n->admin_opt = false;
+					n->opt = NIL;
 					n->granted_roles = $2;
 					n->grantee_roles = $4;
+					n->grantor = $5;
 					n->behavior = $6;
 					$$ = (Node *) n;
 				}
-			| REVOKE ADMIN OPTION FOR privilege_list FROM role_list opt_granted_by opt_drop_behavior
+			| REVOKE ColId OPTION FOR privilege_list FROM role_list opt_granted_by opt_drop_behavior
 				{
 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+					DefElem *opt;
 
+					opt = makeDefElem(pstrdup($2),
+									  (Node *) makeBoolean(false), @2);
 					n->is_grant = false;
-					n->admin_opt = true;
+					n->opt = list_make1(opt);
 					n->granted_roles = $5;
 					n->grantee_roles = $7;
+					n->grantor = $8;
 					n->behavior = $9;
 					$$ = (Node *) n;
 				}
 		;
 
-opt_grant_admin_option: WITH ADMIN OPTION				{ $$ = true; }
-			| /*EMPTY*/									{ $$ = false; }
+grant_role_opt_list:
+			grant_role_opt_list ',' grant_role_opt	{ $$ = lappend($1, $3); }
+			| grant_role_opt						{ $$ = list_make1($1); }
+		;
+
+grant_role_opt:
+		ColLabel grant_role_opt_value
+			{
+				$$ = makeDefElem(pstrdup($1), $2, @1);
+			}
+		;
+
+grant_role_opt_value:
+		OPTION			{ $$ = (Node *) makeBoolean(true); }
+		| TRUE_P		{ $$ = (Node *) makeBoolean(true); }
+		| FALSE_P		{ $$ = (Node *) makeBoolean(false); }
 		;
 
 opt_granted_by: GRANTED BY RoleSpec						{ $$ = $3; }
@@ -9092,13 +9227,12 @@ DropTransformStmt: DROP TRANSFORM opt_if_exists FOR Typename LANGUAGE name opt_d
  *
  *		QUERY:
  *
- *		REINDEX [ (options) ] {TABLE | INDEX | SCHEMA} [CONCURRENTLY] <name>
- *		REINDEX [ (options) ] DATABASE [CONCURRENTLY] [<name>]
- *		REINDEX [ (options) ] SYSTEM [<name>]
+ *		REINDEX [ (options) ] {INDEX | TABLE | SCHEMA} [CONCURRENTLY] <name>
+ *		REINDEX [ (options) ] {DATABASE | SYSTEM} [CONCURRENTLY] [<name>]
  *****************************************************************************/
 
 ReindexStmt:
-			REINDEX opt_reindex_option_list reindex_target_type opt_concurrently qualified_name
+			REINDEX opt_reindex_option_list reindex_target_relation opt_concurrently qualified_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 
@@ -9116,36 +9250,35 @@ ReindexStmt:
 					ReindexStmt *n = makeNode(ReindexStmt);
 
 					n->kind = REINDEX_OBJECT_SCHEMA;
-					n->name = $5;
 					n->relation = NULL;
+					n->name = $5;
 					n->params = $2;
 					if ($4)
 						n->params = lappend(n->params,
 											makeDefElem("concurrently", NULL, @4));
 					$$ = (Node *) n;
 				}
-			| REINDEX opt_reindex_option_list DATABASE opt_concurrently opt_single_name
+			| REINDEX opt_reindex_option_list reindex_target_all opt_concurrently opt_single_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
-					n->kind = REINDEX_OBJECT_DATABASE;
-					n->name = NULL;
+
+					n->kind = $3;
 					n->relation = NULL;
+					n->name = $5;
 					n->params = $2;
-					$$ = (Node *) n;
-				}
-			| REINDEX opt_reindex_option_list SYSTEM_P opt_single_name
-				{
-					ReindexStmt *n = makeNode(ReindexStmt);
-					n->kind = REINDEX_OBJECT_SYSTEM;
-					n->name = NULL;
-					n->relation = NULL;
-					n->params = $2;
+					if ($4)
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @4));
 					$$ = (Node *) n;
 				}
 		;
-reindex_target_type:
+reindex_target_relation:
 			INDEX					{ $$ = REINDEX_OBJECT_INDEX; }
 			| TABLE					{ $$ = REINDEX_OBJECT_TABLE; }
+		;
+reindex_target_all:
+			SYSTEM_P				{ $$ = REINDEX_OBJECT_SYSTEM; }
+			| DATABASE				{ $$ = REINDEX_OBJECT_DATABASE; }
 		;
 opt_reindex_option_list:
 			'(' utility_option_list ')'				{ $$ = $2; }
@@ -10161,6 +10294,8 @@ operator_def_elem: ColLabel '=' NONE
 						{ $$ = makeDefElem($1, NULL, @1); }
 				   | ColLabel '=' operator_def_arg
 						{ $$ = makeDefElem($1, (Node *) $3, @1); }
+				   | ColLabel
+						{ $$ = makeDefElem($1, NULL, @1); }
 		;
 
 /* must be similar enough to def_arg to avoid reduce/reduce conflicts */
@@ -10427,7 +10562,7 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
  * pub_obj is one of:
  *
  *		TABLE table [, ...]
- *		ALL TABLES IN SCHEMA schema [, ...]
+ *		TABLES IN SCHEMA schema [, ...]
  *
  *****************************************************************************/
 
@@ -10462,7 +10597,7 @@ CreatePublicationStmt:
 		;
 
 /*
- * FOR TABLE and FOR ALL TABLES IN SCHEMA specifications
+ * FOR TABLE and FOR TABLES IN SCHEMA specifications
  *
  * This rule parses publication objects with and without keyword prefixes.
  *
@@ -10484,18 +10619,18 @@ PublicationObjSpec:
 					$$->pubtable->columns = $3;
 					$$->pubtable->whereClause = $4;
 				}
-			| ALL TABLES IN_P SCHEMA ColId
+			| TABLES IN_P SCHEMA ColId
 				{
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA;
-					$$->name = $5;
-					$$->location = @5;
+					$$->name = $4;
+					$$->location = @4;
 				}
-			| ALL TABLES IN_P SCHEMA CURRENT_SCHEMA
+			| TABLES IN_P SCHEMA CURRENT_SCHEMA
 				{
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA;
-					$$->location = @5;
+					$$->location = @4;
 				}
 			| ColId opt_column_list OptWhereClause
 				{
@@ -10571,7 +10706,7 @@ pub_obj_list:	PublicationObjSpec
  * pub_obj is one of:
  *
  *		TABLE table_name [, ...]
- *		ALL TABLES IN SCHEMA schema_name [, ...]
+ *		TABLES IN SCHEMA schema_name [, ...]
  *
  *****************************************************************************/
 
@@ -10903,6 +11038,7 @@ TransactionStmt:
 					n->kind = TRANS_STMT_ROLLBACK;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 			| START TRANSACTION transaction_mode_list_or_empty
@@ -10911,6 +11047,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_START;
 					n->options = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 			| COMMIT opt_transaction opt_transaction_chain
@@ -10920,6 +11057,7 @@ TransactionStmt:
 					n->kind = TRANS_STMT_COMMIT;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 			| ROLLBACK opt_transaction opt_transaction_chain
@@ -10929,6 +11067,7 @@ TransactionStmt:
 					n->kind = TRANS_STMT_ROLLBACK;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 			| SAVEPOINT ColId
@@ -10937,6 +11076,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_SAVEPOINT;
 					n->savepoint_name = $2;
+					n->location = @2;
 					$$ = (Node *) n;
 				}
 			| RELEASE SAVEPOINT ColId
@@ -10945,6 +11085,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_RELEASE;
 					n->savepoint_name = $3;
+					n->location = @3;
 					$$ = (Node *) n;
 				}
 			| RELEASE ColId
@@ -10953,6 +11094,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_RELEASE;
 					n->savepoint_name = $2;
+					n->location = @2;
 					$$ = (Node *) n;
 				}
 			| ROLLBACK opt_transaction TO SAVEPOINT ColId
@@ -10961,6 +11103,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_ROLLBACK_TO;
 					n->savepoint_name = $5;
+					n->location = @5;
 					$$ = (Node *) n;
 				}
 			| ROLLBACK opt_transaction TO ColId
@@ -10969,6 +11112,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_ROLLBACK_TO;
 					n->savepoint_name = $4;
+					n->location = @4;
 					$$ = (Node *) n;
 				}
 			| PREPARE TRANSACTION Sconst
@@ -10977,6 +11121,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_PREPARE;
 					n->gid = $3;
+					n->location = @3;
 					$$ = (Node *) n;
 				}
 			| COMMIT PREPARED Sconst
@@ -10985,6 +11130,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_COMMIT_PREPARED;
 					n->gid = $3;
+					n->location = @3;
 					$$ = (Node *) n;
 				}
 			| ROLLBACK PREPARED Sconst
@@ -10993,6 +11139,7 @@ TransactionStmt:
 
 					n->kind = TRANS_STMT_ROLLBACK_PREPARED;
 					n->gid = $3;
+					n->location = @3;
 					$$ = (Node *) n;
 				}
 		;
@@ -11004,6 +11151,7 @@ TransactionStmtLegacy:
 
 					n->kind = TRANS_STMT_BEGIN;
 					n->options = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 			| END_P opt_transaction opt_transaction_chain
@@ -11013,6 +11161,7 @@ TransactionStmtLegacy:
 					n->kind = TRANS_STMT_COMMIT;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
 					$$ = (Node *) n;
 				}
 		;
@@ -11191,9 +11340,9 @@ createdb_opt_items:
 		;
 
 createdb_opt_item:
-			createdb_opt_name opt_equal SignedIconst
+			createdb_opt_name opt_equal NumericOnly
 				{
-					$$ = makeDefElem($1, (Node *) makeInteger($3), @1);
+					$$ = makeDefElem($1, $3, @1);
 				}
 			| createdb_opt_name opt_equal opt_boolean_or_string
 				{
@@ -11445,7 +11594,7 @@ AlterDomainStmt:
 					$$ = (Node *) n;
 				}
 			/* ALTER DOMAIN <domain> ADD CONSTRAINT ... */
-			| ALTER DOMAIN_P any_name ADD_P TableConstraint
+			| ALTER DOMAIN_P any_name ADD_P DomainConstraint
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
@@ -11616,15 +11765,33 @@ CreateConversionStmt:
 /*****************************************************************************
  *
  *		QUERY:
- *				CLUSTER [VERBOSE] <qualified_name> [ USING <index_name> ]
- *				CLUSTER [ (options) ] <qualified_name> [ USING <index_name> ]
- *				CLUSTER [VERBOSE]
+ *				CLUSTER (options) [ <qualified_name> [ USING <index_name> ] ]
+ *				CLUSTER [VERBOSE] [ <qualified_name> [ USING <index_name> ] ]
  *				CLUSTER [VERBOSE] <index_name> ON <qualified_name> (for pre-8.3)
  *
  *****************************************************************************/
 
 ClusterStmt:
-			CLUSTER opt_verbose qualified_name cluster_index_specification
+			CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
+				{
+					ClusterStmt *n = makeNode(ClusterStmt);
+
+					n->relation = $5;
+					n->indexname = $6;
+					n->params = $3;
+					$$ = (Node *) n;
+				}
+			| CLUSTER '(' utility_option_list ')'
+				{
+					ClusterStmt *n = makeNode(ClusterStmt);
+
+					n->relation = NULL;
+					n->indexname = NULL;
+					n->params = $3;
+					$$ = (Node *) n;
+				}
+			/* unparenthesized VERBOSE kept for pre-14 compatibility */
+			| CLUSTER opt_verbose qualified_name cluster_index_specification
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 
@@ -11635,16 +11802,7 @@ ClusterStmt:
 						n->params = lappend(n->params, makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
-
-			| CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
-				{
-					ClusterStmt *n = makeNode(ClusterStmt);
-
-					n->relation = $5;
-					n->indexname = $6;
-					n->params = $3;
-					$$ = (Node *) n;
-				}
+			/* unparenthesized VERBOSE kept for pre-17 compatibility */
 			| CLUSTER opt_verbose
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
@@ -11765,6 +11923,7 @@ utility_option_elem:
 utility_option_name:
 			NonReservedWord							{ $$ = $1; }
 			| analyze_keyword						{ $$ = "analyze"; }
+			| FORMAT_LA								{ $$ = "format"; }
 		;
 
 utility_option_arg:
@@ -11974,6 +12133,8 @@ DeallocateStmt: DEALLOCATE name
 						DeallocateStmt *n = makeNode(DeallocateStmt);
 
 						n->name = $2;
+						n->isall = false;
+						n->location = @2;
 						$$ = (Node *) n;
 					}
 				| DEALLOCATE PREPARE name
@@ -11981,6 +12142,8 @@ DeallocateStmt: DEALLOCATE name
 						DeallocateStmt *n = makeNode(DeallocateStmt);
 
 						n->name = $3;
+						n->isall = false;
+						n->location = @3;
 						$$ = (Node *) n;
 					}
 				| DEALLOCATE ALL
@@ -11988,6 +12151,8 @@ DeallocateStmt: DEALLOCATE name
 						DeallocateStmt *n = makeNode(DeallocateStmt);
 
 						n->name = NULL;
+						n->isall = true;
+						n->location = -1;
 						$$ = (Node *) n;
 					}
 				| DEALLOCATE PREPARE ALL
@@ -11995,6 +12160,8 @@ DeallocateStmt: DEALLOCATE name
 						DeallocateStmt *n = makeNode(DeallocateStmt);
 
 						n->name = NULL;
+						n->isall = true;
+						n->location = -1;
 						$$ = (Node *) n;
 					}
 		;
@@ -12308,6 +12475,7 @@ MergeStmt:
 			USING table_ref
 			ON a_expr
 			merge_when_list
+			returning_clause
 				{
 					MergeStmt  *m = makeNode(MergeStmt);
 
@@ -12316,6 +12484,7 @@ MergeStmt:
 					m->sourceRelation = $6;
 					m->joinCondition = $8;
 					m->mergeWhenClauses = $9;
+					m->returningList = $10;
 
 					$$ = (Node *) m;
 				}
@@ -12326,48 +12495,64 @@ merge_when_list:
 			| merge_when_list merge_when_clause		{ $$ = lappend($1,$2); }
 		;
 
+/*
+ * A WHEN clause may be WHEN MATCHED, WHEN NOT MATCHED BY SOURCE, or WHEN NOT
+ * MATCHED [BY TARGET]. The first two cases match target tuples, and support
+ * UPDATE/DELETE/DO NOTHING actions. The third case does not match target
+ * tuples, and only supports INSERT/DO NOTHING actions.
+ */
 merge_when_clause:
-			WHEN MATCHED opt_merge_when_condition THEN merge_update
+			merge_when_tgt_matched opt_merge_when_condition THEN merge_update
 				{
-					$5->matched = true;
-					$5->condition = $3;
+					$4->matchKind = $1;
+					$4->condition = $2;
 
-					$$ = (Node *) $5;
+					$$ = (Node *) $4;
 				}
-			| WHEN MATCHED opt_merge_when_condition THEN merge_delete
+			| merge_when_tgt_matched opt_merge_when_condition THEN merge_delete
 				{
-					$5->matched = true;
-					$5->condition = $3;
+					$4->matchKind = $1;
+					$4->condition = $2;
 
-					$$ = (Node *) $5;
+					$$ = (Node *) $4;
 				}
-			| WHEN NOT MATCHED opt_merge_when_condition THEN merge_insert
+			| merge_when_tgt_not_matched opt_merge_when_condition THEN merge_insert
 				{
-					$6->matched = false;
-					$6->condition = $4;
+					$4->matchKind = $1;
+					$4->condition = $2;
 
-					$$ = (Node *) $6;
+					$$ = (Node *) $4;
 				}
-			| WHEN MATCHED opt_merge_when_condition THEN DO NOTHING
-				{
-					MergeWhenClause *m = makeNode(MergeWhenClause);
-
-					m->matched = true;
-					m->commandType = CMD_NOTHING;
-					m->condition = $3;
-
-					$$ = (Node *) m;
-				}
-			| WHEN NOT MATCHED opt_merge_when_condition THEN DO NOTHING
+			| merge_when_tgt_matched opt_merge_when_condition THEN DO NOTHING
 				{
 					MergeWhenClause *m = makeNode(MergeWhenClause);
 
-					m->matched = false;
+					m->matchKind = $1;
 					m->commandType = CMD_NOTHING;
-					m->condition = $4;
+					m->condition = $2;
 
 					$$ = (Node *) m;
 				}
+			| merge_when_tgt_not_matched opt_merge_when_condition THEN DO NOTHING
+				{
+					MergeWhenClause *m = makeNode(MergeWhenClause);
+
+					m->matchKind = $1;
+					m->commandType = CMD_NOTHING;
+					m->condition = $2;
+
+					$$ = (Node *) m;
+				}
+		;
+
+merge_when_tgt_matched:
+			WHEN MATCHED					{ $$ = MERGE_WHEN_MATCHED; }
+			| WHEN NOT MATCHED BY SOURCE	{ $$ = MERGE_WHEN_NOT_MATCHED_BY_SOURCE; }
+		;
+
+merge_when_tgt_not_matched:
+			WHEN NOT MATCHED				{ $$ = MERGE_WHEN_NOT_MATCHED_BY_TARGET; }
+			| WHEN NOT MATCHED BY TARGET	{ $$ = MERGE_WHEN_NOT_MATCHED_BY_TARGET; }
 		;
 
 opt_merge_when_condition:
@@ -13988,6 +14173,152 @@ xml_namespace_el:
 				}
 		;
 
+json_table:
+			JSON_TABLE '('
+				json_value_expr ',' a_expr json_table_path_name_opt
+				json_passing_clause_opt
+				COLUMNS '(' json_table_column_definition_list ')'
+				json_on_error_clause_opt
+			')'
+				{
+					JsonTable *n = makeNode(JsonTable);
+					char	  *pathstring;
+
+					n->context_item = (JsonValueExpr *) $3;
+					if (!IsA($5, A_Const) ||
+						castNode(A_Const, $5)->val.node.type != T_String)
+						ereport(ERROR,
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("only string constants are supported in JSON_TABLE path specification"),
+								parser_errposition(@5));
+					pathstring = castNode(A_Const, $5)->val.sval.sval;
+					n->pathspec = makeJsonTablePathSpec(pathstring, $6, @5, @6);
+					n->passing = $7;
+					n->columns = $10;
+					n->on_error = (JsonBehavior *) $12;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+json_table_path_name_opt:
+			AS name			{ $$ = $2; }
+			| /* empty */	{ $$ = NULL; }
+		;
+
+json_table_column_definition_list:
+			json_table_column_definition
+				{ $$ = list_make1($1); }
+			| json_table_column_definition_list ',' json_table_column_definition
+				{ $$ = lappend($1, $3); }
+		;
+
+json_table_column_definition:
+			ColId FOR ORDINALITY
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_FOR_ORDINALITY;
+					n->name = $1;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ColId Typename
+				json_table_column_path_clause_opt
+				json_wrapper_behavior
+				json_quotes_clause_opt
+				json_behavior_clause_opt
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_REGULAR;
+					n->name = $1;
+					n->typeName = $2;
+					n->format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
+					n->pathspec = (JsonTablePathSpec *) $3;
+					n->wrapper = $4;
+					n->quotes = $5;
+					n->on_empty = (JsonBehavior *) linitial($6);
+					n->on_error = (JsonBehavior *) lsecond($6);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ColId Typename json_format_clause
+				json_table_column_path_clause_opt
+				json_wrapper_behavior
+				json_quotes_clause_opt
+				json_behavior_clause_opt
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_FORMATTED;
+					n->name = $1;
+					n->typeName = $2;
+					n->format = (JsonFormat *) $3;
+					n->pathspec = (JsonTablePathSpec *) $4;
+					n->wrapper = $5;
+					n->quotes = $6;
+					n->on_empty = (JsonBehavior *) linitial($7);
+					n->on_error = (JsonBehavior *) lsecond($7);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ColId Typename
+				EXISTS json_table_column_path_clause_opt
+				json_behavior_clause_opt
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_EXISTS;
+					n->name = $1;
+					n->typeName = $2;
+					n->format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
+					n->wrapper = JSW_NONE;
+					n->quotes = JS_QUOTES_UNSPEC;
+					n->pathspec = (JsonTablePathSpec *) $4;
+					n->on_empty = (JsonBehavior *) linitial($5);
+					n->on_error = (JsonBehavior *) lsecond($5);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| NESTED path_opt Sconst
+				COLUMNS '(' json_table_column_definition_list ')'
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_NESTED;
+					n->pathspec = (JsonTablePathSpec *)
+						makeJsonTablePathSpec($3, NULL, @3, -1);
+					n->columns = $6;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| NESTED path_opt Sconst AS name
+				COLUMNS '(' json_table_column_definition_list ')'
+				{
+					JsonTableColumn *n = makeNode(JsonTableColumn);
+
+					n->coltype = JTC_NESTED;
+					n->pathspec = (JsonTablePathSpec *)
+						makeJsonTablePathSpec($3, $5, @3, @5);
+					n->columns = $8;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+path_opt:
+			PATH
+			| /* EMPTY */
+		;
+
+json_table_column_path_clause_opt:
+			PATH Sconst
+				{ $$ = (Node *) makeJsonTablePathSpec($2, NULL, @2, -1); }
+			| /* EMPTY */
+				{ $$ = NULL; }
+		;
+
 /*****************************************************************************
  *
  *	Type syntax
@@ -14503,6 +14834,13 @@ a_expr:		c_expr									{ $$ = $1; }
 											   COERCE_SQL_SYNTAX,
 											   @2);
 				}
+			| a_expr AT LOCAL						%prec AT
+				{
+					$$ = (Node *) makeFuncCall(SystemFuncName("timezone"),
+											   list_make1($1),
+											   COERCE_SQL_SYNTAX,
+											   -1);
+				}
 		/*
 		 * These operators must be called out explicitly in order to make use
 		 * of bison's automatic operator-precedence handling.  All other
@@ -14925,28 +15263,25 @@ a_expr:		c_expr									{ $$ = $1; }
 														   @2),
 									 @2);
 				}
-			| a_expr
-				IS json_predicate_type_constraint_opt
+			| a_expr IS json_predicate_type_constraint
 					json_key_uniqueness_constraint_opt		%prec IS
 				{
 					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
+
 					$$ = makeJsonIsPredicate($1, format, $3, $4, @1);
 				}
 			/*
-			 * Required by standard, but it would conflict with expressions
-			 * like: 'str' || format(...)
+			 * Required by SQL/JSON, but there are conflicts
 			| a_expr
-				FORMAT json_representation
-				IS  json_predicate_type_constraint_opt
-					json_key_uniqueness_constraint_opt		%prec FORMAT
+				json_format_clause
+				IS  json_predicate_type_constraint
+					json_key_uniqueness_constraint_opt		%prec IS
 				{
-					$3.location = @2;
-					$$ = makeJsonIsPredicate($1, $3, $5, $6, @1);
+					$$ = makeJsonIsPredicate($1, $2, $4, $5, @1);
 				}
 			*/
-			| a_expr
-				IS NOT
-					json_predicate_type_constraint_opt
+			| a_expr IS NOT
+					json_predicate_type_constraint
 					json_key_uniqueness_constraint_opt		%prec IS
 				{
 					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
@@ -14954,16 +15289,14 @@ a_expr:		c_expr									{ $$ = $1; }
 					$$ = makeNotExpr(makeJsonIsPredicate($1, format, $4, $5, @1), @1);
 				}
 			/*
-			 * Required by standard, but it would conflict with expressions
-			 * like: 'str' || format(...)
+			 * Required by SQL/JSON, but there are conflicts
 			| a_expr
-				FORMAT json_representation
+				json_format_clause
 				IS NOT
-					json_predicate_type_constraint_opt
-					json_key_uniqueness_constraint_opt		%prec FORMAT
+					json_predicate_type_constraint
+					json_key_uniqueness_constraint_opt		%prec IS
 				{
-					$3.location = @2;
-					$$ = makeNotExpr(makeJsonIsPredicate($1, $3, $6, $7, @1), @1);
+					$$ = makeNotExpr(makeJsonIsPredicate($1, $2, $5, $6, @1), @1);
 				}
 			*/
 			| DEFAULT
@@ -15047,25 +15380,6 @@ b_expr:		c_expr
 												 list_make1($1), @2),
 									 @2);
 				}
-		;
-
-json_predicate_type_constraint_opt:
-			JSON									{ $$ = JS_TYPE_ANY; }
-			| JSON VALUE_P							{ $$ = JS_TYPE_ANY; }
-			| JSON ARRAY							{ $$ = JS_TYPE_ARRAY; }
-			| JSON OBJECT_P							{ $$ = JS_TYPE_OBJECT; }
-			| JSON SCALAR							{ $$ = JS_TYPE_SCALAR; }
-		;
-
-json_key_uniqueness_constraint_opt:
-			WITH_LA_UNIQUE unique_keys				{ $$ = true; }
-			| WITHOUT unique_keys					{ $$ = false; }
-			| /* EMPTY */ %prec empty_json_unique	{ $$ = false; }
-		;
-
-unique_keys:
-			UNIQUE
-			| UNIQUE KEYS
 		;
 
 /*
@@ -15423,6 +15737,13 @@ func_expr_common_subexpr:
 				{
 					$$ = makeSQLValueFunction(SVFOP_SESSION_USER, -1, @1);
 				}
+			| SYSTEM_USER
+				{
+					$$ = (Node *) makeFuncCall(SystemFuncName("system_user"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
+				}
 			| USER
 				{
 					$$ = makeSQLValueFunction(SVFOP_USER, -1, @1);
@@ -15644,19 +15965,184 @@ func_expr_common_subexpr:
 					$$ = makeXmlExpr(IS_XMLROOT, NULL, NIL,
 									 list_make3($3, $5, $6), @1);
 				}
-			| XMLSERIALIZE '(' document_or_content a_expr AS SimpleTypename ')'
+			| XMLSERIALIZE '(' document_or_content a_expr AS SimpleTypename xml_indent_option ')'
 				{
 					XmlSerialize *n = makeNode(XmlSerialize);
 
 					n->xmloption = $3;
 					n->expr = $4;
 					n->typeName = $6;
+					n->indent = $7;
 					n->location = @1;
 					$$ = (Node *) n;
 				}
-			| json_func_expr
-				{ $$ = $1; }
-		;
+			| JSON_OBJECT '(' func_arg_list ')'
+				{
+					/* Support for legacy (non-standard) json_object() */
+					$$ = (Node *) makeFuncCall(SystemFuncName("json_object"),
+											   $3, COERCE_EXPLICIT_CALL, @1);
+				}
+			| JSON_OBJECT '(' json_name_and_value_list
+				json_object_constructor_null_clause_opt
+				json_key_uniqueness_constraint_opt
+				json_returning_clause_opt ')'
+				{
+					JsonObjectConstructor *n = makeNode(JsonObjectConstructor);
+
+					n->exprs = $3;
+					n->absent_on_null = $4;
+					n->unique = $5;
+					n->output = (JsonOutput *) $6;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_OBJECT '(' json_returning_clause_opt ')'
+				{
+					JsonObjectConstructor *n = makeNode(JsonObjectConstructor);
+
+					n->exprs = NULL;
+					n->absent_on_null = false;
+					n->unique = false;
+					n->output = (JsonOutput *) $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_ARRAY '('
+				json_value_expr_list
+				json_array_constructor_null_clause_opt
+				json_returning_clause_opt
+			')'
+				{
+					JsonArrayConstructor *n = makeNode(JsonArrayConstructor);
+
+					n->exprs = $3;
+					n->absent_on_null = $4;
+					n->output = (JsonOutput *) $5;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_ARRAY '('
+				select_no_parens
+				json_format_clause_opt
+				/* json_array_constructor_null_clause_opt */
+				json_returning_clause_opt
+			')'
+				{
+					JsonArrayQueryConstructor *n = makeNode(JsonArrayQueryConstructor);
+
+					n->query = $3;
+					n->format = (JsonFormat *) $4;
+					n->absent_on_null = true;	/* XXX */
+					n->output = (JsonOutput *) $5;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_ARRAY '('
+				json_returning_clause_opt
+			')'
+				{
+					JsonArrayConstructor *n = makeNode(JsonArrayConstructor);
+
+					n->exprs = NIL;
+					n->absent_on_null = true;
+					n->output = (JsonOutput *) $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON '(' json_value_expr json_key_uniqueness_constraint_opt ')'
+				{
+					JsonParseExpr *n = makeNode(JsonParseExpr);
+
+					n->expr = (JsonValueExpr *) $3;
+					n->unique_keys = $4;
+					n->output = NULL;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_SCALAR '(' a_expr ')'
+				{
+					JsonScalarExpr *n = makeNode(JsonScalarExpr);
+
+					n->expr = (Expr *) $3;
+					n->output = NULL;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_SERIALIZE '(' json_value_expr json_returning_clause_opt ')'
+				{
+					JsonSerializeExpr *n = makeNode(JsonSerializeExpr);
+
+					n->expr = (JsonValueExpr *) $3;
+					n->output = (JsonOutput *) $4;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| MERGE_ACTION '(' ')'
+				{
+					MergeSupportFunc *m = makeNode(MergeSupportFunc);
+
+					m->msftype = TEXTOID;
+					m->location = @1;
+					$$ = (Node *) m;
+				}
+			| JSON_QUERY '('
+				json_value_expr ',' a_expr json_passing_clause_opt
+				json_returning_clause_opt
+				json_wrapper_behavior
+				json_quotes_clause_opt
+				json_behavior_clause_opt
+			')'
+				{
+					JsonFuncExpr *n = makeNode(JsonFuncExpr);
+
+					n->op = JSON_QUERY_OP;
+					n->context_item = (JsonValueExpr *) $3;
+					n->pathspec = $5;
+					n->passing = $6;
+					n->output = (JsonOutput *) $7;
+					n->wrapper = $8;
+					n->quotes = $9;
+					n->on_empty = (JsonBehavior *) linitial($10);
+					n->on_error = (JsonBehavior *) lsecond($10);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_EXISTS '('
+				json_value_expr ',' a_expr json_passing_clause_opt
+				json_on_error_clause_opt
+			')'
+				{
+					JsonFuncExpr *n = makeNode(JsonFuncExpr);
+
+					n->op = JSON_EXISTS_OP;
+					n->context_item = (JsonValueExpr *) $3;
+					n->pathspec = $5;
+					n->passing = $6;
+					n->output = NULL;
+					n->on_error = (JsonBehavior *) $7;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| JSON_VALUE '('
+				json_value_expr ',' a_expr json_passing_clause_opt
+				json_returning_clause_opt
+				json_behavior_clause_opt
+			')'
+				{
+					JsonFuncExpr *n = makeNode(JsonFuncExpr);
+
+					n->op = JSON_VALUE_OP;
+					n->context_item = (JsonValueExpr *) $3;
+					n->pathspec = $5;
+					n->passing = $6;
+					n->output = (JsonOutput *) $7;
+					n->on_empty = (JsonBehavior *) linitial($8);
+					n->on_error = (JsonBehavior *) lsecond($8);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			;
+
 
 /*
  * SQL/XML support
@@ -15706,6 +16192,11 @@ document_or_content: DOCUMENT_P						{ $$ = XMLOPTION_DOCUMENT; }
 			| CONTENT_P								{ $$ = XMLOPTION_CONTENT; }
 		;
 
+xml_indent_option: INDENT							{ $$ = true; }
+			| NO INDENT								{ $$ = false; }
+			| /*EMPTY*/								{ $$ = false; }
+		;
+
 xml_whitespace_option: PRESERVE WHITESPACE_P		{ $$ = true; }
 			| STRIP_P WHITESPACE_P					{ $$ = false; }
 			| /*EMPTY*/								{ $$ = false; }
@@ -15732,7 +16223,7 @@ xmlexists_argument:
 		;
 
 xml_passing_mech:
-			BY REF
+			BY REF_P
 			| BY VALUE_P
 		;
 
@@ -16376,109 +16867,9 @@ opt_asymmetric: ASYMMETRIC
 		;
 
 /* SQL/JSON support */
-json_func_expr:
-			json_value_constructor
-			| json_value_func_expr
-			| json_query_expr
-			| json_exists_predicate
-			| json_parse_expr
-			| json_scalar_expr
-			| json_serialize_expr
-		;
-
-json_parse_expr:
-			JSON '(' json_value_expr json_key_uniqueness_constraint_opt
-					 json_returning_clause_opt ')'
-				{
-					JsonParseExpr *n = makeNode(JsonParseExpr);
-
-					n->expr = (JsonValueExpr *) $3;
-					n->unique_keys = $4;
-					n->output = (JsonOutput *) $5;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_scalar_expr:
-			JSON_SCALAR '(' a_expr json_returning_clause_opt ')'
-				{
-					JsonScalarExpr *n = makeNode(JsonScalarExpr);
-
-					n->expr = (Expr *) $3;
-					n->output = (JsonOutput *) $4;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_serialize_expr:
-			JSON_SERIALIZE '(' json_value_expr json_output_clause_opt ')'
-				{
-					JsonSerializeExpr *n = makeNode(JsonSerializeExpr);
-
-					n->expr = (JsonValueExpr *) $3;
-					n->output = (JsonOutput *) $4;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_value_func_expr:
-			JSON_VALUE '('
-				json_api_common_syntax
-				json_returning_clause_opt
-				json_value_on_behavior_clause_opt
-			')'
-				{
-					JsonFuncExpr *n = makeNode(JsonFuncExpr);
-
-					n->op = JSON_VALUE_OP;
-					n->common = (JsonCommon *) $3;
-					n->output = (JsonOutput *) $4;
-					n->on_empty = $5.on_empty;
-					n->on_error = $5.on_error;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_api_common_syntax:
-			json_context_item ',' json_path_specification
-			json_as_path_name_clause_opt
-			json_passing_clause_opt
-				{
-					JsonCommon *n = makeNode(JsonCommon);
-
-					n->expr = (JsonValueExpr *) $1;
-					n->pathspec = $3;
-					n->pathname = $4;
-					n->passing = $5;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_context_item:
-			json_value_expr							{ $$ = $1; }
-		;
-
-json_path_specification:
-			a_expr									{ $$ = $1; }
-		;
-
-json_as_path_name_clause_opt:
-			 AS json_table_path_name				{ $$ = $2; }
-			 | /* EMPTY */							{ $$ = NULL; }
-		;
-
-json_table_path_name:
-			name									{ $$ = $1; }
-		;
-
 json_passing_clause_opt:
 			PASSING json_arguments					{ $$ = $2; }
-			| /* EMPTY */							{ $$ = NIL; }
+			| /*EMPTY*/								{ $$ = NIL; }
 		;
 
 json_arguments:
@@ -16497,18 +16888,93 @@ json_argument:
 			}
 		;
 
+/* ARRAY is a noise word */
+json_wrapper_behavior:
+			  WITHOUT WRAPPER					{ $$ = JSW_NONE; }
+			| WITHOUT ARRAY	WRAPPER				{ $$ = JSW_NONE; }
+			| WITH WRAPPER						{ $$ = JSW_UNCONDITIONAL; }
+			| WITH ARRAY WRAPPER				{ $$ = JSW_UNCONDITIONAL; }
+			| WITH CONDITIONAL ARRAY WRAPPER	{ $$ = JSW_CONDITIONAL; }
+			| WITH UNCONDITIONAL ARRAY WRAPPER	{ $$ = JSW_UNCONDITIONAL; }
+			| WITH CONDITIONAL WRAPPER			{ $$ = JSW_CONDITIONAL; }
+			| WITH UNCONDITIONAL WRAPPER		{ $$ = JSW_UNCONDITIONAL; }
+			| /* empty */						{ $$ = JSW_UNSPEC; }
+		;
+
+json_behavior:
+			DEFAULT a_expr
+				{ $$ = (Node *) makeJsonBehavior(JSON_BEHAVIOR_DEFAULT, $2, @1); }
+			| json_behavior_type
+				{ $$ = (Node *) makeJsonBehavior($1, NULL, @1); }
+		;
+
+json_behavior_type:
+			ERROR_P		{ $$ = JSON_BEHAVIOR_ERROR; }
+			| NULL_P	{ $$ = JSON_BEHAVIOR_NULL; }
+			| TRUE_P	{ $$ = JSON_BEHAVIOR_TRUE; }
+			| FALSE_P	{ $$ = JSON_BEHAVIOR_FALSE; }
+			| UNKNOWN	{ $$ = JSON_BEHAVIOR_UNKNOWN; }
+			| EMPTY_P ARRAY	{ $$ = JSON_BEHAVIOR_EMPTY_ARRAY; }
+			| EMPTY_P OBJECT_P	{ $$ = JSON_BEHAVIOR_EMPTY_OBJECT; }
+			/* non-standard, for Oracle compatibility only */
+			| EMPTY_P	{ $$ = JSON_BEHAVIOR_EMPTY_ARRAY; }
+		;
+
+json_behavior_clause_opt:
+			json_behavior ON EMPTY_P
+				{ $$ = list_make2($1, NULL); }
+			| json_behavior ON ERROR_P
+				{ $$ = list_make2(NULL, $1); }
+			| json_behavior ON EMPTY_P json_behavior ON ERROR_P
+				{ $$ = list_make2($1, $4); }
+			| /* EMPTY */
+				{ $$ = list_make2(NULL, NULL); }
+		;
+
+json_on_error_clause_opt:
+			json_behavior ON ERROR_P
+				{ $$ = $1; }
+			| /* EMPTY */
+				{ $$ = NULL; }
+		;
+
 json_value_expr:
 			a_expr json_format_clause_opt
 			{
-				$$ = (Node *) makeJsonValueExpr((Expr *) $1, castNode(JsonFormat, $2));
+				/* formatted_expr will be set during parse-analysis. */
+				$$ = (Node *) makeJsonValueExpr((Expr *) $1, NULL,
+												castNode(JsonFormat, $2));
 			}
 		;
 
-json_format_clause_opt:
-			FORMAT json_representation
+json_format_clause:
+			FORMAT_LA JSON ENCODING name
 				{
-					$$ = $2;
-					castNode(JsonFormat, $$)->location = @1;
+					int		encoding;
+
+					if (!pg_strcasecmp($4, "utf8"))
+						encoding = JS_ENC_UTF8;
+					else if (!pg_strcasecmp($4, "utf16"))
+						encoding = JS_ENC_UTF16;
+					else if (!pg_strcasecmp($4, "utf32"))
+						encoding = JS_ENC_UTF32;
+					else
+						ereport(ERROR,
+								errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("unrecognized JSON encoding: %s", $4));
+
+					$$ = (Node *) makeJsonFormat(JS_FORMAT_JSON, encoding, @1);
+				}
+			| FORMAT_LA JSON
+				{
+					$$ = (Node *) makeJsonFormat(JS_FORMAT_JSON, JS_ENC_DEFAULT, @1);
+				}
+		;
+
+json_format_clause_opt:
+			json_format_clause
+				{
+					$$ = $1;
 				}
 			| /* EMPTY */
 				{
@@ -16516,437 +16982,15 @@ json_format_clause_opt:
 				}
 		;
 
-json_representation:
-			JSON json_encoding_clause_opt
-				{
-					$$ = (Node *) makeJsonFormat(JS_FORMAT_JSON, $2, @1);
-				}
-		/*	| other implementation defined JSON representation options (BSON, AVRO etc) */
-		;
-
-json_encoding_clause_opt:
-			ENCODING json_encoding					{ $$ = $2; }
-			| /* EMPTY */							{ $$ = JS_ENC_DEFAULT; }
-		;
-
-json_encoding:
-			name									{ $$ = makeJsonEncoding($1); }
-		;
-
-json_behavior_error:
-			ERROR_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_ERROR, NULL); }
-		;
-
-json_behavior_null:
-			NULL_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_NULL, NULL); }
-		;
-
-json_behavior_true:
-			TRUE_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_TRUE, NULL); }
-		;
-
-json_behavior_false:
-			FALSE_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_FALSE, NULL); }
-		;
-
-json_behavior_unknown:
-			UNKNOWN		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_UNKNOWN, NULL); }
-		;
-
-json_behavior_empty:
-			EMPTY_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_OBJECT, NULL); }
-		;
-
-json_behavior_empty_array:
-			EMPTY_P ARRAY	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_ARRAY, NULL); }
-			/* non-standard, for Oracle compatibility only */
-			| EMPTY_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_ARRAY, NULL); }
-		;
-
-json_behavior_empty_object:
-			EMPTY_P OBJECT_P	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_OBJECT, NULL); }
-		;
-
-json_behavior_default:
-			DEFAULT a_expr	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_DEFAULT, $2); }
-		;
-
-
-json_value_behavior:
-			json_behavior_null
-			| json_behavior_error
-			| json_behavior_default
-		;
-
-json_value_on_behavior_clause_opt:
-			json_value_behavior ON EMPTY_P
-									{ $$.on_empty = $1; $$.on_error = NULL; }
-			| json_value_behavior ON EMPTY_P json_value_behavior ON ERROR_P
-									{ $$.on_empty = $1; $$.on_error = $4; }
-			| json_value_behavior ON ERROR_P
-									{ $$.on_empty = NULL; $$.on_error = $1; }
-			|  /* EMPTY */
-									{ $$.on_empty = NULL; $$.on_error = NULL; }
-		;
-
-json_query_expr:
-			JSON_QUERY '('
-				json_api_common_syntax
-				json_output_clause_opt
-				json_wrapper_clause_opt
-				json_quotes_clause_opt
-				json_query_on_behavior_clause_opt
-			')'
-				{
-					JsonFuncExpr *n = makeNode(JsonFuncExpr);
-
-					n->op = JSON_QUERY_OP;
-					n->common = (JsonCommon *) $3;
-					n->output = (JsonOutput *) $4;
-					n->wrapper = $5;
-					if (n->wrapper != JSW_NONE && $6 != JS_QUOTES_UNSPEC)
-						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used"),
-								 parser_errposition(@6)));
-					n->omit_quotes = $6 == JS_QUOTES_OMIT;
-					n->on_empty = $7.on_empty;
-					n->on_error = $7.on_error;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_wrapper_clause_opt:
-			json_wrapper_behavior WRAPPER			{ $$ = $1; }
-			| /* EMPTY */							{ $$ = 0; }
-		;
-
-json_wrapper_behavior:
-			WITHOUT array_opt						{ $$ = JSW_NONE; }
-			| WITH json_conditional_or_unconditional_opt array_opt { $$ = $2; }
-		;
-
-array_opt:
-			ARRAY									{ }
-			| /* EMPTY */							{ }
-		;
-
-json_conditional_or_unconditional_opt:
-			CONDITIONAL								{ $$ = JSW_CONDITIONAL; }
-			| UNCONDITIONAL							{ $$ = JSW_UNCONDITIONAL; }
-			| /* EMPTY */							{ $$ = JSW_UNCONDITIONAL; }
-		;
-
 json_quotes_clause_opt:
-			json_quotes_behavior QUOTES json_on_scalar_string_opt { $$ = $1; }
-			| /* EMPTY */							{ $$ = JS_QUOTES_UNSPEC; }
-		;
-
-json_quotes_behavior:
-			KEEP									{ $$ = JS_QUOTES_KEEP; }
-			| OMIT									{ $$ = JS_QUOTES_OMIT; }
-		;
-
-json_on_scalar_string_opt:
-			ON SCALAR STRING						{ }
-			| /* EMPTY */							{ }
-		;
-
-json_query_behavior:
-			json_behavior_error
-			| json_behavior_null
-			| json_behavior_empty_array
-			| json_behavior_empty_object
-			| json_behavior_default
-		;
-
-json_query_on_behavior_clause_opt:
-			json_query_behavior ON EMPTY_P
-									{ $$.on_empty = $1; $$.on_error = NULL; }
-			| json_query_behavior ON EMPTY_P json_query_behavior ON ERROR_P
-									{ $$.on_empty = $1; $$.on_error = $4; }
-			| json_query_behavior ON ERROR_P
-									{ $$.on_empty = NULL; $$.on_error = $1; }
-			|  /* EMPTY */
-									{ $$.on_empty = NULL; $$.on_error = NULL; }
-		;
-
-json_table:
-			JSON_TABLE '('
-				json_api_common_syntax
-				json_table_columns_clause
-				json_table_plan_clause_opt
-				json_table_error_clause_opt
-			')'
-				{
-					JsonTable *n = makeNode(JsonTable);
-
-					n->common = (JsonCommon *) $3;
-					n->columns = $4;
-					n->plan = (JsonTablePlan *) $5;
-					n->on_error = $6;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_columns_clause:
-			COLUMNS '('	json_table_column_definition_list ')' { $$ = $3; }
-		;
-
-json_table_column_definition_list:
-			json_table_column_definition
-				{ $$ = list_make1($1); }
-			| json_table_column_definition_list ',' json_table_column_definition
-				{ $$ = lappend($1, $3); }
-		;
-
-json_table_column_definition:
-			json_table_ordinality_column_definition		%prec json_table_column
-			| json_table_regular_column_definition		%prec json_table_column
-			| json_table_formatted_column_definition	%prec json_table_column
-			| json_table_exists_column_definition		%prec json_table_column
-			| json_table_nested_columns
-		;
-
-json_table_ordinality_column_definition:
-			ColId FOR ORDINALITY
-				{
-					JsonTableColumn *n = makeNode(JsonTableColumn);
-
-					n->coltype = JTC_FOR_ORDINALITY;
-					n->name = $1;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_regular_column_definition:
-			ColId Typename
-			json_table_column_path_specification_clause_opt
-			json_wrapper_clause_opt
-			json_quotes_clause_opt
-			json_value_on_behavior_clause_opt
-				{
-					JsonTableColumn *n = makeNode(JsonTableColumn);
-
-					n->coltype = JTC_REGULAR;
-					n->name = $1;
-					n->typeName = $2;
-					n->format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
-					n->wrapper = $4; /* JSW_NONE */
-					n->omit_quotes = $5; /* false */
-					n->pathspec = $3;
-					n->on_empty = $6.on_empty;
-					n->on_error = $6.on_error;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_exists_column_definition:
-			ColId Typename
-			EXISTS json_table_column_path_specification_clause_opt
-			json_exists_error_clause_opt
-				{
-					JsonTableColumn *n = makeNode(JsonTableColumn);
-
-					n->coltype = JTC_EXISTS;
-					n->name = $1;
-					n->typeName = $2;
-					n->format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
-					n->wrapper = JSW_NONE;
-					n->omit_quotes = false;
-					n->pathspec = $4;
-					n->on_empty = NULL;
-					n->on_error = $5;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_error_behavior:
-			json_behavior_error
-			| json_behavior_empty
-		;
-
-json_table_error_clause_opt:
-			json_table_error_behavior ON ERROR_P	{ $$ = $1; }
-			| /* EMPTY */							{ $$ = NULL; }
-		;
-
-json_table_column_path_specification_clause_opt:
-			PATH Sconst								{ $$ = $2; }
-			| /* EMPTY */ %prec json_table_column	{ $$ = NULL; }
-		;
-
-json_table_formatted_column_definition:
-			ColId Typename FORMAT json_representation
-			json_table_column_path_specification_clause_opt
-			json_wrapper_clause_opt
-			json_quotes_clause_opt
-			json_query_on_behavior_clause_opt
-				{
-					JsonTableColumn *n = makeNode(JsonTableColumn);
-
-					n->coltype = JTC_FORMATTED;
-					n->name = $1;
-					n->typeName = $2;
-					n->format = castNode(JsonFormat, $4);
-					n->pathspec = $5;
-					n->wrapper = $6;
-					if (n->wrapper != JSW_NONE && $7 != JS_QUOTES_UNSPEC)
-						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used"),
-								 parser_errposition(@7)));
-					n->omit_quotes = $7 == JS_QUOTES_OMIT;
-					n->on_empty = $8.on_empty;
-					n->on_error = $8.on_error;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_nested_columns:
-			NESTED path_opt Sconst
-							json_as_path_name_clause_opt
-							json_table_columns_clause
-				{
-					JsonTableColumn *n = makeNode(JsonTableColumn);
-
-					n->coltype = JTC_NESTED;
-					n->pathspec = $3;
-					n->pathname = $4;
-					n->columns = $5;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-path_opt:
-			PATH									{ }
-			| /* EMPTY */							{ }
-		;
-
-json_table_plan_clause_opt:
-			json_table_specific_plan				{ $$ = $1; }
-			| json_table_default_plan				{ $$ = $1; }
-			| /* EMPTY */							{ $$ = NULL; }
-		;
-
-json_table_specific_plan:
-			PLAN '(' json_table_plan ')'			{ $$ = $3; }
-		;
-
-json_table_plan:
-			json_table_plan_simple
-			| json_table_plan_parent_child
-			| json_table_plan_sibling
-		;
-
-json_table_plan_simple:
-			json_table_path_name
-				{
-					JsonTablePlan *n = makeNode(JsonTablePlan);
-
-					n->plan_type = JSTP_SIMPLE;
-					n->pathname = $1;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_table_plan_parent_child:
-			json_table_plan_outer
-			| json_table_plan_inner
-		;
-
-json_table_plan_outer:
-			json_table_plan_simple OUTER_P json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_OUTER, $1, $3, @1); }
-		;
-
-json_table_plan_inner:
-			json_table_plan_simple INNER_P json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_INNER, $1, $3, @1); }
-		;
-
-json_table_plan_sibling:
-			json_table_plan_union
-			| json_table_plan_cross
-		;
-
-json_table_plan_union:
-			json_table_plan_primary UNION json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_UNION, $1, $3, @1); }
-			| json_table_plan_union UNION json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_UNION, $1, $3, @1); }
-		;
-
-json_table_plan_cross:
-			json_table_plan_primary CROSS json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_CROSS, $1, $3, @1); }
-			| json_table_plan_cross CROSS json_table_plan_primary
-				{ $$ = makeJsonTableJoinedPlan(JSTPJ_CROSS, $1, $3, @1); }
-		;
-
-json_table_plan_primary:
-			json_table_plan_simple						{ $$ = $1; }
-			| '(' json_table_plan ')'
-				{
-					castNode(JsonTablePlan, $2)->location = @1;
-					$$ = $2;
-				}
-		;
-
-json_table_default_plan:
-			PLAN DEFAULT '(' json_table_default_plan_choices ')'
-			{
-				JsonTablePlan *n = makeNode(JsonTablePlan);
-
-				n->plan_type = JSTP_DEFAULT;
-				n->join_type = $4;
-				n->location = @1;
-				$$ = (Node *) n;
-			}
-		;
-
-json_table_default_plan_choices:
-			json_table_default_plan_inner_outer			{ $$ = $1 | JSTPJ_UNION; }
-			| json_table_default_plan_inner_outer ','
-			  json_table_default_plan_union_cross		{ $$ = $1 | $3; }
-			| json_table_default_plan_union_cross		{ $$ = $1 | JSTPJ_OUTER; }
-			| json_table_default_plan_union_cross ','
-			  json_table_default_plan_inner_outer		{ $$ = $1 | $3; }
-		;
-
-json_table_default_plan_inner_outer:
-			INNER_P										{ $$ = JSTPJ_INNER; }
-			| OUTER_P									{ $$ = JSTPJ_OUTER; }
-		;
-
-json_table_default_plan_union_cross:
-			UNION										{ $$ = JSTPJ_UNION; }
-			| CROSS										{ $$ = JSTPJ_CROSS; }
+			KEEP QUOTES ON SCALAR STRING_P		{ $$ = JS_QUOTES_KEEP; }
+			| KEEP QUOTES						{ $$ = JS_QUOTES_KEEP; }
+			| OMIT QUOTES ON SCALAR STRING_P	{ $$ = JS_QUOTES_OMIT; }
+			| OMIT QUOTES						{ $$ = JS_QUOTES_OMIT; }
+			| /* EMPTY */						{ $$ = JS_QUOTES_UNSPEC; }
 		;
 
 json_returning_clause_opt:
-			RETURNING Typename
-				{
-					JsonOutput *n = makeNode(JsonOutput);
-
-					n->typeName = $2;
-					n->returning = makeNode(JsonReturning);
-					n->returning->format =
-						makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, @2);
-					$$ = (Node *) n;
-				}
-			| /* EMPTY */							{ $$ = NULL; }
-			;
-
-json_output_clause_opt:
 			RETURNING Typename json_format_clause_opt
 				{
 					JsonOutput *n = makeNode(JsonOutput);
@@ -16957,96 +17001,37 @@ json_output_clause_opt:
 					$$ = (Node *) n;
 				}
 			| /* EMPTY */							{ $$ = NULL; }
-			;
-
-json_exists_predicate:
-			JSON_EXISTS '('
-				json_api_common_syntax
-				json_returning_clause_opt
-				json_exists_error_clause_opt
-			')'
-				{
-					JsonFuncExpr *p = makeNode(JsonFuncExpr);
-
-					p->op = JSON_EXISTS_OP;
-					p->common = (JsonCommon *) $3;
-					p->output = (JsonOutput *) $4;
-					p->on_error = $5;
-					p->location = @1;
-					$$ = (Node *) p;
-				}
 		;
 
-json_exists_error_clause_opt:
-			json_exists_error_behavior ON ERROR_P		{ $$ = $1; }
-			| /* EMPTY */								{ $$ = NULL; }
+/*
+ * We must assign the only-JSON production a precedence less than IDENT in
+ * order to favor shifting over reduction when JSON is followed by VALUE_P,
+ * OBJECT_P, or SCALAR.  (ARRAY doesn't need that treatment, because it's a
+ * fully reserved word.)  Because json_predicate_type_constraint is always
+ * followed by json_key_uniqueness_constraint_opt, we also need the only-JSON
+ * production to have precedence less than WITH and WITHOUT.  UNBOUNDED isn't
+ * really related to this syntax, but it's a convenient choice because it
+ * already has a precedence less than IDENT for other reasons.
+ */
+json_predicate_type_constraint:
+			JSON					%prec UNBOUNDED	{ $$ = JS_TYPE_ANY; }
+			| JSON VALUE_P							{ $$ = JS_TYPE_ANY; }
+			| JSON ARRAY							{ $$ = JS_TYPE_ARRAY; }
+			| JSON OBJECT_P							{ $$ = JS_TYPE_OBJECT; }
+			| JSON SCALAR							{ $$ = JS_TYPE_SCALAR; }
 		;
 
-json_exists_error_behavior:
-			json_behavior_error
-			| json_behavior_true
-			| json_behavior_false
-			| json_behavior_unknown
-		;
-
-json_value_constructor:
-			json_object_constructor
-			| json_array_constructor
-		;
-
-json_object_constructor:
-			JSON_OBJECT '(' json_object_args ')'
-				{
-					$$ = $3;
-				}
-		;
-
-json_object_args:
-			json_object_constructor_args
-			| json_object_func_args
-		;
-
-json_object_func_args:
-			func_arg_list
-				{
-					List	   *func = list_make1(makeString("json_object"));
-
-					$$ = (Node *) makeFuncCall(func, $1, COERCE_EXPLICIT_CALL, @1);
-				}
-		;
-
-json_object_constructor_args:
-			json_object_constructor_args_opt json_output_clause_opt
-				{
-					JsonObjectConstructor *n = (JsonObjectConstructor *) $1;
-
-					n->output = (JsonOutput *) $2;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_object_constructor_args_opt:
-			json_name_and_value_list
-			json_object_constructor_null_clause_opt
-			json_key_uniqueness_constraint_opt
-				{
-					JsonObjectConstructor *n = makeNode(JsonObjectConstructor);
-
-					n->exprs = $1;
-					n->absent_on_null = $2;
-					n->unique = $3;
-					$$ = (Node *) n;
-				}
-			| /* EMPTY */
-				{
-					JsonObjectConstructor *n = makeNode(JsonObjectConstructor);
-
-					n->exprs = NULL;
-					n->absent_on_null = false;
-					n->unique = false;
-					$$ = (Node *) n;
-				}
+/*
+ * KEYS is a noise word here.  To avoid shift/reduce conflicts, assign the
+ * KEYS-less productions a precedence less than IDENT (i.e., less than KEYS).
+ * This prevents reducing them when the next token is KEYS.
+ */
+json_key_uniqueness_constraint_opt:
+			WITH UNIQUE KEYS							{ $$ = true; }
+			| WITH UNIQUE				%prec UNBOUNDED	{ $$ = true; }
+			| WITHOUT UNIQUE KEYS						{ $$ = false; }
+			| WITHOUT UNIQUE			%prec UNBOUNDED	{ $$ = false; }
+			| /* EMPTY */ 				%prec UNBOUNDED	{ $$ = false; }
 		;
 
 json_name_and_value_list:
@@ -17057,8 +17042,8 @@ json_name_and_value_list:
 		;
 
 json_name_and_value:
-/* TODO This is not supported due to conflicts
-			KEY c_expr VALUE_P json_value_expr %prec POSTFIXOP
+/* Supporting this syntax seems to require major surgery
+			KEY c_expr VALUE_P json_value_expr
 				{ $$ = makeJsonKeyValue($2, $4); }
 			|
 */
@@ -17069,61 +17054,11 @@ json_name_and_value:
 				{ $$ = makeJsonKeyValue($1, $3); }
 		;
 
+/* empty means false for objects, true for arrays */
 json_object_constructor_null_clause_opt:
 			NULL_P ON NULL_P					{ $$ = false; }
 			| ABSENT ON NULL_P					{ $$ = true; }
 			| /* EMPTY */						{ $$ = false; }
-		;
-
-json_array_constructor:
-			JSON_ARRAY '('
-				json_value_expr_list
-				json_array_constructor_null_clause_opt
-				json_output_clause_opt
-			')'
-				{
-					JsonArrayConstructor *n = makeNode(JsonArrayConstructor);
-
-					n->exprs = $3;
-					n->absent_on_null = $4;
-					n->output = (JsonOutput *) $5;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-			| JSON_ARRAY '('
-				select_no_parens
-				/* json_format_clause_opt */
-				/* json_array_constructor_null_clause_opt */
-				json_output_clause_opt
-			')'
-				{
-					JsonArrayQueryConstructor *n = makeNode(JsonArrayQueryConstructor);
-
-					n->query = $3;
-					n->format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
-					/* n->format = $4; */
-					n->absent_on_null = true /* $5 */;
-					n->output = (JsonOutput *) $4;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-			| JSON_ARRAY '('
-				json_output_clause_opt
-			')'
-				{
-					JsonArrayConstructor *n = makeNode(JsonArrayConstructor);
-
-					n->exprs = NIL;
-					n->absent_on_null = true;
-					n->output = (JsonOutput *) $3;
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-json_value_expr_list:
-			json_value_expr								{ $$ = list_make1($1); }
-			| json_value_expr_list ',' json_value_expr	{ $$ = lappend($1, $3);}
 		;
 
 json_array_constructor_null_clause_opt:
@@ -17132,17 +17067,17 @@ json_array_constructor_null_clause_opt:
 			| /* EMPTY */							{ $$ = true; }
 		;
 
-json_aggregate_func:
-			json_object_aggregate_constructor
-			| json_array_aggregate_constructor
+json_value_expr_list:
+			json_value_expr								{ $$ = list_make1($1); }
+			| json_value_expr_list ',' json_value_expr	{ $$ = lappend($1, $3);}
 		;
 
-json_object_aggregate_constructor:
+json_aggregate_func:
 			JSON_OBJECTAGG '('
 				json_name_and_value
 				json_object_constructor_null_clause_opt
 				json_key_uniqueness_constraint_opt
-				json_output_clause_opt
+				json_returning_clause_opt
 			')'
 				{
 					JsonObjectAgg *n = makeNode(JsonObjectAgg);
@@ -17156,14 +17091,11 @@ json_object_aggregate_constructor:
 					n->constructor->location = @1;
 					$$ = (Node *) n;
 				}
-		;
-
-json_array_aggregate_constructor:
-			JSON_ARRAYAGG '('
+			| JSON_ARRAYAGG '('
 				json_value_expr
 				json_array_aggregate_order_by_clause_opt
 				json_array_constructor_null_clause_opt
-				json_output_clause_opt
+				json_returning_clause_opt
 			')'
 				{
 					JsonArrayAgg *n = makeNode(JsonArrayAgg);
@@ -17754,6 +17686,7 @@ unreserved_keyword:
 			| INCLUDE
 			| INCLUDING
 			| INCREMENT
+			| INDENT
 			| INDEX
 			| INDEXES
 			| INHERIT
@@ -17828,6 +17761,7 @@ unreserved_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
+			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -17852,7 +17786,7 @@ unreserved_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCING
 			| REFRESH
 			| REINDEX
@@ -17895,6 +17829,8 @@ unreserved_keyword:
 			| SIMPLE
 			| SKIP
 			| SNAPSHOT
+			| SOURCE
+			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -17906,7 +17842,7 @@ unreserved_keyword:
 			| STORAGE
 			| STORED
 			| STRICT_P
-			| STRING
+			| STRING_P
 			| STRIP_P
 			| SUBSCRIPTION
 			| SUPPORT
@@ -17914,6 +17850,7 @@ unreserved_keyword:
 			| SYSTEM_P
 			| TABLES
 			| TABLESPACE
+			| TARGET
 			| TEMP
 			| TEMPLATE
 			| TEMPORARY
@@ -17999,6 +17936,7 @@ col_name_keyword:
 			| JSON_TABLE
 			| JSON_VALUE
 			| LEAST
+			| MERGE_ACTION
 			| NATIONAL
 			| NCHAR
 			| NONE
@@ -18139,6 +18077,7 @@ reserved_keyword:
 			| SESSION_USER
 			| SOME
 			| SYMMETRIC
+			| SYSTEM_USER
 			| TABLE
 			| THEN
 			| TO
@@ -18335,6 +18274,7 @@ bare_label_keyword:
 			| INCLUDE
 			| INCLUDING
 			| INCREMENT
+			| INDENT
 			| INDEX
 			| INDEXES
 			| INHERIT
@@ -18394,6 +18334,7 @@ bare_label_keyword:
 			| MATERIALIZED
 			| MAXVALUE
 			| MERGE
+			| MERGE_ACTION
 			| METHOD
 			| MINVALUE
 			| MODE
@@ -18446,6 +18387,7 @@ bare_label_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
+			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -18474,7 +18416,7 @@ bare_label_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCES
 			| REFERENCING
 			| REFRESH
@@ -18525,6 +18467,8 @@ bare_label_keyword:
 			| SMALLINT
 			| SNAPSHOT
 			| SOME
+			| SOURCE
+			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -18536,7 +18480,7 @@ bare_label_keyword:
 			| STORAGE
 			| STORED
 			| STRICT_P
-			| STRING
+			| STRING_P
 			| STRIP_P
 			| SUBSCRIPTION
 			| SUBSTRING
@@ -18544,10 +18488,12 @@ bare_label_keyword:
 			| SYMMETRIC
 			| SYSID
 			| SYSTEM_P
+			| SYSTEM_USER
 			| TABLE
 			| TABLES
 			| TABLESAMPLE
 			| TABLESPACE
+			| TARGET
 			| TEMP
 			| TEMPLATE
 			| TEMPORARY
@@ -18715,18 +18661,6 @@ makeTypeCast(Node *arg, TypeName *typename, int location)
 	n->typeName = typename;
 	n->location = location;
 	return (Node *) n;
-}
-
-static Node *
-makeStringConst(char *str, int location)
-{
-	A_Const	   *n = makeNode(A_Const);
-
-	n->val.sval.type = T_String;
-	n->val.sval.sval = str;
-	n->location = location;
-
-   return (Node *) n;
 }
 
 static Node *
@@ -19009,7 +18943,7 @@ insertSelectOptions(SelectStmt *stmt,
 					 parser_errposition(exprLocation(limitClause->limitCount))));
 		stmt->limitCount = limitClause->limitCount;
 	}
-	if (limitClause && limitClause->limitOption != LIMIT_OPTION_DEFAULT)
+	if (limitClause)
 	{
 		if (stmt->limitOption)
 			ereport(ERROR,
@@ -19451,6 +19385,28 @@ processCASbits(int cas_bits, int location, const char *constrType,
 }
 
 /*
+ * Parse a user-supplied partition strategy string into parse node
+ * PartitionStrategy representation, or die trying.
+ */
+static PartitionStrategy
+parsePartitionStrategy(char *strategy)
+{
+	if (pg_strcasecmp(strategy, "list") == 0)
+		return PARTITION_STRATEGY_LIST;
+	else if (pg_strcasecmp(strategy, "range") == 0)
+		return PARTITION_STRATEGY_RANGE;
+	else if (pg_strcasecmp(strategy, "hash") == 0)
+		return PARTITION_STRATEGY_HASH;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unrecognized partitioning strategy \"%s\"",
+					strategy)));
+	return PARTITION_STRATEGY_LIST;		/* keep compiler quiet */
+
+}
+
+/*
  * Process pubobjspec_list to check for errors in any of the objects and
  * convert PUBLICATIONOBJ_CONTINUATION into appropriate PublicationObjSpecType.
  */
@@ -19469,7 +19425,7 @@ preprocess_pubobj_list(List *pubobjspec_list, core_yyscan_t yyscanner)
 		ereport(ERROR,
 				errcode(ERRCODE_SYNTAX_ERROR),
 				errmsg("invalid publication object list"),
-				errdetail("One of TABLE or ALL TABLES IN SCHEMA must be specified before a standalone table or schema name."),
+				errdetail("One of TABLE or TABLES IN SCHEMA must be specified before a standalone table or schema name."),
 				parser_errposition(pubobj->location));
 
 	foreach(cell, pubobjspec_list)
@@ -19485,7 +19441,7 @@ preprocess_pubobj_list(List *pubobjspec_list, core_yyscan_t yyscanner)
 			if (!pubobj->name && !pubobj->pubtable)
 				ereport(ERROR,
 						errcode(ERRCODE_SYNTAX_ERROR),
-						errmsg("invalid table name at or near"),
+						errmsg("invalid table name"),
 						parser_errposition(pubobj->location));
 
 			if (pubobj->name)
@@ -19527,7 +19483,7 @@ preprocess_pubobj_list(List *pubobjspec_list, core_yyscan_t yyscanner)
 			else
 				ereport(ERROR,
 						errcode(ERRCODE_SYNTAX_ERROR),
-						errmsg("invalid schema name at or near"),
+						errmsg("invalid schema name"),
 						parser_errposition(pubobj->location));
 		}
 

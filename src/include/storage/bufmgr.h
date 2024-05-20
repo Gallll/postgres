@@ -4,7 +4,7 @@
  *	  POSTGRES buffer manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufmgr.h
@@ -14,6 +14,7 @@
 #ifndef BUFMGR_H
 #define BUFMGR_H
 
+#include "port/pg_iovec.h"
 #include "storage/block.h"
 #include "storage/buf.h"
 #include "storage/bufpage.h"
@@ -23,14 +24,19 @@
 
 typedef void *Block;
 
-/* Possible arguments for GetAccessStrategy() */
+/*
+ * Possible arguments for GetAccessStrategy().
+ *
+ * If adding a new BufferAccessStrategyType, also add a new IOContext so
+ * IO statistics using this strategy are tracked.
+ */
 typedef enum BufferAccessStrategyType
 {
 	BAS_NORMAL,					/* Normal random access */
 	BAS_BULKREAD,				/* Large read-only scan (hint bit updates are
 								 * ok) */
 	BAS_BULKWRITE,				/* Large multi-block write (e.g. COPY IN) */
-	BAS_VACUUM					/* VACUUM */
+	BAS_VACUUM,					/* VACUUM */
 } BufferAccessStrategyType;
 
 /* Possible modes for ReadBufferExtended() */
@@ -42,7 +48,7 @@ typedef enum
 	RBM_ZERO_AND_CLEANUP_LOCK,	/* Like RBM_ZERO_AND_LOCK, but locks the page
 								 * in "cleanup" mode */
 	RBM_ZERO_ON_ERROR,			/* Read, but return an all-zeros page on error */
-	RBM_NORMAL_NO_LOG			/* Don't log page as invalid during WAL
+	RBM_NORMAL_NO_LOG,			/* Don't log page as invalid during WAL
 								 * replay; otherwise same as RBM_NORMAL */
 } ReadBufferMode;
 
@@ -54,6 +60,84 @@ typedef struct PrefetchBufferResult
 	Buffer		recent_buffer;	/* If valid, a hit (recheck needed!) */
 	bool		initiated_io;	/* If true, a miss resulting in async I/O */
 } PrefetchBufferResult;
+
+/*
+ * Flags influencing the behaviour of ExtendBufferedRel*
+ */
+typedef enum ExtendBufferedFlags
+{
+	/*
+	 * Don't acquire extension lock. This is safe only if the relation isn't
+	 * shared, an access exclusive lock is held or if this is the startup
+	 * process.
+	 */
+	EB_SKIP_EXTENSION_LOCK = (1 << 0),
+
+	/* Is this extension part of recovery? */
+	EB_PERFORMING_RECOVERY = (1 << 1),
+
+	/*
+	 * Should the fork be created if it does not currently exist? This likely
+	 * only ever makes sense for relation forks.
+	 */
+	EB_CREATE_FORK_IF_NEEDED = (1 << 2),
+
+	/* Should the first (possibly only) return buffer be returned locked? */
+	EB_LOCK_FIRST = (1 << 3),
+
+	/* Should the smgr size cache be cleared? */
+	EB_CLEAR_SIZE_CACHE = (1 << 4),
+
+	/* internal flags follow */
+	EB_LOCK_TARGET = (1 << 5),
+}			ExtendBufferedFlags;
+
+/*
+ * Some functions identify relations either by relation or smgr +
+ * relpersistence.  Used via the BMR_REL()/BMR_SMGR() macros below.  This
+ * allows us to use the same function for both recovery and normal operation.
+ */
+typedef struct BufferManagerRelation
+{
+	Relation	rel;
+	struct SMgrRelationData *smgr;
+	char		relpersistence;
+} BufferManagerRelation;
+
+#define BMR_REL(p_rel) ((BufferManagerRelation){.rel = p_rel})
+#define BMR_SMGR(p_smgr, p_relpersistence) ((BufferManagerRelation){.smgr = p_smgr, .relpersistence = p_relpersistence})
+
+/* Zero out page if reading fails. */
+#define READ_BUFFERS_ZERO_ON_ERROR (1 << 0)
+/* Call smgrprefetch() if I/O necessary. */
+#define READ_BUFFERS_ISSUE_ADVICE (1 << 1)
+
+struct ReadBuffersOperation
+{
+	/*
+	 * The following members should be set by the caller.  If only smgr is
+	 * provided without rel, then smgr_persistence can be set to override the
+	 * default assumption of RELPERSISTENCE_PERMANENT.
+	 */
+	Relation	rel;
+	struct SMgrRelationData *smgr;
+	char		smgr_persistence;
+	ForkNumber	forknum;
+	BufferAccessStrategy strategy;
+
+	/*
+	 * The following private members are private state for communication
+	 * between StartReadBuffers() and WaitReadBuffers(), initialized only if
+	 * an actual read is required, and should not be modified.
+	 */
+	Buffer	   *buffers;
+	BlockNumber blocknum;
+	int			flags;
+	int16		nblocks;
+	int16		io_buffers_len;
+};
+
+typedef struct ReadBuffersOperation ReadBuffersOperation;
 
 /* forward declared, to avoid having to expose buf_internals.h here */
 struct WritebackContext;
@@ -69,8 +153,21 @@ extern PGDLLIMPORT bool zero_damaged_pages;
 extern PGDLLIMPORT int bgwriter_lru_maxpages;
 extern PGDLLIMPORT double bgwriter_lru_multiplier;
 extern PGDLLIMPORT bool track_io_timing;
+
+/* only applicable when prefetching is available */
+#ifdef USE_PREFETCH
+#define DEFAULT_EFFECTIVE_IO_CONCURRENCY 1
+#define DEFAULT_MAINTENANCE_IO_CONCURRENCY 10
+#else
+#define DEFAULT_EFFECTIVE_IO_CONCURRENCY 0
+#define DEFAULT_MAINTENANCE_IO_CONCURRENCY 0
+#endif
 extern PGDLLIMPORT int effective_io_concurrency;
 extern PGDLLIMPORT int maintenance_io_concurrency;
+
+#define MAX_IO_COMBINE_LIMIT PG_IOV_MAX
+#define DEFAULT_IO_COMBINE_LIMIT Min(MAX_IO_COMBINE_LIMIT, (128 * 1024) / BLCKSZ)
+extern PGDLLIMPORT int io_combine_limit;
 
 extern PGDLLIMPORT int checkpoint_flush_after;
 extern PGDLLIMPORT int backend_flush_after;
@@ -116,17 +213,49 @@ extern Buffer ReadBufferWithoutRelcache(RelFileLocator rlocator,
 										ForkNumber forkNum, BlockNumber blockNum,
 										ReadBufferMode mode, BufferAccessStrategy strategy,
 										bool permanent);
+
+extern bool StartReadBuffer(ReadBuffersOperation *operation,
+							Buffer *buffer,
+							BlockNumber blocknum,
+							int flags);
+extern bool StartReadBuffers(ReadBuffersOperation *operation,
+							 Buffer *buffers,
+							 BlockNumber blocknum,
+							 int *nblocks,
+							 int flags);
+extern void WaitReadBuffers(ReadBuffersOperation *operation);
+
 extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
+extern bool BufferIsExclusiveLocked(Buffer buffer);
+extern bool BufferIsDirty(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
+extern void CheckBufferIsPinnedOnce(Buffer buffer);
 extern Buffer ReleaseAndReadBuffer(Buffer buffer, Relation relation,
 								   BlockNumber blockNum);
 
-extern void InitBufferPool(void);
+extern Buffer ExtendBufferedRel(BufferManagerRelation bmr,
+								ForkNumber forkNum,
+								BufferAccessStrategy strategy,
+								uint32 flags);
+extern BlockNumber ExtendBufferedRelBy(BufferManagerRelation bmr,
+									   ForkNumber fork,
+									   BufferAccessStrategy strategy,
+									   uint32 flags,
+									   uint32 extend_by,
+									   Buffer *buffers,
+									   uint32 *extended_by);
+extern Buffer ExtendBufferedRelTo(BufferManagerRelation bmr,
+								  ForkNumber fork,
+								  BufferAccessStrategy strategy,
+								  uint32 flags,
+								  BlockNumber extend_to,
+								  ReadBufferMode mode);
+
 extern void InitBufferPoolAccess(void);
 extern void AtEOXact_Buffers(bool isCommit);
-extern void PrintBufferLeakWarning(Buffer buffer);
+extern char *DebugPrintBufferRefcount(Buffer buffer);
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);
 extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
@@ -154,7 +283,6 @@ extern XLogRecPtr BufferGetLSNAtomic(Buffer buffer);
 #ifdef NOT_USED
 extern void PrintPinnedBufs(void);
 #endif
-extern Size BufferShmemSize(void);
 extern void BufferGetTag(Buffer buffer, RelFileLocator *rlocator,
 						 ForkNumber *forknum, BlockNumber *blknum);
 
@@ -168,17 +296,28 @@ extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);
 extern bool HoldingBufferPinThatDelaysRecovery(void);
 
-extern void AbortBufferIO(void);
-
-extern void BufmgrCommit(void);
 extern bool BgBufferSync(struct WritebackContext *wb_context);
 
+extern void LimitAdditionalPins(uint32 *additional_pins);
+extern void LimitAdditionalLocalPins(uint32 *additional_pins);
+
+extern bool EvictUnpinnedBuffer(Buffer buf);
+
+/* in buf_init.c */
+extern void InitBufferPool(void);
+extern Size BufferShmemSize(void);
+
+/* in localbuf.c */
 extern void AtProcExit_LocalBuffers(void);
 
-extern void TestForOldSnapshot_impl(Snapshot snapshot, Relation relation);
-
 /* in freelist.c */
+
 extern BufferAccessStrategy GetAccessStrategy(BufferAccessStrategyType btype);
+extern BufferAccessStrategy GetAccessStrategyWithSize(BufferAccessStrategyType btype,
+													  int ring_size_kb);
+extern int	GetAccessStrategyBufferCount(BufferAccessStrategy strategy);
+extern int	GetAccessStrategyPinLimit(BufferAccessStrategy strategy);
+
 extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 
 
@@ -260,45 +399,11 @@ BufferGetPageSize(Buffer buffer)
 /*
  * BufferGetPage
  *		Returns the page associated with a buffer.
- *
- * When this is called as part of a scan, there may be a need for a nearby
- * call to TestForOldSnapshot().  See the definition of that for details.
  */
 static inline Page
 BufferGetPage(Buffer buffer)
 {
 	return (Page) BufferGetBlock(buffer);
-}
-
-/*
- * Check whether the given snapshot is too old to have safely read the given
- * page from the given table.  If so, throw a "snapshot too old" error.
- *
- * This test generally needs to be performed after every BufferGetPage() call
- * that is executed as part of a scan.  It is not needed for calls made for
- * modifying the page (for example, to position to the right place to insert a
- * new index tuple or for vacuuming).  It may also be omitted where calls to
- * lower-level functions will have already performed the test.
- *
- * Note that a NULL snapshot argument is allowed and causes a fast return
- * without error; this is to support call sites which can be called from
- * either scans or index modification areas.
- *
- * For best performance, keep the tests that are fastest and/or most likely to
- * exclude a page from old snapshot testing near the front.
- */
-static inline void
-TestForOldSnapshot(Snapshot snapshot, Relation relation, Page page)
-{
-	Assert(relation != NULL);
-
-	if (old_snapshot_threshold >= 0
-		&& (snapshot) != NULL
-		&& ((snapshot)->snapshot_type == SNAPSHOT_MVCC
-			|| (snapshot)->snapshot_type == SNAPSHOT_TOAST)
-		&& !XLogRecPtrIsInvalid((snapshot)->lsn)
-		&& PageGetLSN(page) > (snapshot)->lsn)
-		TestForOldSnapshot_impl(snapshot, relation);
 }
 
 #endif							/* FRONTEND */

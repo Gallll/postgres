@@ -47,7 +47,7 @@
  * and 'attribute_buf' are expanded on demand, to hold the longest line
  * encountered so far.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,10 +70,10 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "utils/builtins.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
@@ -174,7 +174,7 @@ ReceiveCopyBegin(CopyFromState cstate)
 	int16		format = (cstate->opts.binary ? 1 : 0);
 	int			i;
 
-	pq_beginmessage(&buf, 'G');
+	pq_beginmessage(&buf, PqMsg_CopyInResponse);
 	pq_sendbyte(&buf, format);	/* overall format */
 	pq_sendint16(&buf, natts);
 	for (i = 0; i < natts; i++)
@@ -279,13 +279,13 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 					/* Validate message type and set packet size limit */
 					switch (mtype)
 					{
-						case 'd':	/* CopyData */
+						case PqMsg_CopyData:
 							maxmsglen = PQ_LARGE_MESSAGE_LIMIT;
 							break;
-						case 'c':	/* CopyDone */
-						case 'f':	/* CopyFail */
-						case 'H':	/* Flush */
-						case 'S':	/* Sync */
+						case PqMsg_CopyDone:
+						case PqMsg_CopyFail:
+						case PqMsg_Flush:
+						case PqMsg_Sync:
 							maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
 							break;
 						default:
@@ -305,20 +305,20 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 					/* ... and process it */
 					switch (mtype)
 					{
-						case 'd':	/* CopyData */
+						case PqMsg_CopyData:
 							break;
-						case 'c':	/* CopyDone */
+						case PqMsg_CopyDone:
 							/* COPY IN correctly terminated by frontend */
 							cstate->raw_reached_eof = true;
 							return bytesread;
-						case 'f':	/* CopyFail */
+						case PqMsg_CopyFail:
 							ereport(ERROR,
 									(errcode(ERRCODE_QUERY_CANCELED),
 									 errmsg("COPY from stdin failed: %s",
 											pq_getmsgstring(cstate->fe_msgbuf))));
 							break;
-						case 'H':	/* Flush */
-						case 'S':	/* Sync */
+						case PqMsg_Flush:
+						case PqMsg_Sync:
 
 							/*
 							 * Ignore Flush/Sync for the convenience of client
@@ -782,7 +782,7 @@ NextCopyFromRawFields(CopyFromState cstate, char ***fields, int *nfields)
 			if (fldct != list_length(cstate->attnumlist))
 				ereport(ERROR,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("wrong number of fields in header line: field count is %d, expected %d",
+						 errmsg("wrong number of fields in header line: got %d, expected %d",
 								fldct, list_length(cstate->attnumlist))));
 
 			fldnum = 0;
@@ -842,9 +842,10 @@ NextCopyFromRawFields(CopyFromState cstate, char ***fields, int *nfields)
 /*
  * Read next tuple from file for COPY FROM. Return false if no more tuples.
  *
- * 'econtext' is used to evaluate default expression for each columns not
- * read from the file. It can be NULL when no default values are used, i.e.
- * when all columns are read from the file.
+ * 'econtext' is used to evaluate default expression for each column that is
+ * either not read from the file or is using the DEFAULT option of COPY FROM.
+ * It can be NULL when no default values are used, i.e. when all columns are
+ * read from the file, and DEFAULT option is unset.
  *
  * 'values' and 'nulls' arrays must be the same length as columns of the
  * relation passed to BeginCopyFrom. This function fills the arrays.
@@ -870,6 +871,7 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 	/* Initialize all values for row to NULL */
 	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
 	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+	MemSet(cstate->defaults, false, num_phys_attrs * sizeof(bool));
 
 	if (!cstate->opts.binary)
 	{
@@ -938,12 +940,72 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 
 			cstate->cur_attname = NameStr(att->attname);
 			cstate->cur_attval = string;
-			values[m] = InputFunctionCall(&in_functions[m],
-										  string,
-										  typioparams[m],
-										  att->atttypmod);
+
 			if (string != NULL)
 				nulls[m] = false;
+
+			if (cstate->defaults[m])
+			{
+				/*
+				 * The caller must supply econtext and have switched into the
+				 * per-tuple memory context in it.
+				 */
+				Assert(econtext != NULL);
+				Assert(CurrentMemoryContext == econtext->ecxt_per_tuple_memory);
+
+				values[m] = ExecEvalExpr(defexprs[m], econtext, &nulls[m]);
+			}
+
+			/*
+			 * If ON_ERROR is specified with IGNORE, skip rows with soft
+			 * errors
+			 */
+			else if (!InputFunctionCallSafe(&in_functions[m],
+											string,
+											typioparams[m],
+											att->atttypmod,
+											(Node *) cstate->escontext,
+											&values[m]))
+			{
+				Assert(cstate->opts.on_error != COPY_ON_ERROR_STOP);
+
+				cstate->num_errors++;
+
+				if (cstate->opts.log_verbosity == COPY_LOG_VERBOSITY_VERBOSE)
+				{
+					/*
+					 * Since we emit line number and column info in the below
+					 * notice message, we suppress error context information
+					 * other than the relation name.
+					 */
+					Assert(!cstate->relname_only);
+					cstate->relname_only = true;
+
+					if (cstate->cur_attval)
+					{
+						char	   *attval;
+
+						attval = CopyLimitPrintoutLength(cstate->cur_attval);
+						ereport(NOTICE,
+								errmsg("skipping row due to data type incompatibility at line %llu for column %s: \"%s\"",
+									   (unsigned long long) cstate->cur_lineno,
+									   cstate->cur_attname,
+									   attval));
+						pfree(attval);
+					}
+					else
+						ereport(NOTICE,
+								errmsg("skipping row due to data type incompatibility at line %llu for column %s: null input",
+									   (unsigned long long) cstate->cur_lineno,
+									   cstate->cur_attname));
+
+					/* reset relname_only */
+					cstate->relname_only = false;
+				}
+
+				return true;
+			}
+
 			cstate->cur_attname = NULL;
 			cstate->cur_attval = NULL;
 		}
@@ -1019,7 +1081,7 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 		Assert(econtext != NULL);
 		Assert(CurrentMemoryContext == econtext->ecxt_per_tuple_memory);
 
-		values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
+		values[defmap[i]] = ExecEvalExpr(defexprs[defmap[i]], econtext,
 										 &nulls[defmap[i]]);
 	}
 
@@ -1143,9 +1205,6 @@ CopyReadLineText(CopyFromState cstate)
 	 * In CSV mode, \r and \n inside a quoted field are just part of the data
 	 * value and are put in line_buf.  We keep just enough state to know if we
 	 * are currently in a quoted field or not.
-	 *
-	 * These four characters, and the CSV escape and quote characters, are
-	 * assumed the same in frontend and backend encodings.
 	 *
 	 * The input has already been converted to the database encoding.  All
 	 * supported server encodings have the property that all bytes in a
@@ -1663,6 +1722,32 @@ CopyReadAttributesText(CopyFromState cstate)
 		if (input_len == cstate->opts.null_print_len &&
 			strncmp(start_ptr, cstate->opts.null_print, input_len) == 0)
 			cstate->raw_fields[fieldno] = NULL;
+		/* Check whether raw input matched default marker */
+		else if (fieldno < list_length(cstate->attnumlist) &&
+				 cstate->opts.default_print &&
+				 input_len == cstate->opts.default_print_len &&
+				 strncmp(start_ptr, cstate->opts.default_print, input_len) == 0)
+		{
+			/* fieldno is 0-indexed and attnum is 1-indexed */
+			int			m = list_nth_int(cstate->attnumlist, fieldno) - 1;
+
+			if (cstate->defexprs[m] != NULL)
+			{
+				/* defaults contain entries for all physical attributes */
+				cstate->defaults[m] = true;
+			}
+			else
+			{
+				TupleDesc	tupDesc = RelationGetDescr(cstate->rel);
+				Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+
+				ereport(ERROR,
+						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+						 errmsg("unexpected default marker in COPY data"),
+						 errdetail("Column \"%s\" has no default value.",
+								   NameStr(att->attname))));
+			}
+		}
 		else
 		{
 			/*
@@ -1852,6 +1937,32 @@ endfield:
 		if (!saw_quote && input_len == cstate->opts.null_print_len &&
 			strncmp(start_ptr, cstate->opts.null_print, input_len) == 0)
 			cstate->raw_fields[fieldno] = NULL;
+		/* Check whether raw input matched default marker */
+		else if (fieldno < list_length(cstate->attnumlist) &&
+				 cstate->opts.default_print &&
+				 input_len == cstate->opts.default_print_len &&
+				 strncmp(start_ptr, cstate->opts.default_print, input_len) == 0)
+		{
+			/* fieldno is 0-index and attnum is 1-index */
+			int			m = list_nth_int(cstate->attnumlist, fieldno) - 1;
+
+			if (cstate->defexprs[m] != NULL)
+			{
+				/* defaults contain entries for all physical attributes */
+				cstate->defaults[m] = true;
+			}
+			else
+			{
+				TupleDesc	tupDesc = RelationGetDescr(cstate->rel);
+				Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+
+				ereport(ERROR,
+						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+						 errmsg("unexpected default marker in COPY data"),
+						 errdetail("Column \"%s\" has no default value.",
+								   NameStr(att->attname))));
+			}
+		}
 
 		fieldno++;
 		/* Done if we hit EOL instead of a delim */

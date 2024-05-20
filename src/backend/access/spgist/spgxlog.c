@@ -4,7 +4,7 @@
  *	  WAL replay logic for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,8 +17,6 @@
 #include "access/bufmask.h"
 #include "access/spgist_private.h"
 #include "access/spgxlog.h"
-#include "access/transam.h"
-#include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "storage/standby.h"
 #include "utils/memutils.h"
@@ -875,14 +873,12 @@ spgRedoVacuumRedirect(XLogReaderState *record)
 	 */
 	if (InHotStandby)
 	{
-		if (TransactionIdIsValid(xldata->newestRedirectXid))
-		{
-			RelFileLocator locator;
+		RelFileLocator locator;
 
-			XLogRecGetBlockTag(record, 0, &locator, NULL, NULL);
-			ResolveRecoveryConflictWithSnapshot(xldata->newestRedirectXid,
-												locator);
-		}
+		XLogRecGetBlockTag(record, 0, &locator, NULL, NULL);
+		ResolveRecoveryConflictWithSnapshot(xldata->snapshotConflictHorizon,
+											xldata->isCatalogRel,
+											locator);
 	}
 
 	if (XLogReadBufferForRedo(record, 0, &buffer) == BLK_NEEDS_REDO)

@@ -1,9 +1,12 @@
 
-# Copyright (c) 2021-2022, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Test streaming of large transaction with DDL and subtransactions
+#
+# This file is mainly to test the DDL/DML interaction of the publisher side,
+# so we didn't add a parallel apply version for the tests in this file.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -17,7 +20,7 @@ $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -28,7 +31,7 @@ $node_publisher->safe_psql('postgres',
 
 # Setup structure on subscriber
 $node_subscriber->safe_psql('postgres',
-	"CREATE TABLE test_tab (a int primary key, b text, c INT, d INT, e INT, f INT)"
+	"CREATE TABLE test_tab (a int primary key, b bytea, c INT, d INT, e INT, f INT)"
 );
 
 # Setup logical replication
@@ -41,13 +44,8 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (streaming = on)"
 );
 
-$node_publisher->wait_for_catchup($appname);
-
-# Also wait for initial table sync to finish
-my $synced_query =
-  "SELECT count(1) = 0 FROM pg_subscription_rel WHERE srsubstate NOT IN ('r', 's');";
-$node_subscriber->poll_query_until('postgres', $synced_query)
-  or die "Timed out while waiting for subscriber to synchronize data";
+# Wait for initial table sync to finish
+$node_subscriber->wait_for_subscription_sync($node_publisher, $appname);
 
 my $result =
   $node_subscriber->safe_psql('postgres',
@@ -58,10 +56,10 @@ is($result, qq(2|0|0), 'check initial data was copied to subscriber');
 $node_publisher->safe_psql(
 	'postgres', q{
 BEGIN;
-INSERT INTO test_tab VALUES (3, md5(3::text));
+INSERT INTO test_tab VALUES (3, sha256(3::text::bytea));
 ALTER TABLE test_tab ADD COLUMN c INT;
 SAVEPOINT s1;
-INSERT INTO test_tab VALUES (4, md5(4::text), -4);
+INSERT INTO test_tab VALUES (4, sha256(4::text::bytea), -4);
 COMMIT;
 });
 
@@ -69,10 +67,10 @@ COMMIT;
 $node_publisher->safe_psql(
 	'postgres', q{
 BEGIN;
-INSERT INTO test_tab SELECT i, md5(i::text), -i FROM generate_series(5, 1000) s(i);
+INSERT INTO test_tab SELECT i, sha256(i::text::bytea), -i FROM generate_series(5, 1000) s(i);
 ALTER TABLE test_tab ADD COLUMN d INT;
 SAVEPOINT s1;
-INSERT INTO test_tab SELECT i, md5(i::text), -i, 2*i FROM generate_series(1001, 2000) s(i);
+INSERT INTO test_tab SELECT i, sha256(i::text::bytea), -i, 2*i FROM generate_series(1001, 2000) s(i);
 COMMIT;
 });
 
@@ -80,10 +78,10 @@ COMMIT;
 $node_publisher->safe_psql(
 	'postgres', q{
 BEGIN;
-INSERT INTO test_tab VALUES (2001, md5(2001::text), -2001, 2*2001);
+INSERT INTO test_tab VALUES (2001, sha256(2001::text::bytea), -2001, 2*2001);
 ALTER TABLE test_tab ADD COLUMN e INT;
 SAVEPOINT s1;
-INSERT INTO test_tab VALUES (2002, md5(2002::text), -2002, 2*2002, -3*2002);
+INSERT INTO test_tab VALUES (2002, sha256(2002::text::bytea), -2002, 2*2002, -3*2002);
 COMMIT;
 });
 
@@ -102,7 +100,7 @@ is($result, qq(2002|1999|1002|1),
 $node_publisher->safe_psql(
 	'postgres', q{
 BEGIN;
-INSERT INTO test_tab SELECT i, md5(i::text), -i, 2*i, -3*i FROM generate_series(2003,5000) s(i);
+INSERT INTO test_tab SELECT i, sha256(i::text::bytea), -i, 2*i, -3*i FROM generate_series(2003,5000) s(i);
 ALTER TABLE test_tab ADD COLUMN f INT;
 COMMIT;
 });
@@ -112,7 +110,7 @@ COMMIT;
 $node_publisher->safe_psql(
 	'postgres', q{
 BEGIN;
-INSERT INTO test_tab SELECT i, md5(i::text), -i, 2*i, -3*i, 4*i FROM generate_series(5001,5005) s(i);
+INSERT INTO test_tab SELECT i, sha256(i::text::bytea), -i, 2*i, -3*i, 4*i FROM generate_series(5001,5005) s(i);
 COMMIT;
 });
 

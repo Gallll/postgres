@@ -4,7 +4,7 @@
  *	  OpenSSL support
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,20 +38,16 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
-#endif
 #include <arpa/inet.h>
 #endif
 
 #include <sys/stat.h>
 
-#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
-#endif
 #endif
 
 /*
@@ -70,14 +66,14 @@
 
 static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static int	openssl_verify_peer_name_matches_certificate_name(PGconn *conn,
-															  ASN1_STRING *name,
+															  ASN1_STRING *name_entry,
 															  char **store_name);
 static int	openssl_verify_peer_name_matches_certificate_ip(PGconn *conn,
 															ASN1_OCTET_STRING *addr_entry,
 															char **store_name);
 static void destroy_ssl_system(void);
 static int	initialize_SSL(PGconn *conn);
-static PostgresPollingStatusType open_client_SSL(PGconn *);
+static PostgresPollingStatusType open_client_SSL(PGconn *conn);
 static char *SSLerrmessage(unsigned long ecode);
 static void SSLerrfree(char *buf);
 static int	PQssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
@@ -93,16 +89,9 @@ static bool pq_init_crypto_lib = true;
 
 static bool ssl_lib_initialized = false;
 
-#ifdef ENABLE_THREAD_SAFETY
 static long crypto_open_connections = 0;
 
-#ifndef WIN32
 static pthread_mutex_t ssl_config_mutex = PTHREAD_MUTEX_INITIALIZER;
-#else
-static pthread_mutex_t ssl_config_mutex = NULL;
-static long win32_ssl_create_mutex = 0;
-#endif
-#endif							/* ENABLE_THREAD_SAFETY */
 
 static PQsslKeyPassHook_OpenSSL_type PQsslKeyPassHook = NULL;
 static int	ssl_protocol_version_to_openssl(const char *protocol);
@@ -114,15 +103,12 @@ static int	ssl_protocol_version_to_openssl(const char *protocol);
 void
 pgtls_init_library(bool do_ssl, int do_crypto)
 {
-#ifdef ENABLE_THREAD_SAFETY
-
 	/*
 	 * Disallow changing the flags while we have open connections, else we'd
 	 * get completely confused.
 	 */
 	if (crypto_open_connections != 0)
 		return;
-#endif
 
 	pq_init_ssl_lib = do_ssl;
 	pq_init_crypto_lib = do_crypto;
@@ -209,25 +195,22 @@ rloop:
 			 */
 			goto rloop;
 		case SSL_ERROR_SYSCALL:
-			if (n < 0)
+			if (n < 0 && SOCK_ERRNO != 0)
 			{
 				result_errno = SOCK_ERRNO;
 				if (result_errno == EPIPE ||
 					result_errno == ECONNRESET)
-					appendPQExpBufferStr(&conn->errorMessage,
-										 libpq_gettext("server closed the connection unexpectedly\n"
-													   "\tThis probably means the server terminated abnormally\n"
-													   "\tbefore or while processing the request.\n"));
+					libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
+											"\tThis probably means the server terminated abnormally\n"
+											"\tbefore or while processing the request.");
 				else
-					appendPQExpBuffer(&conn->errorMessage,
-									  libpq_gettext("SSL SYSCALL error: %s\n"),
-									  SOCK_STRERROR(result_errno,
-													sebuf, sizeof(sebuf)));
+					libpq_append_conn_error(conn, "SSL SYSCALL error: %s",
+											SOCK_STRERROR(result_errno,
+														  sebuf, sizeof(sebuf)));
 			}
 			else
 			{
-				appendPQExpBufferStr(&conn->errorMessage,
-									 libpq_gettext("SSL SYSCALL error: EOF detected\n"));
+				libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 				/* assume the connection is broken */
 				result_errno = ECONNRESET;
 				n = -1;
@@ -237,8 +220,7 @@ rloop:
 			{
 				char	   *errm = SSLerrmessage(ecode);
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("SSL error: %s\n"), errm);
+				libpq_append_conn_error(conn, "SSL error: %s", errm);
 				SSLerrfree(errm);
 				/* assume the connection is broken */
 				result_errno = ECONNRESET;
@@ -252,15 +234,12 @@ rloop:
 			 * a clean connection closure, so we should not report it as a
 			 * server crash.
 			 */
-			appendPQExpBufferStr(&conn->errorMessage,
-								 libpq_gettext("SSL connection has been closed unexpectedly\n"));
+			libpq_append_conn_error(conn, "SSL connection has been closed unexpectedly");
 			result_errno = ECONNRESET;
 			n = -1;
 			break;
 		default:
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("unrecognized SSL error code: %d\n"),
-							  err);
+			libpq_append_conn_error(conn, "unrecognized SSL error code: %d", err);
 			/* assume the connection is broken */
 			result_errno = ECONNRESET;
 			n = -1;
@@ -317,24 +296,27 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			n = 0;
 			break;
 		case SSL_ERROR_SYSCALL:
-			if (n < 0)
+
+			/*
+			 * If errno is still zero then assume it's a read EOF situation,
+			 * and report EOF.  (This seems possible because SSL_write can
+			 * also do reads.)
+			 */
+			if (n < 0 && SOCK_ERRNO != 0)
 			{
 				result_errno = SOCK_ERRNO;
 				if (result_errno == EPIPE || result_errno == ECONNRESET)
-					appendPQExpBufferStr(&conn->errorMessage,
-										 libpq_gettext("server closed the connection unexpectedly\n"
-													   "\tThis probably means the server terminated abnormally\n"
-													   "\tbefore or while processing the request.\n"));
+					libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
+											"\tThis probably means the server terminated abnormally\n"
+											"\tbefore or while processing the request.");
 				else
-					appendPQExpBuffer(&conn->errorMessage,
-									  libpq_gettext("SSL SYSCALL error: %s\n"),
-									  SOCK_STRERROR(result_errno,
-													sebuf, sizeof(sebuf)));
+					libpq_append_conn_error(conn, "SSL SYSCALL error: %s",
+											SOCK_STRERROR(result_errno,
+														  sebuf, sizeof(sebuf)));
 			}
 			else
 			{
-				appendPQExpBufferStr(&conn->errorMessage,
-									 libpq_gettext("SSL SYSCALL error: EOF detected\n"));
+				libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 				/* assume the connection is broken */
 				result_errno = ECONNRESET;
 				n = -1;
@@ -344,8 +326,7 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			{
 				char	   *errm = SSLerrmessage(ecode);
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("SSL error: %s\n"), errm);
+				libpq_append_conn_error(conn, "SSL error: %s", errm);
 				SSLerrfree(errm);
 				/* assume the connection is broken */
 				result_errno = ECONNRESET;
@@ -359,15 +340,12 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			 * a clean connection closure, so we should not report it as a
 			 * server crash.
 			 */
-			appendPQExpBufferStr(&conn->errorMessage,
-								 libpq_gettext("SSL connection has been closed unexpectedly\n"));
+			libpq_append_conn_error(conn, "SSL connection has been closed unexpectedly");
 			result_errno = ECONNRESET;
 			n = -1;
 			break;
 		default:
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("unrecognized SSL error code: %d\n"),
-							  err);
+			libpq_append_conn_error(conn, "unrecognized SSL error code: %d", err);
 			/* assume the connection is broken */
 			result_errno = ECONNRESET;
 			n = -1;
@@ -380,7 +358,6 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 	return n;
 }
 
-#ifdef HAVE_X509_GET_SIGNATURE_NID
 char *
 pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 {
@@ -400,13 +377,17 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 
 	/*
 	 * Get the signature algorithm of the certificate to determine the hash
-	 * algorithm to use for the result.
+	 * algorithm to use for the result.  Prefer X509_get_signature_info(),
+	 * introduced in OpenSSL 1.1.1, which can handle RSA-PSS signatures.
 	 */
+#if HAVE_X509_GET_SIGNATURE_INFO
+	if (!X509_get_signature_info(peer_cert, &algo_nid, NULL, NULL, NULL))
+#else
 	if (!OBJ_find_sigid_algs(X509_get_signature_nid(peer_cert),
 							 &algo_nid, NULL))
+#endif
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("could not determine server certificate signature algorithm\n"));
+		libpq_append_conn_error(conn, "could not determine server certificate signature algorithm");
 		return NULL;
 	}
 
@@ -426,9 +407,8 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 			algo_type = EVP_get_digestbynid(algo_nid);
 			if (algo_type == NULL)
 			{
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not find digest for NID %s\n"),
-								  OBJ_nid2sn(algo_nid));
+				libpq_append_conn_error(conn, "could not find digest for NID %s",
+										OBJ_nid2sn(algo_nid));
 				return NULL;
 			}
 			break;
@@ -436,8 +416,7 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 
 	if (!X509_digest(peer_cert, algo_type, hash, &hash_size))
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("could not generate peer certificate hash\n"));
+		libpq_append_conn_error(conn, "could not generate peer certificate hash");
 		return NULL;
 	}
 
@@ -445,8 +424,7 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 	cert_hash = malloc(hash_size);
 	if (cert_hash == NULL)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("out of memory\n"));
+		libpq_append_conn_error(conn, "out of memory");
 		return NULL;
 	}
 	memcpy(cert_hash, hash, hash_size);
@@ -454,7 +432,6 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 
 	return cert_hash;
 }
-#endif							/* HAVE_X509_GET_SIGNATURE_NID */
 
 /* ------------------------------------------------------------ */
 /*						OpenSSL specific code					*/
@@ -477,6 +454,34 @@ verify_cb(int ok, X509_STORE_CTX *ctx)
 	return ok;
 }
 
+#ifdef HAVE_SSL_CTX_SET_CERT_CB
+/*
+ * Certificate selection callback
+ *
+ * This callback lets us choose the client certificate we send to the server
+ * after seeing its CertificateRequest.  We only support sending a single
+ * hard-coded certificate via sslcert, so we don't actually set any certificates
+ * here; we just use it to record whether or not the server has actually asked
+ * for one and whether we have one to send.
+ */
+static int
+cert_cb(SSL *ssl, void *arg)
+{
+	PGconn	   *conn = arg;
+
+	conn->ssl_cert_requested = true;
+
+	/* Do we have a certificate loaded to send back? */
+	if (SSL_get_certificate(ssl))
+		conn->ssl_cert_sent = true;
+
+	/*
+	 * Tell OpenSSL that the callback succeeded; we're not required to
+	 * actually make any changes to the SSL handle.
+	 */
+	return 1;
+}
+#endif
 
 /*
  * OpenSSL-specific wrapper around
@@ -493,8 +498,7 @@ openssl_verify_peer_name_matches_certificate_name(PGconn *conn, ASN1_STRING *nam
 	/* Should not happen... */
 	if (name_entry == NULL)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("SSL certificate's name entry is missing\n"));
+		libpq_append_conn_error(conn, "SSL certificate's name entry is missing");
 		return -1;
 	}
 
@@ -528,8 +532,7 @@ openssl_verify_peer_name_matches_certificate_ip(PGconn *conn,
 	/* Should not happen... */
 	if (addr_entry == NULL)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("SSL certificate's address entry is missing\n"));
+		libpq_append_conn_error(conn, "SSL certificate's address entry is missing");
 		return -1;
 	}
 
@@ -709,7 +712,7 @@ pgtls_verify_peer_name_matches_certificate_guts(PGconn *conn,
 	return rc;
 }
 
-#if defined(ENABLE_THREAD_SAFETY) && defined(HAVE_CRYPTO_LOCK)
+#if defined(HAVE_CRYPTO_LOCK)
 /*
  *	Callback functions for OpenSSL internal locking.  (OpenSSL 1.1.0
  *	does its own locking, and doesn't need these anymore.  The
@@ -750,7 +753,7 @@ pq_lockingcallback(int mode, int n, const char *file, int line)
 			Assert(false);
 	}
 }
-#endif							/* ENABLE_THREAD_SAFETY && HAVE_CRYPTO_LOCK */
+#endif							/* HAVE_CRYPTO_LOCK */
 
 /*
  * Initialize SSL library.
@@ -765,21 +768,6 @@ pq_lockingcallback(int mode, int n, const char *file, int line)
 int
 pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
 {
-#ifdef ENABLE_THREAD_SAFETY
-#ifdef WIN32
-	/* Also see similar code in fe-connect.c, default_threadlock() */
-	if (ssl_config_mutex == NULL)
-	{
-		while (InterlockedExchange(&win32_ssl_create_mutex, 1) == 1)
-			 /* loop, another thread own the lock */ ;
-		if (ssl_config_mutex == NULL)
-		{
-			if (pthread_mutex_init(&ssl_config_mutex, NULL))
-				return -1;
-		}
-		InterlockedExchange(&win32_ssl_create_mutex, 0);
-	}
-#endif
 	if (pthread_mutex_lock(&ssl_config_mutex))
 		return -1;
 
@@ -831,7 +819,6 @@ pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
 		}
 	}
 #endif							/* HAVE_CRYPTO_LOCK */
-#endif							/* ENABLE_THREAD_SAFETY */
 
 	if (!ssl_lib_initialized && do_ssl)
 	{
@@ -848,9 +835,7 @@ pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
 		ssl_lib_initialized = true;
 	}
 
-#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&ssl_config_mutex);
-#endif
 	return 0;
 }
 
@@ -869,8 +854,7 @@ pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto)
 static void
 destroy_ssl_system(void)
 {
-#if defined(ENABLE_THREAD_SAFETY) && defined(HAVE_CRYPTO_LOCK)
-	/* Mutex is created in pgtls_init() */
+#if defined(HAVE_CRYPTO_LOCK)
 	if (pthread_mutex_lock(&ssl_config_mutex))
 		return;
 
@@ -901,6 +885,9 @@ destroy_ssl_system(void)
 #endif
 }
 
+/* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
+static unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
+
 /*
  *	Create per-connection SSL object, and load the client certificate,
  *	private key, and trusted CA certs.
@@ -918,7 +905,6 @@ initialize_SSL(PGconn *conn)
 	bool		have_homedir;
 	bool		have_cert;
 	bool		have_rootcert;
-	EVP_PKEY   *pkey = NULL;
 
 	/*
 	 * We'll need the home directory if any of the relevant parameters are
@@ -946,9 +932,7 @@ initialize_SSL(PGconn *conn)
 	{
 		char	   *err = SSLerrmessage(ERR_get_error());
 
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not create SSL context: %s\n"),
-						  err);
+		libpq_append_conn_error(conn, "could not create SSL context: %s", err);
 		SSLerrfree(err);
 		return -1;
 	}
@@ -972,6 +956,11 @@ initialize_SSL(PGconn *conn)
 		SSL_CTX_set_default_passwd_cb_userdata(SSL_context, conn);
 	}
 
+#ifdef HAVE_SSL_CTX_SET_CERT_CB
+	/* Set up a certificate selection callback. */
+	SSL_CTX_set_cert_cb(SSL_context, cert_cb, conn);
+#endif
+
 	/* Disable old protocol versions */
 	SSL_CTX_set_options(SSL_context, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
@@ -985,9 +974,8 @@ initialize_SSL(PGconn *conn)
 
 		if (ssl_min_ver == -1)
 		{
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("invalid value \"%s\" for minimum SSL protocol version\n"),
-							  conn->ssl_min_protocol_version);
+			libpq_append_conn_error(conn, "invalid value \"%s\" for minimum SSL protocol version",
+									conn->ssl_min_protocol_version);
 			SSL_CTX_free(SSL_context);
 			return -1;
 		}
@@ -996,9 +984,7 @@ initialize_SSL(PGconn *conn)
 		{
 			char	   *err = SSLerrmessage(ERR_get_error());
 
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not set minimum SSL protocol version: %s\n"),
-							  err);
+			libpq_append_conn_error(conn, "could not set minimum SSL protocol version: %s", err);
 			SSLerrfree(err);
 			SSL_CTX_free(SSL_context);
 			return -1;
@@ -1014,9 +1000,8 @@ initialize_SSL(PGconn *conn)
 
 		if (ssl_max_ver == -1)
 		{
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("invalid value \"%s\" for maximum SSL protocol version\n"),
-							  conn->ssl_max_protocol_version);
+			libpq_append_conn_error(conn, "invalid value \"%s\" for maximum SSL protocol version",
+									conn->ssl_max_protocol_version);
 			SSL_CTX_free(SSL_context);
 			return -1;
 		}
@@ -1025,9 +1010,7 @@ initialize_SSL(PGconn *conn)
 		{
 			char	   *err = SSLerrmessage(ERR_get_error());
 
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not set maximum SSL protocol version: %s\n"),
-							  err);
+			libpq_append_conn_error(conn, "could not set maximum SSL protocol version: %s", err);
 			SSLerrfree(err);
 			SSL_CTX_free(SSL_context);
 			return -1;
@@ -1052,8 +1035,29 @@ initialize_SSL(PGconn *conn)
 	else
 		fnbuf[0] = '\0';
 
-	if (fnbuf[0] != '\0' &&
-		stat(fnbuf, &buf) == 0)
+	if (strcmp(fnbuf, "system") == 0)
+	{
+		/*
+		 * The "system" sentinel value indicates that we should load whatever
+		 * root certificates are installed for use by OpenSSL; these locations
+		 * differ by platform. Note that the default system locations may be
+		 * further overridden by the SSL_CERT_DIR and SSL_CERT_FILE
+		 * environment variables.
+		 */
+		if (SSL_CTX_set_default_verify_paths(SSL_context) != 1)
+		{
+			char	   *err = SSLerrmessage(ERR_get_error());
+
+			libpq_append_conn_error(conn, "could not load system root certificate paths: %s",
+									err);
+			SSLerrfree(err);
+			SSL_CTX_free(SSL_context);
+			return -1;
+		}
+		have_rootcert = true;
+	}
+	else if (fnbuf[0] != '\0' &&
+			 stat(fnbuf, &buf) == 0)
 	{
 		X509_STORE *cvstore;
 
@@ -1061,9 +1065,8 @@ initialize_SSL(PGconn *conn)
 		{
 			char	   *err = SSLerrmessage(ERR_get_error());
 
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not read root certificate file \"%s\": %s\n"),
-							  fnbuf, err);
+			libpq_append_conn_error(conn, "could not read root certificate file \"%s\": %s",
+									fnbuf, err);
 			SSLerrfree(err);
 			SSL_CTX_free(SSL_context);
 			return -1;
@@ -1114,13 +1117,11 @@ initialize_SSL(PGconn *conn)
 			 * that it seems worth having a specialized error message for it.
 			 */
 			if (fnbuf[0] == '\0')
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not get home directory to locate root certificate file\n"
-												"Either provide the file or change sslmode to disable server certificate verification.\n"));
+				libpq_append_conn_error(conn, "could not get home directory to locate root certificate file\n"
+										"Either provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.");
 			else
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("root certificate file \"%s\" does not exist\n"
-												"Either provide the file or change sslmode to disable server certificate verification.\n"), fnbuf);
+				libpq_append_conn_error(conn, "root certificate file \"%s\" does not exist\n"
+										"Either provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.", fnbuf);
 			SSL_CTX_free(SSL_context);
 			return -1;
 		}
@@ -1135,7 +1136,12 @@ initialize_SSL(PGconn *conn)
 	else
 		fnbuf[0] = '\0';
 
-	if (fnbuf[0] == '\0')
+	if (conn->sslcertmode[0] == 'd')	/* disable */
+	{
+		/* don't send a client cert even if we have one */
+		have_cert = false;
+	}
+	else if (fnbuf[0] == '\0')
 	{
 		/* no home directory, proceed without a client cert */
 		have_cert = false;
@@ -1149,9 +1155,8 @@ initialize_SSL(PGconn *conn)
 		 */
 		if (errno != ENOENT && errno != ENOTDIR)
 		{
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not open certificate file \"%s\": %s\n"),
-							  fnbuf, strerror_r(errno, sebuf, sizeof(sebuf)));
+			libpq_append_conn_error(conn, "could not open certificate file \"%s\": %s",
+									fnbuf, strerror_r(errno, sebuf, sizeof(sebuf)));
 			SSL_CTX_free(SSL_context);
 			return -1;
 		}
@@ -1168,9 +1173,8 @@ initialize_SSL(PGconn *conn)
 		{
 			char	   *err = SSLerrmessage(ERR_get_error());
 
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not read certificate file \"%s\": %s\n"),
-							  fnbuf, err);
+			libpq_append_conn_error(conn, "could not read certificate file \"%s\": %s",
+									fnbuf, err);
 			SSLerrfree(err);
 			SSL_CTX_free(SSL_context);
 			return -1;
@@ -1193,9 +1197,7 @@ initialize_SSL(PGconn *conn)
 	{
 		char	   *err = SSLerrmessage(ERR_get_error());
 
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not establish SSL connection: %s\n"),
-						  err);
+		libpq_append_conn_error(conn, "could not establish SSL connection: %s", err);
 		SSLerrfree(err);
 		SSL_CTX_free(SSL_context);
 		return -1;
@@ -1227,12 +1229,26 @@ initialize_SSL(PGconn *conn)
 			{
 				char	   *err = SSLerrmessage(ERR_get_error());
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not set SSL Server Name Indication (SNI): %s\n"),
-								  err);
+				libpq_append_conn_error(conn, "could not set SSL Server Name Indication (SNI): %s", err);
 				SSLerrfree(err);
 				return -1;
 			}
+		}
+	}
+
+	/* Set ALPN */
+	{
+		int			retval;
+
+		retval = SSL_set_alpn_protos(conn->ssl, alpn_protos, sizeof(alpn_protos));
+
+		if (retval != 0)
+		{
+			char	   *err = SSLerrmessage(ERR_get_error());
+
+			libpq_append_conn_error(conn, "could not set SSL ALPN extension: %s", err);
+			SSLerrfree(err);
+			return -1;
 		}
 	}
 
@@ -1254,11 +1270,11 @@ initialize_SSL(PGconn *conn)
 			/* Colon, but not in second character, treat as engine:key */
 			char	   *engine_str = strdup(conn->sslkey);
 			char	   *engine_colon;
+			EVP_PKEY   *pkey;
 
 			if (engine_str == NULL)
 			{
-				appendPQExpBufferStr(&conn->errorMessage,
-									 libpq_gettext("out of memory\n"));
+				libpq_append_conn_error(conn, "out of memory");
 				return -1;
 			}
 
@@ -1273,9 +1289,8 @@ initialize_SSL(PGconn *conn)
 			{
 				char	   *err = SSLerrmessage(ERR_get_error());
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not load SSL engine \"%s\": %s\n"),
-								  engine_str, err);
+				libpq_append_conn_error(conn, "could not load SSL engine \"%s\": %s",
+										engine_str, err);
 				SSLerrfree(err);
 				free(engine_str);
 				return -1;
@@ -1285,9 +1300,8 @@ initialize_SSL(PGconn *conn)
 			{
 				char	   *err = SSLerrmessage(ERR_get_error());
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not initialize SSL engine \"%s\": %s\n"),
-								  engine_str, err);
+				libpq_append_conn_error(conn, "could not initialize SSL engine \"%s\": %s",
+										engine_str, err);
 				SSLerrfree(err);
 				ENGINE_free(conn->engine);
 				conn->engine = NULL;
@@ -1301,9 +1315,8 @@ initialize_SSL(PGconn *conn)
 			{
 				char	   *err = SSLerrmessage(ERR_get_error());
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not read private SSL key \"%s\" from engine \"%s\": %s\n"),
-								  engine_colon, engine_str, err);
+				libpq_append_conn_error(conn, "could not read private SSL key \"%s\" from engine \"%s\": %s",
+										engine_colon, engine_str, err);
 				SSLerrfree(err);
 				ENGINE_finish(conn->engine);
 				ENGINE_free(conn->engine);
@@ -1315,9 +1328,8 @@ initialize_SSL(PGconn *conn)
 			{
 				char	   *err = SSLerrmessage(ERR_get_error());
 
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not load private SSL key \"%s\" from engine \"%s\": %s\n"),
-								  engine_colon, engine_str, err);
+				libpq_append_conn_error(conn, "could not load private SSL key \"%s\" from engine \"%s\": %s",
+										engine_colon, engine_str, err);
 				SSLerrfree(err);
 				ENGINE_finish(conn->engine);
 				ENGINE_free(conn->engine);
@@ -1353,22 +1365,19 @@ initialize_SSL(PGconn *conn)
 		if (stat(fnbuf, &buf) != 0)
 		{
 			if (errno == ENOENT)
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("certificate present, but not private key file \"%s\"\n"),
-								  fnbuf);
+				libpq_append_conn_error(conn, "certificate present, but not private key file \"%s\"",
+										fnbuf);
 			else
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not stat private key file \"%s\": %m\n"),
-								  fnbuf);
+				libpq_append_conn_error(conn, "could not stat private key file \"%s\": %m",
+										fnbuf);
 			return -1;
 		}
 
 		/* Key file must be a regular file */
 		if (!S_ISREG(buf.st_mode))
 		{
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("private key file \"%s\" is not a regular file\n"),
-							  fnbuf);
+			libpq_append_conn_error(conn, "private key file \"%s\" is not a regular file",
+									fnbuf);
 			return -1;
 		}
 
@@ -1399,9 +1408,9 @@ initialize_SSL(PGconn *conn)
 			buf.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO) :
 			buf.st_mode & (S_IRWXG | S_IRWXO))
 		{
-			appendPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("private key file \"%s\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root\n"),
-							  fnbuf);
+			libpq_append_conn_error(conn,
+									"private key file \"%s\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root",
+									fnbuf);
 			return -1;
 		}
 #endif
@@ -1424,9 +1433,8 @@ initialize_SSL(PGconn *conn)
 			 */
 			if (SSL_use_PrivateKey_file(conn->ssl, fnbuf, SSL_FILETYPE_ASN1) != 1)
 			{
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("could not load private key file \"%s\": %s\n"),
-								  fnbuf, err);
+				libpq_append_conn_error(conn, "could not load private key file \"%s\": %s",
+										fnbuf, err);
 				SSLerrfree(err);
 				return -1;
 			}
@@ -1441,9 +1449,8 @@ initialize_SSL(PGconn *conn)
 	{
 		char	   *err = SSLerrmessage(ERR_get_error());
 
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("certificate does not match private key file \"%s\": %s\n"),
-						  fnbuf, err);
+		libpq_append_conn_error(conn, "certificate does not match private key file \"%s\": %s",
+								fnbuf, err);
 		SSLerrfree(err);
 		return -1;
 	}
@@ -1474,10 +1481,12 @@ open_client_SSL(PGconn *conn)
 {
 	int			r;
 
+	SOCK_ERRNO_SET(0);
 	ERR_clear_error();
 	r = SSL_connect(conn->ssl);
 	if (r <= 0)
 	{
+		int			save_errno = SOCK_ERRNO;
 		int			err = SSL_get_error(conn->ssl, r);
 		unsigned long ecode;
 
@@ -1493,14 +1502,29 @@ open_client_SSL(PGconn *conn)
 			case SSL_ERROR_SYSCALL:
 				{
 					char		sebuf[PG_STRERROR_R_BUFLEN];
+					unsigned long vcode;
 
-					if (r == -1)
-						appendPQExpBuffer(&conn->errorMessage,
-										  libpq_gettext("SSL SYSCALL error: %s\n"),
-										  SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+					vcode = SSL_get_verify_result(conn->ssl);
+
+					/*
+					 * If we get an X509 error here for failing to load the
+					 * local issuer cert, without an error in the socket layer
+					 * it means that verification failed due to a missing
+					 * system CA pool without it being a protocol error. We
+					 * inspect the sslrootcert setting to ensure that the user
+					 * was using the system CA pool. For other errors, log
+					 * them using the normal SYSCALL logging.
+					 */
+					if (save_errno == 0 &&
+						vcode == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY &&
+						strcmp(conn->sslrootcert, "system") == 0)
+						libpq_append_conn_error(conn, "SSL error: certificate verify failed: %s",
+												X509_verify_cert_error_string(vcode));
+					else if (r == -1 && save_errno != 0)
+						libpq_append_conn_error(conn, "SSL SYSCALL error: %s",
+												SOCK_STRERROR(save_errno, sebuf, sizeof(sebuf)));
 					else
-						appendPQExpBufferStr(&conn->errorMessage,
-											 libpq_gettext("SSL SYSCALL error: EOF detected\n"));
+						libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 					pgtls_close(conn);
 					return PGRES_POLLING_FAILED;
 				}
@@ -1508,9 +1532,7 @@ open_client_SSL(PGconn *conn)
 				{
 					char	   *err = SSLerrmessage(ecode);
 
-					appendPQExpBuffer(&conn->errorMessage,
-									  libpq_gettext("SSL error: %s\n"),
-									  err);
+					libpq_append_conn_error(conn, "SSL error: %s", err);
 					SSLerrfree(err);
 					switch (ERR_GET_REASON(ecode))
 					{
@@ -1541,14 +1563,13 @@ open_client_SSL(PGconn *conn)
 						case SSL_R_VERSION_TOO_HIGH:
 						case SSL_R_VERSION_TOO_LOW:
 #endif
-							appendPQExpBuffer(&conn->errorMessage,
-											  libpq_gettext("This may indicate that the server does not support any SSL protocol version between %s and %s.\n"),
-											  conn->ssl_min_protocol_version ?
-											  conn->ssl_min_protocol_version :
-											  MIN_OPENSSL_TLS_VERSION,
-											  conn->ssl_max_protocol_version ?
-											  conn->ssl_max_protocol_version :
-											  MAX_OPENSSL_TLS_VERSION);
+							libpq_append_conn_error(conn, "This may indicate that the server does not support any SSL protocol version between %s and %s.",
+													conn->ssl_min_protocol_version ?
+													conn->ssl_min_protocol_version :
+													MIN_OPENSSL_TLS_VERSION,
+													conn->ssl_max_protocol_version ?
+													conn->ssl_max_protocol_version :
+													MAX_OPENSSL_TLS_VERSION);
 							break;
 						default:
 							break;
@@ -1558,11 +1579,37 @@ open_client_SSL(PGconn *conn)
 				}
 
 			default:
-				appendPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext("unrecognized SSL error code: %d\n"),
-								  err);
+				libpq_append_conn_error(conn, "unrecognized SSL error code: %d", err);
 				pgtls_close(conn);
 				return PGRES_POLLING_FAILED;
+		}
+	}
+
+	/* ALPN is mandatory with direct SSL connections */
+	if (conn->current_enc_method == ENC_SSL && conn->sslnegotiation[0] == 'd')
+	{
+		const unsigned char *selected;
+		unsigned int len;
+
+		SSL_get0_alpn_selected(conn->ssl, &selected, &len);
+
+		if (selected == NULL)
+		{
+			libpq_append_conn_error(conn, "direct SSL connection was established without ALPN protocol negotiation extension");
+			pgtls_close(conn);
+			return PGRES_POLLING_FAILED;
+		}
+
+		/*
+		 * We only support one protocol so that's what the negotiation should
+		 * always choose, but doesn't hurt to check.
+		 */
+		if (len != strlen(PG_ALPN_PROTOCOL) ||
+			memcmp(selected, PG_ALPN_PROTOCOL, strlen(PG_ALPN_PROTOCOL)) != 0)
+		{
+			libpq_append_conn_error(conn, "SSL connection was established with unexpected ALPN protocol");
+			pgtls_close(conn);
+			return PGRES_POLLING_FAILED;
 		}
 	}
 
@@ -1577,9 +1624,7 @@ open_client_SSL(PGconn *conn)
 	{
 		char	   *err = SSLerrmessage(ERR_get_error());
 
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("certificate could not be obtained: %s\n"),
-						  err);
+		libpq_append_conn_error(conn, "certificate could not be obtained: %s", err);
 		SSLerrfree(err);
 		pgtls_close(conn);
 		return PGRES_POLLING_FAILED;
@@ -1614,6 +1659,7 @@ pgtls_close(PGconn *conn)
 			SSL_free(conn->ssl);
 			conn->ssl = NULL;
 			conn->ssl_in_use = false;
+			conn->ssl_handshake_started = false;
 
 			destroy_needed = true;
 		}
@@ -1637,7 +1683,7 @@ pgtls_close(PGconn *conn)
 	{
 		/*
 		 * In the non-SSL case, just remove the crypto callbacks if the
-		 * connection has then loaded.  This code path has no dependency on
+		 * connection has them loaded.  This code path has no dependency on
 		 * any pending SSL calls.
 		 */
 		if (conn->crypto_loaded)
@@ -1664,10 +1710,11 @@ pgtls_close(PGconn *conn)
  * Obtain reason string for passed SSL errcode
  *
  * ERR_get_error() is used by caller to get errcode to pass here.
+ * The result must be freed after use, using SSLerrfree.
  *
- * Some caution is needed here since ERR_reason_error_string will
- * return NULL if it doesn't recognize the error code.  We don't
- * want to return NULL ever.
+ * Some caution is needed here since ERR_reason_error_string will return NULL
+ * if it doesn't recognize the error code, or (in OpenSSL >= 3) if the code
+ * represents a system errno value.  We don't want to return NULL ever.
  */
 static char ssl_nomem[] = "out of memory allocating error description";
 
@@ -1693,6 +1740,39 @@ SSLerrmessage(unsigned long ecode)
 		strlcpy(errbuf, errreason, SSL_ERR_LEN);
 		return errbuf;
 	}
+
+	/*
+	 * Server aborted the connection with TLS "no_application_protocol" alert.
+	 * The ERR_reason_error_string() function doesn't give any error string
+	 * for that for some reason, so do it ourselves.  See
+	 * https://github.com/openssl/openssl/issues/24300.  This is available in
+	 * OpenSSL 1.1.0 and later, as well as in LibreSSL 3.4.3 (OpenBSD 7.0) and
+	 * later.
+	 */
+#ifdef SSL_AD_NO_APPLICATION_PROTOCOL
+	if (ERR_GET_LIB(ecode) == ERR_LIB_SSL &&
+		ERR_GET_REASON(ecode) == SSL_AD_REASON_OFFSET + SSL_AD_NO_APPLICATION_PROTOCOL)
+	{
+		snprintf(errbuf, SSL_ERR_LEN, libpq_gettext("no application protocol"));
+		return errbuf;
+	}
+#endif
+
+	/*
+	 * In OpenSSL 3.0.0 and later, ERR_reason_error_string randomly refuses to
+	 * map system errno values.  We can cover that shortcoming with this bit
+	 * of code.  Older OpenSSL versions don't have the ERR_SYSTEM_ERROR macro,
+	 * but that's okay because they don't have the shortcoming either.
+	 */
+#ifdef ERR_SYSTEM_ERROR
+	if (ERR_SYSTEM_ERROR(ecode))
+	{
+		strlcpy(errbuf, strerror(ERR_GET_REASON(ecode)), SSL_ERR_LEN);
+		return errbuf;
+	}
+#endif
+
+	/* No choice but to report the numeric ecode */
 	snprintf(errbuf, SSL_ERR_LEN, libpq_gettext("SSL error code %lu"), ecode);
 	return errbuf;
 }
@@ -1732,28 +1812,47 @@ PQsslStruct(PGconn *conn, const char *struct_name)
 const char *const *
 PQsslAttributeNames(PGconn *conn)
 {
-	static const char *const result[] = {
+	static const char *const openssl_attrs[] = {
 		"library",
 		"key_bits",
 		"cipher",
 		"compression",
 		"protocol",
+		"alpn",
 		NULL
 	};
+	static const char *const empty_attrs[] = {NULL};
 
-	return result;
+	if (!conn)
+	{
+		/* Return attributes of default SSL library */
+		return openssl_attrs;
+	}
+
+	/* No attrs for unencrypted connection */
+	if (conn->ssl == NULL)
+		return empty_attrs;
+
+	return openssl_attrs;
 }
 
 const char *
 PQsslAttribute(PGconn *conn, const char *attribute_name)
 {
-	if (strcmp(attribute_name, "library") == 0)
-		return "OpenSSL";
-
 	if (!conn)
+	{
+		/* PQsslAttribute(NULL, "library") reports the default SSL library */
+		if (strcmp(attribute_name, "library") == 0)
+			return "OpenSSL";
 		return NULL;
+	}
+
+	/* All attributes read as NULL for a non-encrypted connection */
 	if (conn->ssl == NULL)
 		return NULL;
+
+	if (strcmp(attribute_name, "library") == 0)
+		return "OpenSSL";
 
 	if (strcmp(attribute_name, "key_bits") == 0)
 	{
@@ -1774,6 +1873,21 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
 	if (strcmp(attribute_name, "protocol") == 0)
 		return SSL_get_version(conn->ssl);
 
+	if (strcmp(attribute_name, "alpn") == 0)
+	{
+		const unsigned char *data;
+		unsigned int len;
+		static char alpn_str[256];	/* alpn doesn't support longer than 255
+									 * bytes */
+
+		SSL_get0_alpn_selected(conn->ssl, &data, &len);
+		if (data == NULL || len == 0 || len > sizeof(alpn_str) - 1)
+			return "";
+		memcpy(alpn_str, data, len);
+		alpn_str[len] = 0;
+		return alpn_str;
+	}
+
 	return NULL;				/* unknown attribute */
 }
 
@@ -1784,23 +1898,18 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
  *
  * These functions are closely modelled on the standard socket BIO in OpenSSL;
  * see sock_read() and sock_write() in OpenSSL's crypto/bio/bss_sock.c.
- * XXX OpenSSL 1.0.1e considers many more errcodes than just EINTR as reasons
- * to retry; do we need to adopt their logic for that?
  */
 
-#ifndef HAVE_BIO_GET_DATA
-#define BIO_get_data(bio) (bio->ptr)
-#define BIO_set_data(bio, data) (bio->ptr = data)
-#endif
-
+/* protected by ssl_config_mutex */
 static BIO_METHOD *my_bio_methods;
 
 static int
 my_sock_read(BIO *h, char *buf, int size)
 {
+	PGconn	   *conn = (PGconn *) BIO_get_app_data(h);
 	int			res;
 
-	res = pqsecure_raw_read((PGconn *) BIO_get_data(h), buf, size);
+	res = pqsecure_raw_read(conn, buf, size);
 	BIO_clear_retry_flags(h);
 	if (res < 0)
 	{
@@ -1822,6 +1931,9 @@ my_sock_read(BIO *h, char *buf, int size)
 		}
 	}
 
+	if (res > 0)
+		conn->ssl_handshake_started = true;
+
 	return res;
 }
 
@@ -1830,7 +1942,7 @@ my_sock_write(BIO *h, const char *buf, int size)
 {
 	int			res;
 
-	res = pqsecure_raw_write((PGconn *) BIO_get_data(h), buf, size);
+	res = pqsecure_raw_write((PGconn *) BIO_get_app_data(h), buf, size);
 	BIO_clear_retry_flags(h);
 	if (res < 0)
 	{
@@ -1858,6 +1970,13 @@ my_sock_write(BIO *h, const char *buf, int size)
 static BIO_METHOD *
 my_BIO_s_socket(void)
 {
+	BIO_METHOD *res;
+
+	if (pthread_mutex_lock(&ssl_config_mutex))
+		return NULL;
+
+	res = my_bio_methods;
+
 	if (!my_bio_methods)
 	{
 		BIO_METHOD *biom = (BIO_METHOD *) BIO_s_socket();
@@ -1866,39 +1985,51 @@ my_BIO_s_socket(void)
 
 		my_bio_index = BIO_get_new_index();
 		if (my_bio_index == -1)
-			return NULL;
+			goto err;
 		my_bio_index |= (BIO_TYPE_DESCRIPTOR | BIO_TYPE_SOURCE_SINK);
-		my_bio_methods = BIO_meth_new(my_bio_index, "libpq socket");
-		if (!my_bio_methods)
-			return NULL;
+		res = BIO_meth_new(my_bio_index, "libpq socket");
+		if (!res)
+			goto err;
 
 		/*
 		 * As of this writing, these functions never fail. But check anyway,
 		 * like OpenSSL's own examples do.
 		 */
-		if (!BIO_meth_set_write(my_bio_methods, my_sock_write) ||
-			!BIO_meth_set_read(my_bio_methods, my_sock_read) ||
-			!BIO_meth_set_gets(my_bio_methods, BIO_meth_get_gets(biom)) ||
-			!BIO_meth_set_puts(my_bio_methods, BIO_meth_get_puts(biom)) ||
-			!BIO_meth_set_ctrl(my_bio_methods, BIO_meth_get_ctrl(biom)) ||
-			!BIO_meth_set_create(my_bio_methods, BIO_meth_get_create(biom)) ||
-			!BIO_meth_set_destroy(my_bio_methods, BIO_meth_get_destroy(biom)) ||
-			!BIO_meth_set_callback_ctrl(my_bio_methods, BIO_meth_get_callback_ctrl(biom)))
+		if (!BIO_meth_set_write(res, my_sock_write) ||
+			!BIO_meth_set_read(res, my_sock_read) ||
+			!BIO_meth_set_gets(res, BIO_meth_get_gets(biom)) ||
+			!BIO_meth_set_puts(res, BIO_meth_get_puts(biom)) ||
+			!BIO_meth_set_ctrl(res, BIO_meth_get_ctrl(biom)) ||
+			!BIO_meth_set_create(res, BIO_meth_get_create(biom)) ||
+			!BIO_meth_set_destroy(res, BIO_meth_get_destroy(biom)) ||
+			!BIO_meth_set_callback_ctrl(res, BIO_meth_get_callback_ctrl(biom)))
 		{
-			BIO_meth_free(my_bio_methods);
-			my_bio_methods = NULL;
-			return NULL;
+			goto err;
 		}
 #else
-		my_bio_methods = malloc(sizeof(BIO_METHOD));
-		if (!my_bio_methods)
-			return NULL;
-		memcpy(my_bio_methods, biom, sizeof(BIO_METHOD));
-		my_bio_methods->bread = my_sock_read;
-		my_bio_methods->bwrite = my_sock_write;
+		res = malloc(sizeof(BIO_METHOD));
+		if (!res)
+			goto err;
+		memcpy(res, biom, sizeof(BIO_METHOD));
+		res->bread = my_sock_read;
+		res->bwrite = my_sock_write;
 #endif
 	}
-	return my_bio_methods;
+
+	my_bio_methods = res;
+	pthread_mutex_unlock(&ssl_config_mutex);
+	return res;
+
+err:
+#ifdef HAVE_BIO_METH_NEW
+	if (res)
+		BIO_meth_free(res);
+#else
+	if (res)
+		free(res);
+#endif
+	pthread_mutex_unlock(&ssl_config_mutex);
+	return NULL;
 }
 
 /* This should exactly match OpenSSL's SSL_set_fd except for using my BIO */
@@ -1921,7 +2052,7 @@ my_SSL_set_fd(PGconn *conn, int fd)
 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
 		goto err;
 	}
-	BIO_set_data(bio, conn);
+	BIO_set_app_data(bio, conn);
 
 	SSL_set_bio(conn->ssl, bio, bio);
 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
@@ -1938,7 +2069,7 @@ err:
 int
 PQdefaultSSLKeyPassHook_OpenSSL(char *buf, int size, PGconn *conn)
 {
-	if (conn->sslpassword)
+	if (conn && conn->sslpassword)
 	{
 		if (strlen(conn->sslpassword) + 1 > size)
 			fprintf(stderr, libpq_gettext("WARNING: sslpassword truncated\n"));

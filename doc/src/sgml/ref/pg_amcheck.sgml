@@ -160,7 +160,7 @@ PostgreSQL documentation
        Patterns may be unqualified, e.g. <literal>myrel*</literal>, or they
        may be schema-qualified, e.g. <literal>myschema*.myrel*</literal> or
        database-qualified and schema-qualified, e.g.
-       <literal>mydb*.myscheam*.myrel*</literal>. A database-qualified
+       <literal>mydb*.myschema*.myrel*</literal>. A database-qualified
        pattern will add matching databases to the list of databases to be
        checked.
       </para>
@@ -383,6 +383,17 @@ PostgreSQL documentation
    The following command-line options control checking of B-tree indexes:
 
    <variablelist>
+    <varlistentry>
+     <term><option>--checkunique</option></term>
+     <listitem>
+      <para>
+       For each index with unique constraint checked, verify that no more than
+       one among duplicate entries is visible in the index using <xref linkend="amcheck"/>'s
+       <option>checkunique</option> option.
+      </para>
+     </listitem>
+    </varlistentry>
+
     <varlistentry>
      <term><option>--heapallindexed</option></term>
      <listitem>
@@ -630,6 +641,24 @@ PostgreSQL documentation
      </listitem>
     </varlistentry>
    </variablelist>
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Environment</title>
+
+  <para>
+   <command>pg_amcheck</command>, like most other <productname>PostgreSQL</productname>
+   utilities,
+   also uses the environment variables supported by <application>libpq</application>
+   (see <xref linkend="libpq-envars"/>).
+  </para>
+
+  <para>
+   The environment variable <envar>PG_COLOR</envar> specifies whether to use
+   color in diagnostic messages. Possible values are
+   <literal>always</literal>, <literal>auto</literal> and
+   <literal>never</literal>.
   </para>
  </refsect1>
 

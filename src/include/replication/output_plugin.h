@@ -2,7 +2,7 @@
  * output_plugin.h
  *	   PostgreSQL Logical Decode Plugin Interface
  *
- * Copyright (c) 2012-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2024, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -17,7 +17,7 @@ struct OutputPluginCallbacks;
 typedef enum OutputPluginOutputType
 {
 	OUTPUT_PLUGIN_BINARY_OUTPUT,
-	OUTPUT_PLUGIN_TEXTUAL_OUTPUT
+	OUTPUT_PLUGIN_TEXTUAL_OUTPUT,
 } OutputPluginOutputType;
 
 /*
@@ -112,7 +112,7 @@ typedef bool (*LogicalDecodeFilterPrepareCB) (struct LogicalDecodingContext *ctx
 											  const char *gid);
 
 /*
- * Callback called for every BEGIN of a prepared trnsaction.
+ * Callback called for every BEGIN of a prepared transaction.
  */
 typedef void (*LogicalDecodeBeginPrepareCB) (struct LogicalDecodingContext *ctx,
 											 ReorderBufferTXN *txn);

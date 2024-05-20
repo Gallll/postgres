@@ -6,7 +6,7 @@
  * See comments in pg_list.h.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include "common/int.h"
 #include "nodes/pg_list.h"
 #include "port/pg_bitutils.h"
 #include "utils/memdebug.h"
@@ -747,7 +748,7 @@ list_member_xid(const List *list, TransactionId datum)
 
 	foreach(cell, list)
 	{
-		if (lfirst_oid(cell) == datum)
+		if (lfirst_xid(cell) == datum)
 			return true;
 	}
 
@@ -1593,10 +1594,10 @@ list_copy_head(const List *oldlist, int len)
 {
 	List	   *newlist;
 
-	len = Min(oldlist->length, len);
-
-	if (len <= 0)
+	if (oldlist == NIL || len <= 0)
 		return NIL;
+
+	len = Min(oldlist->length, len);
 
 	newlist = new_list(oldlist->type, len);
 	memcpy(newlist->elements, oldlist->elements, len * sizeof(ListCell));
@@ -1692,11 +1693,7 @@ list_int_cmp(const ListCell *p1, const ListCell *p2)
 	int			v1 = lfirst_int(p1);
 	int			v2 = lfirst_int(p2);
 
-	if (v1 < v2)
-		return -1;
-	if (v1 > v2)
-		return 1;
-	return 0;
+	return pg_cmp_s32(v1, v2);
 }
 
 /*
@@ -1708,9 +1705,5 @@ list_oid_cmp(const ListCell *p1, const ListCell *p2)
 	Oid			v1 = lfirst_oid(p1);
 	Oid			v2 = lfirst_oid(p2);
 
-	if (v1 < v2)
-		return -1;
-	if (v1 > v2)
-		return 1;
-	return 0;
+	return pg_cmp_u32(v1, v2);
 }

@@ -1,5 +1,8 @@
+
+# Copyright (c) 2024, PostgreSQL Global Development Group
+
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -141,8 +144,8 @@ $node_primary->safe_psql('postgres',
 $node_primary->safe_psql('conflict_db', "UPDATE large SET datab = 7;");
 cause_eviction(\%psql_primary, \%psql_standby);
 $node_primary->safe_psql('conflict_db', "UPDATE large SET datab = 8;");
-$node_primary->safe_psql('postgres',    'DROP DATABASE conflict_db');
-$node_primary->safe_psql('postgres',    'DROP TABLESPACE test_tablespace');
+$node_primary->safe_psql('postgres', 'DROP DATABASE conflict_db');
+$node_primary->safe_psql('postgres', 'DROP TABLESPACE test_tablespace');
 
 $node_primary->safe_psql('postgres', 'REINDEX TABLE pg_database');
 

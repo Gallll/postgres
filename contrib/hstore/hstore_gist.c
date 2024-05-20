@@ -7,6 +7,7 @@
 #include "access/reloptions.h"
 #include "access/stratnum.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "hstore.h"
 #include "utils/pg_crc.h"
 
@@ -77,7 +78,7 @@ typedef struct
 
 /* shorthand for calculating CRC-32 of a single chunk of data. */
 static pg_crc32
-crc32_sz(char *buf, int size)
+crc32_sz(const char *buf, int size)
 {
 	pg_crc32	crc;
 
@@ -96,15 +97,21 @@ PG_FUNCTION_INFO_V1(ghstore_out);
 Datum
 ghstore_in(PG_FUNCTION_ARGS)
 {
-	elog(ERROR, "Not implemented");
-	PG_RETURN_DATUM(0);
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "ghstore")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 Datum
 ghstore_out(PG_FUNCTION_ARGS)
 {
-	elog(ERROR, "Not implemented");
-	PG_RETURN_DATUM(0);
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type %s", "ghstore")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 static GISTTYPE *
@@ -350,7 +357,8 @@ typedef struct
 static int
 comparecost(const void *a, const void *b)
 {
-	return ((const SPLITCOST *) a)->cost - ((const SPLITCOST *) b)->cost;
+	return pg_cmp_s32(((const SPLITCOST *) a)->cost,
+					  ((const SPLITCOST *) b)->cost);
 }
 
 
@@ -430,7 +438,7 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 		size_beta = hemdist(datum_r, _j, siglen);
 		costvector[j - 1].cost = abs(size_alpha - size_beta);
 	}
-	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
+	qsort(costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	union_l = GETSIGN(datum_l);
 	union_r = GETSIGN(datum_r);
@@ -459,7 +467,7 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_l) || ISALLTRUE(_j))
 			{
 				if (!ISALLTRUE(datum_l))
-					memset((void *) union_l, 0xff, siglen);
+					memset(union_l, 0xff, siglen);
 			}
 			else
 			{
@@ -475,7 +483,7 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_r) || ISALLTRUE(_j))
 			{
 				if (!ISALLTRUE(datum_r))
-					memset((void *) union_r, 0xff, siglen);
+					memset(union_r, 0xff, siglen);
 			}
 			else
 			{
